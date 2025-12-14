@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+    <title>Example 01.01 - Basic skeleton</title>
+
+    <!--
+      Three.js 本体を読み込む。
+      ここでは npm / import は使わず、script タグで読み込む昔ながらの形式。
+
+      この形式の重要ポイント：
+      - 読み込みが成功すると、グローバル変数として `THREE` が生える
+        例：new THREE.Scene(), new THREE.WebGLRenderer() などが使える
+      - 依存関係の順序が重要（Three.js より先に THREE を使うスクリプトを置くと壊れる）
+    -->
+    <script type="text/javascript" src="../libs/three.js"></script>
+
+    <style>
+        body {
+            /* set margin to 0 and overflow to hidden, to
+             use the complete page */
+
+            /* 余白を消して、WebGLキャンバスを画面いっぱいに表示しやすくする定番設定 */
+            margin: 0;
+
+            /* スクロールバーが出ると表示がズレたり、操作感が悪くなるので隠す */
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body>
+
+<!--
+  Div which will hold the Output
+
+  ここは「描画先の入れ物」。
+  Three.js の WebGLRenderer が内部で作る canvas（renderer.domElement）を
+  この div の子要素として appendChild して表示するのが一般的。
+-->
+<div id="WebGL-output">
+</div>
+
+<!--
+  Javascript code that runs our Three.js examples
+
+  ここに Three.js の初期化コードを書く。
+  典型的には次の3点セットを init() の中で作る：
+
+  1) Scene    : 3D空間（オブジェクトを置く箱）
+  2) Camera   : その空間をどう見るか（視点）
+  3) Renderer : Scene を Camera 視点で描画して canvas に出す装置
+
+  最初は「表示の骨格」を作り、次に Mesh / Light / Controls などを追加していく流れになる。
+-->
+<script type="text/javascript">
+
+    // once everything is loaded, we run our Three.js stuff.
+    function init() {
+
+        /*
+          ここに Three.js の処理を書く場所（この例は skeleton なので空）。
+
+          実際に書く処理の流れ（定番）：
+
+          - 描画先 div を取得
+              var container = document.getElementById("WebGL-output");
+
+          - Scene を作る（3D空間）
+              var scene = new THREE.Scene();
+
+          - Camera を作る（視点）
+              var camera = new THREE.PerspectiveCamera(fov, aspect, near, far);
+              camera.position.set(...);
+
+          - Renderer を作る（描画装置）
+              var renderer = new THREE.WebGLRenderer();
+              renderer.setSize(window.innerWidth, window.innerHeight);
+
+          - canvas を DOM に差し込む
+              container.appendChild(renderer.domElement);
+
+          - 描画する（1回だけ or アニメーション）
+              renderer.render(scene, camera);
+              // もしくは requestAnimationFrame で毎フレーム描く
+
+          なお、ハマりどころとして「リサイズ対応」がある：
+          window.onresize で camera.aspect の更新と renderer.setSize をしないと
+          画面比率が崩れたり引き伸ばされたりする。
+        */
+
+        // here we'll put the Three.js stuff
+    }
+
+    /*
+      window.onload = init
+
+      - ページ内の読み込み（DOM、画像など）が完了した後に init を呼ぶ。
+      - Three.js を script タグで読み込む場合、THREE が確実に存在してから実行したいので
+        こうした「読み込み後に初期化」が安全。
+
+      似たものに DOMContentLoaded があるが、教材の流れ的に onload を使う例が多い。
+    */
+    window.onload = init
+
+</script>
+</body>
+</html>
