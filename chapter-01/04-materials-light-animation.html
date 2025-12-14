@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+    <title>Example 01.04 - Materials, light and animation</title>
+
+    <!--
+      【方針（ES Modules 前提）】
+      これからは Three.js を “ES Modules” として読み込む（window.THREE に依存しない）。
+      旧来の ../libs/three.js / ../libs/stats.js の <script> 直読みは使わない。
+
+      ここでは importmap を使って、教材コードの見た目（importが短い）を保ちつつ、
+      CDN 上の ES Modules を安定して参照する。
+    -->
+    <script type="importmap">
+        {
+          "imports": {
+            "three": "https://unpkg.com/three@0.182.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.182.0/examples/jsm/"
+          }
+        }
+    </script>
+
+    <style>
+        body {
+            /* set margin to 0 and overflow to hidden, to go fullscreen */
+            margin: 0;
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body>
+
+<div id="Stats-output">
+</div>
+<!-- Div which will hold the Output -->
+<div id="WebGL-output">
+</div>
+
+<!--
+  ES Modules 版のメインコード。
+  - type="module" により import が使える
+  - THREE はグローバルではなく、このスクリプトのスコープ内変数
+-->
+<script type="module">
+
+    /*
+      Stats も Three.js 公式の addons（examples/jsm）から読む。
+      これにより、外部パッケージ stats.js の CORS 問題やURL違いでコケる確率を下げる。
+    */
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+
+    // once everything is loaded, we run our Three.js stuff.
+    function init() {
+
+        var stats = initStats();
+
+        // ============================================================
+        // Scene（シーン）：3D世界の入れ物
+        // ============================================================
+        // Mesh（床・立方体・球）や Light（ライト）を scene.add(...) で追加し、
+        // renderer.render(scene, camera) で「この世界」を「この視点」で描画する。
+        var scene = new THREE.Scene();
+
+        // ============================================================
+        // Camera（カメラ）：視点（透視投影）
+        // ============================================================
+        // PerspectiveCamera(fov, aspect, near, far)
+        // - fov: 視野角（度）…大きいほど広角
+        // - aspect: 画面の縦横比…ズレると歪む
+        // - near/far: クリッピング平面…外側は描画されない（深度精度にも影響）
+        var camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+        // ============================================================
+        // Renderer（レンダラー）：WebGLで描画して canvas を生成する
+        // ============================================================
+        var renderer = new THREE.WebGLRenderer();
+
+        // 背景色（クリアカラー）
+        renderer.setClearColor(new THREE.Color(0xEEEEEE));
+
+        // canvas の解像度（ウィンドウに合わせる）
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        // ============================================================
+        // Shadow Mapping（影）を有効化
+        // ============================================================
+        // 影が出るための条件（4点セット）：
+        // 1) renderer.shadowMap.enabled = true
+        // 2) light.castShadow = true（ライトがシャドウマップ生成）
+        // 3) 影を落とす物体：mesh.castShadow = true
+        // 4) 影を受ける物体：mesh.receiveShadow = true
+        renderer.shadowMap.enabled = true;
+
+        // 影の境界を少し自然にする（見た目改善・教材的に分かりやすい）
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+        // ============================================================
+        // Ground Plane（床）
+        // ============================================================
+        // PlaneGeometry(幅, 奥行, 分割x, 分割y)
+        // 分割数を増やすと頂点が増える（変形やシェーディングの細かさに影響）
+        var planeGeometry = new THREE.PlaneGeometry(60, 20, 1, 1);
+
+        // Lambert材質：拡散反射（ライトの方向で明暗が出る）
+        // ライトが無いと暗く（黒く）なりやすい点は重要な性質。
+        var planeMaterial = new THREE.MeshLambertMaterial({color: 0xffffff});
+
+        var plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+        // 床は影を「受ける」側
+        plane.receiveShadow = true;
+
+        // PlaneGeometryはデフォルト XY 平面（壁っぽい向き）なので床にするため回転
+        plane.rotation.x = -0.5 * Math.PI;
+
+        // 位置調整（元コードと同じ）
+        plane.position.x = 15;
+        plane.position.y = 0;
+        plane.position.z = 0;
+
+        scene.add(plane);
+
+        // ============================================================
+        // Cube（立方体）
+        // ============================================================
+        var cubeGeometry = new THREE.BoxGeometry(4, 4, 4);
+        var cubeMaterial = new THREE.MeshLambertMaterial({color: 0xff0000});
+        var cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+
+        // 立方体は影を「落とす」側
+        cube.castShadow = true;
+
+        cube.position.x = -4;
+        cube.position.y = 3;
+        cube.position.z = 0;
+
+        scene.add(cube);
+
+        // ============================================================
+        // Sphere（球）
+        // ============================================================
+        var sphereGeometry = new THREE.SphereGeometry(4, 20, 20);
+        var sphereMaterial = new THREE.MeshLambertMaterial({color: 0x7777ff});
+        var sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+
+        // 初期位置（元コードと同じ）
+        sphere.position.x = 20;
+        sphere.position.y = 0;
+        sphere.position.z = 2;
+
+        // 球も影を「落とす」
+        sphere.castShadow = true;
+
+        scene.add(sphere);
+
+        // ============================================================
+        // Camera placement（カメラ配置）
+        // ============================================================
+        camera.position.x = -30;
+        camera.position.y = 40;
+        camera.position.z = 30;
+
+        // 原点（scene.position は (0,0,0)）を見る
+        camera.lookAt(scene.position);
+
+        // ============================================================
+        // AmbientLight（環境光）…元コードにあるので維持
+        // ============================================================
+        // AmbientLight は方向性のない光で、影の中にも一様に回り込む。
+        // これが無いと Lambert 材質は「直射が弱い」場面で黒つぶれしやすい。
+        var ambientLight = new THREE.AmbientLight(0x0c0c0c);
+        scene.add(ambientLight);
+
+        // ============================================================
+        // SpotLight（スポットライト）…影を作るメイン光源
+        // ============================================================
+        var spotLight = new THREE.SpotLight(0xffffff);
+
+        // ライト位置（元コードと同じ）
+        spotLight.position.set(-20, 30, -5);
+
+        // ライトが影（shadow map）を生成する
+        spotLight.castShadow = true;
+
+        /*
+          ★今回の要求：decay の設定を変える
+
+          【decayとは何か？（理論）】
+          SpotLight / PointLight では、距離 r に応じて光の届き方（照度 E）が減衰する。
+          概念的には
+
+          $ E \propto \frac{1}{r^{decay}} $
+
+          のように減衰するイメージである（実装は物理ベース寄りのモデルも絡む）。
+
+          【decay を大きくすると】
+          - 遠くに届きにくい → 対象物が暗くなりやすい（Lambert材質は特に黒く見える）
+          - ただし“現実っぽい”減衰になる
+
+          【decay を小さくすると】
+          - 遠くにも届く → 教材のようなスケールでも見えやすい
+          - ただし物理的には不自然になりやすい
+
+          ここでは「0（減衰なし）」ではなく、
+          “弱めの減衰” を残して「雰囲気は物理寄り、でも暗すぎない」を狙う。
+        */
+        spotLight.decay = 0.0;     // ← 変更点：減衰を「弱め」に設定（0よりは現実寄り、2よりは明るい）
+        spotLight.intensity = 1.2; // ← decay を上げると暗くなるので、最小限の補償として少しだけ強度を上げる
+
+        /*
+          SpotLight は position → target の方向へ照射する。
+          target を明示してシーングラフに入れると、方向が安定して意図が伝わりやすい。
+        */
+        spotLight.target.position.set(0, 0, 0);
+        scene.add(spotLight.target);
+
+        /*
+          影の品質調整（最小限）
+          - mapSize を上げると影のジャギーが減る（ただし負荷が増える）
+          - bias/normalBias は自己シャドウ（shadow acne）対策
+        */
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+        spotLight.shadow.bias = -0.0001;
+        spotLight.shadow.normalBias = 0.02;
+
+        scene.add(spotLight);
+
+        // ============================================================
+        // DOMへ canvas を追加（これが無いと画面に表示されない）
+        // ============================================================
+        document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+        // ============================================================
+        // Animation loop（アニメーション）
+        // ============================================================
+        // 「毎フレームのアルゴリズム」：
+        // 1) stats.update() で計測更新
+        // 2) cube を回転（角度を加算）
+        // 3) sphere を三角関数で移動（cos/sin で周期運動）
+        // 4) requestAnimationFrame で次フレーム予約
+        // 5) renderer.render(scene, camera) で描画
+        //
+        // ここで重要なのは「状態更新 → render」の順序である。
+        // 先に render してしまうと、更新が1フレーム遅れて見える（視覚的ラグが出る）。
+        var step = 0;
+        renderScene();
+
+        function renderScene() {
+            stats.update();
+
+            // rotate the cube around its axes
+            cube.rotation.x += 0.02;
+            cube.rotation.y += 0.02;
+            cube.rotation.z += 0.02;
+
+            // bounce the sphere up and down
+            // step を増やすことで時間 t を進める（擬似時間）。
+            // x = 20 + 10*cos(t) で左右に往復
+            // y = 2 + 10*|sin(t)| で上方向にバウンド（負の高さにならないよう abs）
+            step += 0.04;
+            sphere.position.x = 20 + ( 10 * (Math.cos(step)));
+            sphere.position.y = 2 + ( 10 * Math.abs(Math.sin(step)));
+
+            // render using requestAnimationFrame
+            requestAnimationFrame(renderScene);
+
+            // 1フレーム描画（Scene を Camera 視点で）
+            renderer.render(scene, camera);
+        }
+
+        function initStats() {
+
+            var stats = new Stats();
+
+            // Stats の表示モード
+            // - 0: fps
+            // - 1: ms
+            // ※ stats.module.js でも互換的に動くが、将来は showPanel を使う方が安定する場合がある
+            stats.setMode(0);
+
+            // Align top-left
+            stats.domElement.style.position = 'absolute';
+            stats.domElement.style.left = '0px';
+            stats.domElement.style.top = '0px';
+
+            document.getElementById("Stats-output").appendChild(stats.domElement);
+
+            return stats;
+        }
+
+        // ============================================================
+        // Resize（リサイズ対応）
+        // ============================================================
+        // カメラの aspect を更新し projectionMatrix を再計算しないと、表示が歪む。
+        // アニメーション構成なので render は毎フレーム呼ばれており、ここではサイズ更新だけで良い。
+        window.addEventListener("resize", () => {
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+
+            renderer.setSize(w, h);
+        });
+    }
+
+    // 元コードの体裁維持：onload を残す
+    window.onload = init;
+
+</script>
+</body>
+</html>
