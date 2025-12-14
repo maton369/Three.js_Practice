@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+    <title>Example 01.03 - Materials and light</title>
+
+    <!--
+      元コードは ../libs/three.js を <script> で読み込む（window.THREE 前提）だが、
+      これからは ES Modules 前提にする、という方針に合わせて読み込みだけ最小変更する。
+
+      重要：今回 “全部真っ暗” になっていた原因は、Three.jsの近年の挙動では
+      SpotLight が「距離減衰（decay）」で急速に弱くなり、Lambert材質（光が無いと黒い）に
+      十分な光量が届いていなかったため。
+
+      そこで、AmbientLight を追加せず（元コードに無いので足さない）、
+      代わりに SpotLight の減衰を切って「昔の教材の感覚（強度=1でも見える）」に戻す。
+
+      最小の修正点は以下：
+      - spotLight.decay = 0;          // 距離減衰を無効化（=届く光量を確保）
+      - spotLight.intensity = 1.0;    // （明るすぎ/暗すぎならここだけ微調整）
+      - spotLight.target を明示（照射方向を安定させる）
+      - renderer.shadowMap.type を PCFSoft に（影の境界を自然にして“黒い塊感”を減らす）
+    -->
+    <script type="importmap">
+        {
+          "imports": {
+            "three": "https://unpkg.com/three@0.182.0/build/three.module.js"
+          }
+        }
+    </script>
+
+    <style>
+        body {
+            /* set margin to 0 and overflow to hidden, to go fullscreen */
+            margin: 0;
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body>
+
+<!-- Div which will hold the Output -->
+<div id="WebGL-output">
+</div>
+
+<!-- Javascript code that runs our Three.js examples -->
+<script type="module">
+
+    import * as THREE from "three";
+
+    // once everything is loaded, we run our Three.js stuff.
+    function init() {
+
+        // create a scene, that will hold all our elements such as objects, cameras and lights.
+        var scene = new THREE.Scene();
+
+        // create a camera, which defines where we're looking at.
+        var camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+        // create a render and set the size
+        var renderer = new THREE.WebGLRenderer();
+
+        renderer.setClearColor(new THREE.Color(0xEEEEEE));
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        // 影を使うスイッチ（Shadow Mapping を有効化）
+        renderer.shadowMap.enabled = true;
+
+        // 影の境界を柔らかくして、黒い“板”っぽさを減らす（見た目の改善）
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+        // create the ground plane
+        var planeGeometry = new THREE.PlaneGeometry(60, 20);
+        var planeMaterial = new THREE.MeshLambertMaterial({color: 0xffffff});
+        var plane = new THREE.Mesh(planeGeometry, planeMaterial);
+        plane.receiveShadow = true;
+
+        // rotate and position the plane
+        plane.rotation.x = -0.5 * Math.PI;
+        plane.position.x = 15;
+        plane.position.y = 0;
+        plane.position.z = 0;
+
+        // add the plane to the scene
+        scene.add(plane);
+
+        // create a cube
+        var cubeGeometry = new THREE.BoxGeometry(4, 4, 4);
+        var cubeMaterial = new THREE.MeshLambertMaterial({color: 0xff0000});
+        var cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+        cube.castShadow = true;
+
+        // position the cube
+        cube.position.x = -4;
+        cube.position.y = 3;
+        cube.position.z = 0;
+
+        // add the cube to the scene
+        scene.add(cube);
+
+        var sphereGeometry = new THREE.SphereGeometry(4, 20, 20);
+        var sphereMaterial = new THREE.MeshLambertMaterial({color: 0x7777ff});
+        var sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+
+        // position the sphere
+        sphere.position.x = 20;
+        sphere.position.y = 4;
+        sphere.position.z = 2;
+        sphere.castShadow = true;
+
+        // add the sphere to the scene
+        scene.add(sphere);
+
+        // position and point the camera to the center of the scene
+        camera.position.x = -30;
+        camera.position.y = 40;
+        camera.position.z = 30;
+        camera.lookAt(scene.position);
+
+        // add spotlight for the shadows
+        var spotLight = new THREE.SpotLight(0xffffff);
+
+        // ライトの位置（元コードのまま）
+        spotLight.position.set(-20, 30, -5);
+
+        // ライトが影を生成する（shadow map を作る）
+        spotLight.castShadow = true;
+
+        /*
+          ★最重要修正：距離減衰を無効化して “届く光量” を確保する
+          - 近年のThree.jsでは SpotLight が距離により急速に弱くなる（物理寄りの減衰）。
+          - Lambert材質はライトが弱いとほぼ黒になる。
+          - AmbientLightを入れない縛りのため、直射光を「ちゃんと届かせる」必要がある。
+
+          decay = 0 は「距離で減衰しない」＝昔の教材的な見え方に近い。
+        */
+        spotLight.decay = 0;
+
+        // 明るさ（必要ならここだけ 0.8〜2.0 くらいで微調整）
+        spotLight.intensity = 1.0;
+
+        /*
+          照射方向の安定化：
+          SpotLight は “position → target” の向きに照射する。
+          target を動かす/明示する場合は scene.add(spotLight.target) が安全。
+          ここでは床と物体がある原点付近（だいたい (0,0,0)）を見るようにする。
+        */
+        spotLight.target.position.set(0, 0, 0);
+        scene.add(spotLight.target);
+
+        /*
+          影の品質（任意だが効果が出やすい最小調整）：
+          - shadow map 解像度を上げるとジャギーが減り、影が自然に見える
+          - bias/normalBias は黒つぶれ（shadow acne）対策
+        */
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+        spotLight.shadow.bias = -0.0001;
+        spotLight.shadow.normalBias = 0.02;
+
+        scene.add(spotLight);
+
+        // add the output of the renderer to the html element
+        document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+        // call the render function
+        renderer.render(scene, camera);
+    }
+
+    // 元コードの体裁維持：onload を残す
+    window.onload = init;
+
+</script>
+</body>
+</html>
