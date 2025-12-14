@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Example 01.02 - First Scene</title>
+
+  <!--
+    【なぜ従来の <script src=".../three.min.js"> がダメなのか？】
+
+    - 以前のThree.js（昔の教材）では「ビルド済みの非モジュール版（three.js / three.min.js）」が配布されており、
+      それを <script> で読み込むと `window.THREE`（グローバル変数）が自動で生えていた。
+      そのため、教材の多くが
+        var scene = new THREE.Scene();
+      のように書けた。
+
+    - しかし、近年のThree.jsでは配布形態がES Modules中心になり、
+      “非モジュール版（three.min.js）” が提供されないバージョンがある。
+      その場合、`https://unpkg.com/three@0.182.0/build/three.min.js` のようなURLは 404 になり、
+      THREE が定義されず、結果として
+        THREE is not defined
+      となって処理が止まる。
+
+    【どう解決するか？】
+    - ES Modules版（three.module.js）を使い、import で THREE を受け取る。
+    - こうすると THREE は “グローバル” ではなく “このモジュール内の変数” になる。
+  -->
+
+  <style>
+    /*
+      body の余白を消す → canvas がページ端まで広がる。
+      overflow:hidden → スクロールバーの出現を防ぎ、表示ズレや操作の邪魔を防ぐ。
+
+      ※より厳密に「必ず画面いっぱい」を狙うなら html, body { width:100%; height:100%; } を足すことも多い。
+    */
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <!--
+    Three.js のレンダラー（WebGLRenderer）は内部で <canvas> を生成する。
+    その canvas をどこに挿すかはアプリ側が決める必要があるため、描画先コンテナを用意している。
+  -->
+  <div id="WebGL-output"></div>
+
+  <!--
+    type="module" を付ける理由（重要）：
+
+    1) import 文が使える
+       ES Modules は import/export を前提とした仕組みなので、これがないと import が構文エラーになる。
+
+    2) 実行タイミングが「だいたい defer」になる
+       module script は HTML のパースをブロックしにくく、
+       DOMが構築された後に走る挙動になりやすい。
+       （とはいえ “必ず” ではないので、DOM要素を触るなら存在チェックはした方が安全）
+
+    3) スコープが分離される
+       import した THREE は、この module の中でだけ使える。
+       window.THREE のようなグローバルに依存しないので、衝突が減り保守性が上がる。
+  -->
+  <script type="module">
+    /*
+      Three.js を unpkg から ES Modules として読み込む。
+
+      - import * as THREE は「three.module.js が export しているものを全部 THREE に束ねる」書き方。
+      - バージョン固定（@0.182.0）：
+        ここを固定しないと、将来の更新で API が変わって教材コードが突然壊れるリスクがある。
+    */
+    import * as THREE from "https://unpkg.com/three@0.182.0/build/three.module.js";
+
+    function init() {
+      // ============================================================
+      // 0) 描画先DOMの取得（canvasの挿入先）
+      // ============================================================
+      const container = document.getElementById("WebGL-output");
+
+      /*
+        container が null になる典型例：
+        - HTML側で id を変えた
+        - script が DOM 構築より前に動いた
+        - ページ構造が別ファイルに分割されている
+
+        null のまま appendChild すると「原因不明のエラー」に見えやすいので、
+        ここで明示的に止めてログを出すのが実務上かなり有効。
+      */
+      if (!container) {
+        console.error('Element "#WebGL-output" was not found.');
+        return;
+      }
+
+      // ============================================================
+      // 1) Scene（シーン）：3D世界の入れ物
+      // ============================================================
+      /*
+        Scene は “空間そのもの” を表す。
+        - Mesh（立方体や床）
+        - Helper（座標軸）
+        - Light（ライト）
+        - Group（まとまり）
+        などを scene.add(...) で追加していき、最終的に renderer が scene 全体を描画する。
+
+        Three.js は「Scene を描く」というより
+        「Scene を Camera 視点で Renderer が描く」という 3点セットで成立する。
+      */
+      const scene = new THREE.Scene();
+
+      // ============================================================
+      // 2) Camera（カメラ）：3D→2D への見え方を決める
+      // ============================================================
+      /*
+        PerspectiveCamera（透視投影）：
+        - 近いものは大きく、遠いものは小さく見える（人間の視覚に近い）
+
+        引数：
+        - fov（視野角 / 度）
+          値が大きいほど広角になり、遠近感が強調される。
+        - aspect（縦横比）
+          ここがズレると、投影が横に伸びたり縦に潰れたりする。
+        - near / far（クリッピング平面）
+          カメラから見て near より手前、far より奥は描画しない。
+          これは “表示最適化” だけでなく、深度バッファ精度にも影響する重要パラメータ。
+      */
+      const camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      // ============================================================
+      // 3) Renderer（レンダラー）：WebGLで実際に描く
+      // ============================================================
+      /*
+        WebGLRenderer は
+        - GPUに頂点データを送り（ジオメトリ）
+        - シェーダで変換し（内部的にはマテリアルごとにシェーダが決まる）
+        - ラスタライズしてピクセルを塗り
+        - canvas に出力する
+        という一連の流れを担当する。
+
+        「renderer.render(scene, camera)」を呼んだ瞬間に、
+        Scene を Camera 視点で描いて canvas を更新する。
+      */
+      const renderer = new THREE.WebGLRenderer();
+
+      /*
+        setClearColor は「描画前に画面を塗りつぶす色」。
+        ここを薄いグレーにしておくと、何も描けていない状態でも
+        “canvas自体は表示されている” ことが分かりやすい。
+      */
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+
+      /*
+        setSize は renderer が生成した canvas の解像度を決める。
+        ここが小さいと、描画が引き伸ばされてぼやける/粗く見える。
+        （実務では setPixelRatio も一緒に設定することが多い）
+      */
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // ============================================================
+      // 4) 座標軸ヘルパ：ワールド座標を可視化する
+      // ============================================================
+      /*
+        AxesHelper は “X, Y, Z の方向” を目で確認するための補助。
+        初学者がつまずきやすい
+        - どっちが上？
+        - 奥はどっち？
+        - 右方向は？
+        を即座に確認できる。
+
+        Three.js の右手系（右手座標系）と合わせて理解すると良い：
+        - X: 左右
+        - Y: 上下
+        - Z: 手前/奥（カメラの向きと合わせて感覚を掴む）
+      */
+      const axes = new THREE.AxesHelper(20);
+      scene.add(axes);
+
+      // ============================================================
+      // 5) 床（Plane）：Geometry + Material → Mesh
+      // ============================================================
+      /*
+        Three.js の描画対象は基本的に Mesh。
+        Mesh は「形（Geometry）」と「見た目（Material）」の組でできる。
+
+        PlaneGeometry(60, 20) は幅60・奥行20の平面。
+        ただしデフォルトでは XY 平面上に生成されるので、
+        そのままだと “壁” のような向きになることがある。
+
+        地面にしたい → XZ 平面に寝かせる必要がある。
+      */
+      const plane = new THREE.Mesh(
+        new THREE.PlaneGeometry(60, 20),
+        /*
+          MeshBasicMaterial はライトの影響を受けない。
+          つまり Light を置かなくても “指定した色のまま” 見える。
+          導入としては分かりやすいが、現実感のある陰影は出ない。
+        */
+        new THREE.MeshBasicMaterial({ color: 0xcccccc })
+      );
+
+      /*
+        rotation.x = -0.5 * Math.PI
+        Math.PI は 180度。
+        0.5 * Math.PI は 90度。
+        -90度回転して、XY平面 → XZ平面 へ向きを変えるイメージ。
+      */
+      plane.rotation.x = -0.5 * Math.PI;
+
+      /*
+        position は「ワールド座標での配置」。
+        plane.position.x = 15 は、床を X方向へ 15 平行移動する。
+      */
+      plane.position.x = 15;
+
+      scene.add(plane);
+
+      // ============================================================
+      // 6) 立方体（Cube）
+      // ============================================================
+      /*
+        BoxGeometry(4,4,4) は 4×4×4 の箱。
+
+        wireframe: true は “面を塗らずに線だけで表示”。
+        形状の確認やデバッグに向く。
+      */
+      const cube = new THREE.Mesh(
+        new THREE.BoxGeometry(4, 4, 4),
+        new THREE.MeshBasicMaterial({ color: 0xff0000, wireframe: true })
+      );
+      cube.position.set(-4, 3, 0);
+      scene.add(cube);
+
+      // ============================================================
+      // 7) 球（Sphere）
+      // ============================================================
+      /*
+        SphereGeometry(半径, 横分割, 縦分割)
+
+        分割数が多いほど滑らかになるが、頂点数が増えて重くなる。
+        今回は 20,20 として “十分滑らか + 重すぎない” を狙っている。
+      */
+      const sphere = new THREE.Mesh(
+        new THREE.SphereGeometry(4, 20, 20),
+        new THREE.MeshBasicMaterial({ color: 0x7777ff, wireframe: true })
+      );
+      sphere.position.set(20, 4, 2);
+      scene.add(sphere);
+
+      // ============================================================
+      // 8) カメラ位置と注視点（lookAt）
+      // ============================================================
+      /*
+        カメラはデフォルトで原点付近にあるため、
+        そのままだとオブジェクトと重なって “見えない” ことが多い。
+        そこで、斜め上からシーン全体を見下ろすように配置する。
+      */
+      camera.position.set(-30, 40, 30);
+
+      /*
+        lookAt(scene.position)
+        scene.position はデフォルトで (0,0,0)。
+        つまり「原点を見る」設定になる。
+
+        注意：
+        - lookAt はカメラの向きを決めるが、アニメーションでカメラを動かす場合は
+          毎フレーム呼び直す必要があるケースがある。
+      */
+      camera.lookAt(scene.position);
+
+      // ============================================================
+      // 9) canvas をDOMに挿入
+      // ============================================================
+      /*
+        renderer.domElement が canvas。
+        これを DOM に追加しない限り、どれだけ render() しても画面には出ない。
+
+        “真っ白” の典型原因のひとつが
+        - render はしている
+        - でも canvas を appendChild していない
+        というパターン。
+      */
+      container.appendChild(renderer.domElement);
+
+      // ============================================================
+      // 10) 1フレーム描画（静止画）
+      // ============================================================
+      /*
+        この例は requestAnimationFrame ループが無いので、描画は一回だけ。
+        その結果、「静止画」として表示される。
+
+        アニメーションしたい場合は
+          function animate(){
+            requestAnimationFrame(animate);
+            renderer.render(scene,camera);
+          }
+          animate();
+        のように毎フレーム描く必要がある。
+      */
+      renderer.render(scene, camera);
+
+      // ============================================================
+      // 11) リサイズ対応（静止画だと再描画が特に重要）
+      // ============================================================
+      /*
+        ウィンドウサイズが変わると aspect（縦横比）が変化する。
+        aspect が変わったのに projection matrix を更新しないと投影が歪む。
+
+        手順：
+        - camera.aspect を更新
+        - camera.updateProjectionMatrix() で射影行列を再計算
+        - renderer.setSize で canvas の解像度を更新
+        - 静止画構成なので renderer.render をもう一回呼ぶ
+      */
+      window.addEventListener("resize", () => {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+
+        renderer.setSize(w, h);
+        renderer.render(scene, camera);
+      });
+    }
+
+    /*
+      module script は基本的にDOM構築後に動くため、ここで init() を呼べばOK。
+      （画像テクスチャなど“読み込み完了”を待ちたいケースでは window.load を使うこともある）
+    */
+    init();
+  </script>
+</body>
+</html>
