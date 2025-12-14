@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Example 01.05 - Control gui</title>
+
+  <!--
+    【方針】Three.js は ES Modules 前提（window.THREE に依存しない）
+    - 旧来の ../libs/three.js / stats.js / dat.gui.js の <script> 直読みは使わない
+    - importmap で依存（three と addons）を “短い import” で書けるようにする
+    - three のバージョンを固定して、教材が突然壊れる確率を下げる
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      /* set margin to 0 and overflow to hidden, to go fullscreen */
+      margin: 0;
+      overflow: hidden;
+    }
+  </style>
+</head>
+<body>
+
+<div id="Stats-output"></div>
+<div id="WebGL-output"></div>
+
+<!--
+  type="module" が重要：
+  - import が使える
+  - THREE はグローバルではなく、このモジュール内の変数として扱う
+-->
+<script type="module">
+  import * as THREE from "three";
+
+  /*
+    Stats は three の addons 側に同梱されている module を使う。
+    これにより、外部パッケージ stats.js を CDN 直 import した時に起きやすい
+    CORS / 404 / 配布パス違いのトラブルを避けやすい。
+  */
+  import Stats from "three/addons/libs/stats.module.js";
+
+  /*
+    dat.gui は旧来のグローバル前提ライブラリで、ES Modules と相性が悪いケースが多い。
+    ここでは “dat.gui 相当” として lil-gui（軽量で互換に近いGUI）を採用する。
+    API は dat.GUI とほぼ同型の感覚で使える（new GUI(), gui.add(...)）。
+  */
+  import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+  function init() {
+    // ============================================================
+    // 0) DOM（canvas と stats の挿入先）
+    // ============================================================
+    const statsContainer = document.getElementById("Stats-output");
+    const webglContainer = document.getElementById("WebGL-output");
+
+    if (!statsContainer || !webglContainer) {
+      console.error("Required containers (#Stats-output / #WebGL-output) not found.");
+      return;
+    }
+
+    // ============================================================
+    // 1) Stats 初期化（FPS表示）
+    // ============================================================
+    const stats = initStats(statsContainer);
+
+    // ============================================================
+    // 2) Scene / Camera / Renderer（Three.js 最小3点セット）
+    // ============================================================
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(
+      45,                                // fov（視野角）
+      window.innerWidth / window.innerHeight, // aspect（縦横比）
+      0.1,                               // near
+      1000                               // far
+    );
+
+    const renderer = new THREE.WebGLRenderer();
+
+    renderer.setClearColor(new THREE.Color(0xEEEEEE));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    /*
+      Shadow Mapping（影）を有効化するスイッチ
+      影の成立条件（4点セット）：
+      1) renderer.shadowMap.enabled = true
+      2) light.castShadow = true
+      3) mesh.castShadow = true（影を落とす）
+      4) mesh.receiveShadow = true（影を受ける）
+    */
+    renderer.shadowMap.enabled = true;
+
+    /*
+      影の境界を少し柔らかくして “黒い板” 感を減らす（教材的に見やすい）
+      ※負荷は増えるが、今回の規模なら問題になりにくい
+    */
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    // ============================================================
+    // 3) Ground（床）
+    // ============================================================
+    const planeGeometry = new THREE.PlaneGeometry(60, 20, 1, 1);
+    const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+    plane.receiveShadow = true;
+
+    // PlaneGeometry はデフォルトで XY 平面なので、床にするため XZ に寝かせる（-90°）
+    plane.rotation.x = -0.5 * Math.PI;
+    plane.position.set(15, 0, 0);
+
+    scene.add(plane);
+
+    // ============================================================
+    // 4) Cube（回転する立方体）
+    // ============================================================
+    const cubeGeometry = new THREE.BoxGeometry(4, 4, 4);
+    const cubeMaterial = new THREE.MeshLambertMaterial({ color: 0xff0000 });
+    const cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+
+    cube.castShadow = true;
+    cube.position.set(-4, 3, 0);
+
+    scene.add(cube);
+
+    // ============================================================
+    // 5) Sphere（バウンドする球）
+    // ============================================================
+    const sphereGeometry = new THREE.SphereGeometry(4, 20, 20);
+    const sphereMaterial = new THREE.MeshLambertMaterial({ color: 0x7777ff });
+    const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+
+    sphere.castShadow = true;
+    sphere.position.set(20, 0, 2);
+
+    scene.add(sphere);
+
+    // ============================================================
+    // 6) Camera 配置
+    // ============================================================
+    camera.position.set(-30, 40, 30);
+    camera.lookAt(scene.position);
+
+    // ============================================================
+    // 7) Lighting（環境光 + スポットライト）
+    // ============================================================
+    /*
+      AmbientLight（環境光）
+      - 方向性のない光で、影の中にも一様に回り込む
+      - Lambert 材質は “光が弱いと黒くなりやすい” ため、
+        低強度でも ambient を置くと黒つぶれが軽減する
+    */
+    const ambientLight = new THREE.AmbientLight(0x0c0c0c);
+    scene.add(ambientLight);
+
+    /*
+      SpotLight（スポットライト）
+      - 影を作る主光源
+      - ここでの重要方針：decay は常に 0（距離減衰なし）
+        これにより教材スケール（数十ユニット）でも光量不足で真っ暗になりにくい
+    */
+    const spotLight = new THREE.SpotLight(0xffffff);
+
+    spotLight.position.set(-20, 30, -5);
+    spotLight.castShadow = true;
+
+    // ★方針：decay はこれから常に 0
+    spotLight.decay = 0;
+
+    // 強度は必要に応じて微調整（暗いなら上げる、白飛びするなら下げる）
+    spotLight.intensity = 1.0;
+
+    /*
+      SpotLight は position → target の方向へ照射する。
+      target を明示して scene に入れると、意図（どこを照らすか）が安定しやすい。
+    */
+    spotLight.target.position.set(0, 0, 0);
+    scene.add(spotLight.target);
+
+    /*
+      影の品質（最小限の改善）
+      - mapSize を上げると影のジャギーが減るが、ライト視点での追加レンダリングが重くなる
+      - bias / normalBias は自己シャドウ（shadow acne）対策
+    */
+    spotLight.shadow.mapSize.width = 1024;
+    spotLight.shadow.mapSize.height = 1024;
+    spotLight.shadow.bias = -0.0001;
+    spotLight.shadow.normalBias = 0.02;
+
+    scene.add(spotLight);
+
+    // ============================================================
+    // 8) canvas を DOM に挿入（これをしないと表示されない）
+    // ============================================================
+    webglContainer.appendChild(renderer.domElement);
+
+    // ============================================================
+    // 9) GUI（回転速度・バウンド速度を操作）
+    // ============================================================
+    /*
+      元コード：new dat.GUI()
+      ES Modules 版：new GUI()
+      gui.add(...) の操作感はほぼ同じ。
+    */
+    const controls = {
+      rotationSpeed: 0.02,
+      bouncingSpeed: 0.03
+    };
+
+    const gui = new GUI();
+    gui.add(controls, "rotationSpeed", 0, 0.5);
+    gui.add(controls, "bouncingSpeed", 0, 0.5);
+
+    // ============================================================
+    // 10) Animation loop（毎フレーム更新）
+    // ============================================================
+    /*
+      アルゴリズム（毎フレームの流れ）：
+      1) stats.update() で計測表示更新
+      2) cube の回転：角度 += rotationSpeed
+      3) sphere の移動：step を進めて cos/sin で周期運動
+      4) renderer.render(scene, camera) で 1 フレーム描画
+      5) requestAnimationFrame で次フレーム予約
+    */
+    let step = 0;
+
+    function render() {
+      stats.update();
+
+      // 立方体：3軸回転（角速度を controls で調整）
+      cube.rotation.x += controls.rotationSpeed;
+      cube.rotation.y += controls.rotationSpeed;
+      cube.rotation.z += controls.rotationSpeed;
+
+      // 球：バウンド（step を時間パラメータとして扱う）
+      step += controls.bouncingSpeed;
+      sphere.position.x = 20 + (10 * Math.cos(step));
+      sphere.position.y = 2 + (10 * Math.abs(Math.sin(step)));
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(render);
+    }
+
+    render();
+
+    // ============================================================
+    // 11) Resize（リサイズ対応）
+    // ============================================================
+    /*
+      aspect が変わると射影が歪むため、resize 時に更新する。
+      - camera.aspect 更新
+      - camera.updateProjectionMatrix() で射影行列を再計算
+      - renderer.setSize で canvas 解像度更新
+    */
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+    });
+  }
+
+  function initStats(statsContainer) {
+    const stats = new Stats();
+
+    /*
+      Stats の表示パネル
+      古い例では setMode(0) がよく出るが、module 版では showPanel が定番。
+      - 0: fps
+      - 1: ms
+      - 2: mb（環境による）
+    */
+    stats.showPanel(0);
+
+    // Align top-left（元コードの意図を維持）
+    stats.dom.style.position = "absolute";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+
+    statsContainer.appendChild(stats.dom);
+    return stats;
+  }
+
+  // 元コードの体裁を維持して onload で起動
+  window.onload = init;
+</script>
+
+</body>
+</html>
