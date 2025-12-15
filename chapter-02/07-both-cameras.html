@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 02.07 - Cameras (ES Modules + detailed comments)</title>
+
+  <!--
+    【方針（これまで通り：ES Modules + importmap）】
+    - 旧来の ../libs/three.js / stats.js / dat.gui.js の <script> 直読みをやめる
+    - three は CDN から ESM で import
+    - GUI は dat.gui 互換の lil-gui（three/addons）を使う
+    - Stats も three/addons から読む
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // 目的：PerspectiveCamera と OrthographicCamera の切り替えで
+    //       「投影（Projection）の違い」を見た目で理解する
+    //
+    // Perspective（透視投影）：
+    //   - 遠いほど小さく見える（現実のカメラと同じ）
+    //   - 視錐台（frustum）が “すぼまる”
+    //
+    // Orthographic（正射影）：
+    //   - 距離で大きさが変わらない（設計図/地図っぽい）
+    //   - 視錐台が “箱” になる（平行投影）
+    //
+    // このサンプルでは床に格子状にキューブを並べ、
+    // 「遠近感が出る/出ない」を明確に観察できるようにしている。
+    // ============================================================
+
+    // グローバル的に参照したいものを上に置く（切り替え・リサイズで使う）
+    let camera;
+    let scene;
+    let renderer;
+    let stats;
+
+    // カメラ位置（透視/正射影で共通にする：比較が楽）
+    const CAM_POS = new THREE.Vector3(120, 60, 180);
+
+    // シーンを見る基準点（床の中心＝原点）
+    const LOOK_TARGET = new THREE.Vector3(0, 0, 0);
+
+    // 正射影カメラの “見える範囲” を決めるためのスケール値
+    // - 値が小さいほど「ズームイン」、大きいほど「ズームアウト」に相当
+    const ORTHO_FRUSTUM_SIZE = 64;
+
+    // ============================================================
+    // init：初期化（シーン構築 → GUI → ループ開始）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene：シーングラフのルート
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Renderer：WebGL 描画装置
+      // - clearColor は背景色（何もない部分の色）
+      // - size は canvas の描画領域
+      // - pixelRatio は高DPI対策（上げすぎると負荷増）
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // DOM に canvas を追加（これが無いと画面に何も出ない）
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // 床（Plane）：比較用の基準面
+      // - PlaneGeometry はデフォルトでXY平面なので、床にするためXZへ寝かせる
+      // ------------------------------------------------------------
+      const planeGeometry = new THREE.PlaneGeometry(180, 180);
+      const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+      const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+      plane.rotation.x = -0.5 * Math.PI;
+      plane.position.set(0, 0, 0);
+      scene.add(plane);
+
+      // ------------------------------------------------------------
+      // キューブを格子状に敷く（奥行き方向に並ぶほど遠近差が分かる）
+      // - cubeMaterial.color = (rnd, 0, 0) で “赤の濃淡” にしている
+      // - Geometry は共有してメモリ効率を上げる（教材としても良い慣習）
+      // ------------------------------------------------------------
+      const cubeGeometry = new THREE.BoxGeometry(4, 4, 4);
+
+      // width/height は 180、間隔が 5 なので 36×36=1296個 になる
+      // ※ これは環境によっては少し重い場合がある（必要なら間隔を増やす）
+      const rows = planeGeometry.parameters.height / 5;
+      const cols = planeGeometry.parameters.width / 5;
+
+      for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+          const rnd = Math.random() * 0.75 + 0.25; // 0.25〜1.0
+          const cubeMaterial = new THREE.MeshLambertMaterial({
+            color: new THREE.Color(rnd, 0, 0)
+          });
+
+          const cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+
+          // 床の中心が原点なので、[-W/2, W/2] の範囲に並べる
+          cube.position.z = -(planeGeometry.parameters.height / 2) + 2 + (j * 5);
+          cube.position.x = -(planeGeometry.parameters.width  / 2) + 2 + (i * 5);
+          cube.position.y = 2; // 立方体の半分（高さ4の半分）だけ上げて床に接地させる
+
+          scene.add(cube);
+        }
+      }
+
+      // ------------------------------------------------------------
+      // 光源：Lambert はライトが無いと真っ黒なので最低限の照明を置く
+      // - DirectionalLight：太陽光のような平行光（距離減衰の概念が薄い）
+      // - AmbientLight：影の黒つぶれを抑えるベース光
+      // ------------------------------------------------------------
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
+      directionalLight.position.set(-20, 40, 60);
+      scene.add(directionalLight);
+
+      const ambientLight = new THREE.AmbientLight(0x292929);
+      scene.add(ambientLight);
+
+      // ------------------------------------------------------------
+      // 初期カメラ：まずは Perspective（透視投影）で開始
+      // ------------------------------------------------------------
+      camera = makePerspectiveCamera();
+      camera.lookAt(LOOK_TARGET);
+
+      // ------------------------------------------------------------
+      // GUI：カメラ切り替え
+      // - “今どちらの投影か” を表示する
+      // ------------------------------------------------------------
+      const controls = {
+        projection: "Perspective",
+        switchCamera: () => {
+          // 現在の camera の種類で分岐
+          if (camera.isPerspectiveCamera) {
+            camera = makeOrthographicCamera();
+            controls.projection = "Orthographic";
+          } else {
+            camera = makePerspectiveCamera();
+            controls.projection = "Perspective";
+          }
+
+          // カメラ切り替え後は必ず注視点を再設定
+          // - 新しい camera インスタンスなので lookAt 情報がリセットされる
+          camera.position.copy(CAM_POS);
+          camera.lookAt(LOOK_TARGET);
+        }
+      };
+
+      const gui = new GUI({ title: "Controls" });
+      gui.add(controls, "switchCamera").name("switchCamera");
+      gui.add(controls, "projection").name("projection").listen();
+
+      // ------------------------------------------------------------
+      // resize：画面比率が変わると投影が壊れるので必ず更新する
+      // - Perspective：aspect を更新し、updateProjectionMatrix() が必要
+      // - Orthographic：left/right/top/bottom を更新し、updateProjectionMatrix() が必要
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // ループ開始
+      // ------------------------------------------------------------
+      render();
+    }
+
+    // ============================================================
+    // PerspectiveCamera の生成
+    // - 透視投影：視野角(fov), aspect, near, far
+    // - near が小さすぎると深度精度が落ち Z-fighting が起きやすい
+    // ============================================================
+    function makePerspectiveCamera() {
+      const cam = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      cam.position.copy(CAM_POS);
+      return cam;
+    }
+
+    // ============================================================
+    // OrthographicCamera の生成
+    // - 正射影：left, right, top, bottom, near, far
+    //
+    // ここが重要：
+    // - Orthographic は “画面に映る範囲” を数値で直接決める必要がある
+    // - 透視投影のように fov で自動調整されない
+    //
+    // 本コードでは「画面の縦横比(aspect)」を使って、
+    // 画面が横長でも縦長でも、表示範囲が歪まずに見えるよう調整する。
+    // ============================================================
+    function makeOrthographicCamera() {
+      const aspect = window.innerWidth / window.innerHeight;
+
+      // 表示サイズの基準：frustumSize を基に “縦方向の見える範囲” を決める
+      // 横方向は aspect に応じて広げる
+      const frustumSize = ORTHO_FRUSTUM_SIZE;
+
+      const left   = (-frustumSize * aspect) / 2;
+      const right  = ( frustumSize * aspect) / 2;
+      const top    = ( frustumSize) / 2;
+      const bottom = (-frustumSize) / 2;
+
+      // near/far は「カメラの前後にどれだけ見えるか」
+      // - near を負にするのは一般に推奨されない（クリップの定義が直感とズレやすい）
+      // - ここでは床・キューブが十分入るよう 0.1〜1000 に合わせる
+      const cam = new THREE.OrthographicCamera(left, right, top, bottom, 0.1, 1000);
+
+      cam.position.copy(CAM_POS);
+      return cam;
+    }
+
+    // ============================================================
+    // onResize：リサイズ時の投影更新
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      if (camera.isPerspectiveCamera) {
+        // 透視投影：aspect を更新し投影行列を再計算
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      } else {
+        // 正射影：left/right/top/bottom を更新し投影行列を再計算
+        const aspect = w / h;
+        const frustumSize = ORTHO_FRUSTUM_SIZE;
+
+        camera.left   = (-frustumSize * aspect) / 2;
+        camera.right  = ( frustumSize * aspect) / 2;
+        camera.top    = ( frustumSize) / 2;
+        camera.bottom = (-frustumSize) / 2;
+
+        camera.updateProjectionMatrix();
+      }
+    }
+
+    // ============================================================
+    // render：毎フレーム描画
+    // - このサンプルではアニメーションは無いので “描画のみ”
+    // - Stats は毎フレーム update して FPS 表示
+    // ============================================================
+    function render() {
+      stats.update();
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // Stats 初期化
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+
+      // 左上固定
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    // 元コードの体裁維持：window.onload
+    window.onload = init;
+  </script>
+</body>
+</html>
