@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 02.04 - Geometries</title>
+
+  <!--
+    【今まで通りの方針（ES Modules + importmap）】
+    - 旧来の ../libs/*.js（window.THREE 前提）の直読みをやめて、ES Modules で import する。
+    - 直前に落ちていた ParametricGeometries.js は「CDN 側の配信/CORS/404」要因で壊れやすいので、
+      “モビウス関数 mobius3d を自前実装” に切り替えて依存を消す（教材の狙い＝ParametricGeometry の理解は保てる）。
+    - ConvexGeometry / ParametricGeometry は three の addons から import する。
+    - THREE.SceneUtils.createMultiMaterialObject は現行 three では廃止なので、
+      Group + (solid Mesh + wire Mesh) の重ね描きで置き換える。
+    - SpotLight.decay は方針通り 0（距離減衰なし）で固定する。
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { ConvexGeometry } from "three/addons/geometries/ConvexGeometry.js";
+    import { ParametricGeometry } from "three/addons/geometries/ParametricGeometry.js";
+
+    // ============================================================
+    // ParametricGeometries.mobius3d 相当（依存を消すため自前で実装）
+    // ============================================================
+    /*
+      ParametricGeometry は「(u, v) ∈ [0,1]×[0,1]」のパラメータを、
+      3D 空間の点 P(u, v) に写像してメッシュ化する。
+
+      この mobius3d は “モビウスの帯” を生成する代表例。
+      - u: 帯の周方向（0..1 → 0..2π）
+      - v: 帯の幅方向（0..1 → -1..1）
+      - target: 計算結果の座標を格納する Vector3（毎回 new しないためのAPI設計）
+    */
+    function mobius3d(u, v, target) {
+      const U = u * Math.PI * 2;
+      const V = (v - 0.5) * 2; // [-1, 1]
+
+      // 帯の幅（厚み）スケール
+      const a = 2.0;
+
+      // モビウス帯の典型的なパラメータ化
+      const x = Math.cos(U) * (a + V * Math.cos(U / 2));
+      const y = Math.sin(U) * (a + V * Math.cos(U / 2));
+      const z = V * Math.sin(U / 2);
+
+      target.set(x, z, y); // 見やすいように軸入れ替え（床との関係が分かりやすい）
+    }
+
+    // ============================================================
+    // init：初期化（シーン構築 → 描画ループ開始）
+    // ============================================================
+    function init() {
+      const stats = initStats();
+
+      // Scene：シーングラフのルート（全オブジェクトの入れ物）
+      const scene = new THREE.Scene();
+
+      // Camera：透視投影（視野角, アスペクト比, near, far）
+      const camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      // Renderer：WebGL 描画装置（canvas を内部生成）
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // Shadow Mapping（影）
+      // 影が成立する 4 点セット：
+      // 1) renderer.shadowMap.enabled = true
+      // 2) light.castShadow = true
+      // 3) mesh.castShadow = true
+      // 4) mesh.receiveShadow = true
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      // Ground（床）
+      // PlaneGeometry はデフォルト XY 平面なので、X 軸回転で XZ に寝かせて床にする
+      const planeGeometry = new THREE.PlaneGeometry(60, 40, 1, 1);
+      const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+      const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+      plane.receiveShadow = true;
+      plane.rotation.x = -0.5 * Math.PI;
+      plane.position.set(0, 0, 0);
+      scene.add(plane);
+
+      // Camera placement：ジオメトリ群を斜めから眺める
+      camera.position.set(-50, 30, 20);
+      const lookTarget = new THREE.Vector3(-10, 0, 0);
+      camera.lookAt(lookTarget);
+
+      // Lights：Lambert/Phong を見せる最小構成
+      const ambientLight = new THREE.AmbientLight(0x090909);
+      scene.add(ambientLight);
+
+      const spotLight = new THREE.SpotLight(0xffffff);
+      spotLight.position.set(-25, 25, 32);
+      spotLight.castShadow = true;
+
+      // ★方針：SpotLight/PointLight の decay は常に 0（距離減衰なし）
+      // - 教材スケール（座標が数十）で暗くなりすぎる事故を避ける
+      spotLight.decay = 0;
+
+      // SpotLight は position → target 方向に照射するため、target を明示して安定化
+      spotLight.target.position.copy(lookTarget);
+      scene.add(spotLight.target);
+
+      // 影品質（必要最小限）
+      spotLight.shadow.mapSize.set(1024, 1024);
+      spotLight.shadow.bias = -0.0001;
+      spotLight.shadow.normalBias = 0.02;
+      scene.add(spotLight);
+
+      // このサンプルの主題：Geometry を生成して並べる
+      addGeometries(scene);
+
+      // DOM に canvas を追加（これが無いと画面に何も出ない）
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // メインループ（requestAnimationFrame）
+      // - stats.update()：FPS 表示更新（DOM）
+      // - renderer.render(scene, camera)：1 フレーム描画
+      function render() {
+        stats.update();
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+      render();
+
+      // Resize：aspect と投影行列、レンダラーサイズを更新（歪み防止の必須手順）
+      window.addEventListener("resize", () => {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+
+        renderer.setSize(w, h);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      });
+    }
+
+    // ============================================================
+    // addGeometries：Geometry 群を生成して 4 列グリッドに配置
+    // ============================================================
+    function addGeometries(scene) {
+      const geoms = [];
+
+      // 代表的なプリミティブ（形状・分割の違いを比較しやすい）
+      geoms.push(new THREE.CylinderGeometry(1, 4, 4));
+      geoms.push(new THREE.BoxGeometry(2, 2, 2));
+      geoms.push(new THREE.SphereGeometry(2, 16, 12));
+      geoms.push(new THREE.IcosahedronGeometry(4));
+      geoms.push(new THREE.OctahedronGeometry(3));
+      geoms.push(new THREE.TetrahedronGeometry(3));
+      geoms.push(new THREE.TorusGeometry(3, 1, 10, 10));
+      geoms.push(new THREE.TorusKnotGeometry(3, 0.5, 50, 20));
+
+      // ConvexGeometry（凸包）
+      // - 点集合から「へこみのない（凸）形状」を構成する
+      // - ここでは立方体の 8 頂点 → 凸包は立方体になる
+      const points = [
+        new THREE.Vector3( 2,  2,  2),
+        new THREE.Vector3( 2,  2, -2),
+        new THREE.Vector3(-2,  2, -2),
+        new THREE.Vector3(-2,  2,  2),
+        new THREE.Vector3( 2, -2,  2),
+        new THREE.Vector3( 2, -2, -2),
+        new THREE.Vector3(-2, -2, -2),
+        new THREE.Vector3(-2, -2,  2)
+      ];
+      geoms.push(new ConvexGeometry(points));
+
+      // LatheGeometry（回転体）
+      // - 断面曲線（プロフィール）を Y 軸周りに回転して形状を作る
+      const pts = [];
+      const detail = 0.1; // 小さいほど滑らかだが頂点が増える
+      const radius = 3;
+      for (let angle = 0.0; angle < Math.PI; angle += detail) {
+        pts.push(new THREE.Vector3(Math.cos(angle) * radius, Math.sin(angle) * radius, 0));
+      }
+      geoms.push(new THREE.LatheGeometry(pts, 12));
+
+      // ParametricGeometry（関数ベース）
+      // - ParametricGeometries.js に依存せず、自前の mobius3d 関数でモビウス帯を作る
+      geoms.push(new ParametricGeometry(mobius3d, 20, 10));
+
+      // 旧コード互換：THREE.SceneUtils.createMultiMaterialObject は廃止
+      // 代替アルゴリズム：Group を作り
+      // 1) solid（Phong + flatShading）で面の立体感を出す
+      // 2) wireframe（Basic）で分割/輪郭を見せる
+      // を同一ジオメトリで重ねて 1 オブジェクトとして配置する
+      let row = 0;
+      for (let i = 0; i < geoms.length; i++) {
+        const group = new THREE.Group();
+
+        const solidMat = new THREE.MeshPhongMaterial({
+          color: Math.random() * 0xffffff,
+          flatShading: true
+        });
+
+        const wireMat = new THREE.MeshBasicMaterial({
+          color: 0x000000,
+          wireframe: true
+        });
+
+        // Z-fighting（面とワイヤが同一深度で競合してチラつく）対策：
+        // - polygonOffset でワイヤ側を “わずかに” 手前扱いにする
+        wireMat.polygonOffset = true;
+        wireMat.polygonOffsetFactor = -1;
+        wireMat.polygonOffsetUnits = -1;
+
+        const solidMesh = new THREE.Mesh(geoms[i], solidMat);
+        const wireMesh  = new THREE.Mesh(geoms[i], wireMat);
+
+        // 影を落とす（グループ内の各 Mesh に設定）
+        solidMesh.castShadow = true;
+        wireMesh.castShadow  = true;
+
+        group.add(solidMesh);
+        group.add(wireMesh);
+
+        // 4 列グリッド配置（元コードのレイアウト意図を維持）
+        group.position.x = -24 + ((i % 4) * 12);
+        group.position.y = 4;
+        group.position.z = -8 + (row * 12);
+
+        if ((i + 1) % 4 === 0) row++;
+
+        scene.add(group);
+      }
+    }
+
+    // Stats 初期化（FPS 表示）
+    function initStats() {
+      const stats = new Stats();
+      stats.showPanel(0); // 0: fps
+
+      stats.dom.style.position = "absolute";
+      stats.dom.style.left = "0px";
+      stats.dom.style.top = "0px";
+
+      document.getElementById("Stats-output").appendChild(stats.dom);
+      return stats;
+    }
+
+    // 元コードの体裁維持：onload を残す
+    window.onload = init;
+  </script>
+</body>
+</html>
