@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 02.06 - Mesh Properties</title>
+
+  <!--
+    【今まで通りの方針（ES Modules + importmap）】
+    - 旧来の ../libs/three.js / stats.js / dat.gui.js を <script> 直読み（window.THREE 前提）から、
+      ES Modules + importmap に移行する。
+    - GUI は dat.gui の代替として three/addons の lil-gui を使う（ESMで安定）。
+    - Stats も three/addons から読み、配布差異・CORS事故を減らす。
+
+    【このサンプルの主題】
+    - Mesh の “プロパティ操作” が何を意味するか（position / rotation / scale / visible）
+    - translateX/Y/Z（ローカル座標系での移動）と position（ワールド座標系の位置）の違い
+    - それらがシーングラフ上の変換行列（local matrix / world matrix）にどう反映されるか
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル参照（リサイズなどで参照するため）
+    // ============================================================
+    let camera, scene, renderer;
+    let cube;
+    let stats;
+
+    // ============================================================
+    // エントリーポイント
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene：3D世界（シーングラフのルート）
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Camera：透視投影（Perspective）
+      // - fov: 視野角（度）
+      // - aspect: 画面縦横比（リサイズで更新必須）
+      // - near/far: 表示する距離範囲（深度バッファにも影響）
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+      // ------------------------------------------------------------
+      // Renderer：WebGL描画装置（canvasを内部生成）
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+
+      // 背景色：描画されないピクセルの色
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+
+      // 描画サイズ：CSSの見た目だけでなく、実ピクセル解像度もここで決まる
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // HiDPI対策：Retinaでボケない。上げすぎると重いので 2 で頭打ちが定番。
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // ------------------------------------------------------------
+      // Shadow Mapping（影）
+      // 影が成立する4条件：
+      // 1) renderer.shadowMap.enabled = true
+      // 2) light.castShadow = true
+      // 3) mesh.castShadow = true
+      // 4) mesh.receiveShadow = true
+      // ------------------------------------------------------------
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      // ------------------------------------------------------------
+      // Ground Plane（床）
+      // PlaneGeometry はデフォルトで XY 平面なので、床にするため XZ に寝かせる
+      // ------------------------------------------------------------
+      const planeGeometry = new THREE.PlaneGeometry(60, 40, 1, 1);
+      const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+      const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+      plane.receiveShadow = true;
+      plane.rotation.x = -0.5 * Math.PI;
+      plane.position.set(0, 0, 0);
+      scene.add(plane);
+
+      // ------------------------------------------------------------
+      // Camera placement（カメラ配置）
+      // - 原点（scene.position）付近を見下ろす
+      // ------------------------------------------------------------
+      camera.position.set(-30, 40, 30);
+      camera.lookAt(scene.position);
+
+      // ------------------------------------------------------------
+      // AmbientLight：影の黒つぶれ防止の “底上げ光”
+      // ------------------------------------------------------------
+      const ambientLight = new THREE.AmbientLight(0x0c0c0c);
+      scene.add(ambientLight);
+
+      // ------------------------------------------------------------
+      // SpotLight：影を作るメイン光源
+      // - 方針：decay = 0（距離減衰なし）で暗すぎ事故を避ける
+      // ------------------------------------------------------------
+      const spotLight = new THREE.SpotLight(0xffffff);
+
+      spotLight.position.set(-20, 30, 10);
+      spotLight.castShadow = true;
+
+      // ★方針：SpotLight/PointLight の decay は 0
+      spotLight.decay = 0;
+
+      // 照射方向：position → target に向かう
+      spotLight.target.position.set(0, 0, 0);
+      scene.add(spotLight.target);
+
+      // 影品質（必要最小限）
+      spotLight.shadow.mapSize.set(1024, 1024);
+      spotLight.shadow.bias = -0.0001;
+      spotLight.shadow.normalBias = 0.02;
+
+      scene.add(spotLight);
+
+      // ------------------------------------------------------------
+      // Object：操作対象の Mesh（箱）
+      // ------------------------------------------------------------
+      /*
+        Mesh = Geometry（形） + Material（見た目）
+        - BoxGeometry(幅, 高さ, 奥行)
+        - LambertMaterial は拡散反射（マット）で、ライトが無いと暗い
+      */
+      const material = new THREE.MeshLambertMaterial({ color: 0x44ff44 });
+      const geom = new THREE.BoxGeometry(5, 8, 3);
+      cube = new THREE.Mesh(geom, material);
+
+      // 初期位置：床から浮かせる（高さ8の箱なので y=4 で底面が y=0 に来る）
+      cube.position.y = 4;
+
+      // 影を落とす
+      cube.castShadow = true;
+
+      scene.add(cube);
+
+      // ------------------------------------------------------------
+      // DOMへ canvas を追加（これが無いと何も表示されない）
+      // ------------------------------------------------------------
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // GUI：Mesh のプロパティ操作
+      // ------------------------------------------------------------
+      /*
+        重要：position / rotation / scale の意味
+        - position : 親座標系（通常はワールド）における “原点の移動”
+        - rotation : その Mesh のローカル座標系の回転（オイラー角、単位はラジアン）
+        - scale    : ローカル座標系の拡大縮小（1が等倍）
+
+        これらは内部的にはローカル行列 M_local を構成し、親のワールド行列と掛けて
+        M_world = M_parent_world * M_local
+        の形で最終的な配置が決まる。
+
+        translateX/Y/Z は “ローカル座標系” の軸方向に移動する操作で、
+        現在の回転状態に依存して移動方向が変わる（ここが position と大きく違う）。
+      */
+      const controls = createControls(cube);
+
+      const gui = new GUI();
+
+      // scale
+      const guiScale = gui.addFolder("scale");
+      guiScale.add(controls, "scaleX", 0, 5, 0.001).onChange(() => applyScale(controls));
+      guiScale.add(controls, "scaleY", 0, 5, 0.001).onChange(() => applyScale(controls));
+      guiScale.add(controls, "scaleZ", 0, 5, 0.001).onChange(() => applyScale(controls));
+
+      // position（ワールド/親座標系での位置）
+      const guiPosition = gui.addFolder("position");
+      guiPosition.add(controls, "positionX", -10, 10, 0.001).listen().onChange(() => applyPosition(controls));
+      guiPosition.add(controls, "positionY", -4, 20, 0.001).listen().onChange(() => applyPosition(controls));
+      guiPosition.add(controls, "positionZ", -10, 10, 0.001).listen().onChange(() => applyPosition(controls));
+
+      // rotation（ラジアン）
+      const guiRotation = gui.addFolder("rotation (radians)");
+      guiRotation.add(controls, "rotationX", -Math.PI, Math.PI, 0.001).onChange(() => applyRotation(controls));
+      guiRotation.add(controls, "rotationY", -Math.PI, Math.PI, 0.001).onChange(() => applyRotation(controls));
+      guiRotation.add(controls, "rotationZ", -Math.PI, Math.PI, 0.001).onChange(() => applyRotation(controls));
+
+      // translate（ローカル軸方向の移動）
+      const guiTranslate = gui.addFolder("translate (local axis)");
+      guiTranslate.add(controls, "translateX", -10, 10, 0.001);
+      guiTranslate.add(controls, "translateY", -10, 10, 0.001);
+      guiTranslate.add(controls, "translateZ", -10, 10, 0.001);
+      guiTranslate.add(controls, "translate");
+
+      // visible（描画するか）
+      gui.add(controls, "visible").onChange(() => {
+        cube.visible = controls.visible;
+      });
+
+      // 初期値を反映（GUI変更以外でも整合を取る）
+      applyPosition(controls);
+      applyRotation(controls);
+      applyScale(controls);
+      cube.visible = controls.visible;
+
+      // ------------------------------------------------------------
+      // メインループ：このサンプルは “UI反映の結果を描画” が中心
+      // ------------------------------------------------------------
+      render();
+
+      // ------------------------------------------------------------
+      // Resize：aspect と投影行列更新、レンダラーの解像度更新
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+    }
+
+    // ============================================================
+    // Controls（GUIの状態）を作成
+    // ============================================================
+    function createControls(targetMesh) {
+      const controls = new function () {
+        // scale（ローカル座標系の拡大縮小）
+        this.scaleX = 1;
+        this.scaleY = 1;
+        this.scaleZ = 1;
+
+        // position（親座標系での位置）
+        this.positionX = targetMesh.position.x;
+        this.positionY = targetMesh.position.y;
+        this.positionZ = targetMesh.position.z;
+
+        // rotation（ラジアン）
+        this.rotationX = targetMesh.rotation.x;
+        this.rotationY = targetMesh.rotation.y;
+        this.rotationZ = targetMesh.rotation.z;
+
+        // translate（ローカル軸に沿った移動量）
+        this.translateX = 0;
+        this.translateY = 0;
+        this.translateZ = 0;
+
+        // 表示ON/OFF
+        this.visible = true;
+
+        // ----------------------------------------------------------
+        // translate：ローカル軸に沿って移動する
+        // ----------------------------------------------------------
+        /*
+          translateX/Y/Z の直感：
+          - cube.rotation が 0 の時は、見た目は position を足すのと同じに見える
+          - しかし cube を回転させると、ローカル軸が回るため
+            translateX は “回転後の X軸方向” に動くようになる
+          これは「移動ベクトルを回転で変換してから加算する」操作に相当する。
+        */
+        this.translate = function () {
+          cube.translateX(this.translateX);
+          cube.translateY(this.translateY);
+          cube.translateZ(this.translateZ);
+
+          // translate は position を内部的に更新するので、
+          // GUI上の position 表示も同期させる（listen()で追従表示）
+          this.positionX = cube.position.x;
+          this.positionY = cube.position.y;
+          this.positionZ = cube.position.z;
+        };
+      };
+
+      return controls;
+    }
+
+    // ============================================================
+    // GUI値 -> Mesh反映（分離して “何をしているか” を明確化）
+    // ============================================================
+    function applyPosition(controls) {
+      cube.position.set(controls.positionX, controls.positionY, controls.positionZ);
+    }
+
+    function applyRotation(controls) {
+      // Euler角（x,y,z の順序は cube.rotation.order に依存。既定は 'XYZ'）
+      cube.rotation.set(controls.rotationX, controls.rotationY, controls.rotationZ);
+    }
+
+    function applyScale(controls) {
+      cube.scale.set(controls.scaleX, controls.scaleY, controls.scaleZ);
+    }
+
+    // ============================================================
+    // レンダリングループ
+    // ============================================================
+    function render() {
+      stats.update();
+
+      // visible は毎フレーム強制しても良いが、GUI onChange で十分なのでここでは不要
+      // cube.visible = controls.visible;
+
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // リサイズ対応
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    }
+
+    // ============================================================
+    // Stats 初期化（FPS表示）
+    // ============================================================
+    function initStats() {
+      const stats = new Stats();
+      stats.showPanel(0); // 0: fps
+
+      stats.dom.style.position = "absolute";
+      stats.dom.style.left = "0px";
+      stats.dom.style.top = "0px";
+
+      document.getElementById("Stats-output").appendChild(stats.dom);
+      return stats;
+    }
+
+    // 元コードの体裁維持：onload を残す
+    window.onload = init;
+  </script>
+</body>
+</html>
