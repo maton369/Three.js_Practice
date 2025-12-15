@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Example 02.03 - Override Material</title>
+
+  <!--
+    【方針（ES Modules 前提）】
+    - 旧来の ../libs/three.js / stats.js / dat.gui.js を <script> 直読み（window.THREE 前提）ではなく、
+      ES Modules + importmap で読み込む。
+    - Stats / GUI も three の addons から import し、CORS や配布形態差で壊れにくくする。
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      /* set margin to 0 and overflow to hidden, to go fullscreen */
+      margin: 0;
+      overflow: hidden;
+    }
+  </style>
+</head>
+<body>
+
+<div id="Stats-output"></div>
+<div id="WebGL-output"></div>
+
+<script type="module">
+  import * as THREE from "three";
+  import Stats from "three/addons/libs/stats.module.js";
+  import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+  // once everything is loaded, we run our Three.js stuff.
+  function init() {
+
+    // ============================================================
+    // Stats：FPS表示（毎フレーム update が必要）
+    // ============================================================
+    var stats = initStats();
+
+    // ============================================================
+    // Scene：3D世界の入れ物（オブジェクト/ライト/カメラを追加していく）
+    // ============================================================
+    var scene = new THREE.Scene();
+
+    // ============================================================
+    // Override Material（本サンプルの主役）
+    // ============================================================
+    /*
+      scene.overrideMaterial を設定すると、
+      「描画時に限って」シーン内の Mesh が一律この材質で描かれる。
+
+      重要ポイント：
+      - 置き換えは “レンダリング時のみ”。各 Mesh.material 自体は保持される。
+      - デバッグ用途が強い（例：全部を同一材質にして形状・陰影だけを見る、など）。
+      - 影（ShadowMap）やフォグ等の“描画結果”にも当然影響する。
+    */
+    var overrideMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+
+    // 最初は overrideMaterial を ON にして「差」が分かりやすい状態にする
+    scene.overrideMaterial = overrideMat;
+
+    // ============================================================
+    // Camera：視点（透視投影）
+    // ============================================================
+    var camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+
+    // ============================================================
+    // Renderer：WebGL で描画し canvas を更新する装置
+    // ============================================================
+    var renderer = new THREE.WebGLRenderer({ antialias: true });
+
+    renderer.setClearColor(new THREE.Color(0xEEEEEE));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    // HiDPI 対応（Retina などでボケる問題を避ける）
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+    // ============================================================
+    // Shadow Mapping（影）
+    // ============================================================
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap; // 影のエッジを少し柔らかくする
+
+    // ============================================================
+    // Ground Plane（床）
+    // ============================================================
+    var planeGeometry = new THREE.PlaneGeometry(60, 40, 1, 1);
+    var planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    var plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+    // 床は影を「受ける」側
+    plane.receiveShadow = true;
+
+    // PlaneGeometry はデフォルトで XY 平面なので、床にするため XZ に寝かせる（-90°）
+    plane.rotation.x = -0.5 * Math.PI;
+    plane.position.set(0, 0, 0);
+
+    scene.add(plane);
+
+    // ============================================================
+    // カメラ配置（元コードの意図を維持）
+    // ============================================================
+    camera.position.set(-30, 40, 30);
+    camera.lookAt(scene.position);
+
+    // ============================================================
+    // AmbientLight（環境光）：影の中の“黒つぶれ”を防ぐ最低限の回り込み光
+    // ============================================================
+    var ambientLight = new THREE.AmbientLight(0x0c0c0c);
+    scene.add(ambientLight);
+
+    // ============================================================
+    // SpotLight（スポットライト）：影を作るメイン光源
+    // ============================================================
+    var spotLight = new THREE.SpotLight(0xffffff);
+
+    spotLight.position.set(-20, 30, -5);
+    spotLight.castShadow = true;
+
+    /*
+      【重要：decay は常に 0 にする方針】
+      SpotLight / PointLight は距離減衰（decay）を持つ。
+      教材スケール（座標が数十）+ Lambert材質だと、減衰が強いと “届く光量不足で暗すぎる” 事故が起きやすい。
+      そのため、学習の安定性を優先して decay = 0（減衰なし）をデフォルトにする。
+    */
+    spotLight.decay = 0;
+
+    // 照射方向を安定させる：position → target 方向に照射する
+    spotLight.target.position.set(0, 0, 0);
+    scene.add(spotLight.target);
+
+    // 影の品質（最小限のチューニング）
+    spotLight.shadow.mapSize.set(1024, 1024);
+    spotLight.shadow.bias = -0.0001;
+    spotLight.shadow.normalBias = 0.02;
+
+    scene.add(spotLight);
+
+    // ============================================================
+    // canvas を DOM に追加（これが無いと何も表示されない）
+    // ============================================================
+    document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+    // ============================================================
+    // Controls（GUI + 操作関数）
+    // ============================================================
+    /*
+      本サンプルの “全体アルゴリズム” は大きく 3 つ：
+      1) 初期化（Scene/Camera/Renderer/Light/Objects/GUI）
+      2) 毎フレーム更新（回転更新 → render）
+      3) イベント処理（GUI操作・resize）
+
+      Override Material は「描画ステップ」に割り込み、シーン全 Mesh の材質を一時的に差し替える。
+      つまり、ジオメトリやトランスフォームはそのままで “見た目だけ” を統一できる。
+    */
+    var controls = new function () {
+      this.rotationSpeed = 0.02;
+
+      // overrideMaterial の ON/OFF を GUI から切り替えできるようにする
+      this.useOverrideMaterial = true;
+
+      // scene.children にはライトやターゲットなども含まれるため、
+      // 「メッシュ数」ではなく「children 数」である点に注意（元コードの意図を維持）
+      this.numberOfObjects = scene.children.length;
+
+      this.addCube = function () {
+        // 1〜3 の整数サイズのキューブ
+        var cubeSize = Math.ceil((Math.random() * 3));
+        var cubeGeometry = new THREE.BoxGeometry(cubeSize, cubeSize, cubeSize);
+
+        // overrideMaterial が OFF のときに “個体差” が分かるよう、ランダム色を保持する
+        var cubeMaterial = new THREE.MeshLambertMaterial({ color: Math.random() * 0xffffff });
+
+        var cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+        cube.castShadow = true;
+        cube.name = "cube-" + scene.children.length;
+
+        // ランダム配置：床は中心が原点なので、[-w/2, w/2], [-h/2, h/2] に散らす方が自然
+        var w = planeGeometry.parameters.width;
+        var h = planeGeometry.parameters.height;
+
+        cube.position.x = -w / 2 + Math.round(Math.random() * w);
+        cube.position.y = Math.round(Math.random() * 5);
+        cube.position.z = -h / 2 + Math.round(Math.random() * h);
+
+        scene.add(cube);
+        this.numberOfObjects = scene.children.length;
+      };
+
+      this.removeCube = function () {
+        // 元コードの「末尾を消す」は、末尾がライト/ターゲット等になり得るので安全性が低い。
+        // ここでは「床以外の Mesh を後ろから探して消す」に修正して事故を防ぐ。
+        for (var i = scene.children.length - 1; i >= 0; i--) {
+          var obj = scene.children[i];
+          if (obj instanceof THREE.Mesh && obj !== plane) {
+            scene.remove(obj);
+            this.numberOfObjects = scene.children.length;
+            break;
+          }
+        }
+      };
+
+      this.outputObjects = function () {
+        console.log(scene.children);
+      };
+
+      this.applyOverrideMaterial = function () {
+        // ON：全 Mesh を overrideMat で描画
+        // OFF：各 Mesh.material で描画
+        scene.overrideMaterial = this.useOverrideMaterial ? overrideMat : null;
+      };
+    };
+
+    // GUI（dat.gui の代替：lil-gui）
+    var gui = new GUI({ title: "Controls" });
+    gui.add(controls, "rotationSpeed", 0, 0.5);
+    gui.add(controls, "useOverrideMaterial").onChange(() => controls.applyOverrideMaterial());
+    gui.add(controls, "addCube");
+    gui.add(controls, "removeCube");
+    gui.add(controls, "outputObjects");
+    gui.add(controls, "numberOfObjects").listen();
+
+    // 初期状態を反映（useOverrideMaterial=true）
+    controls.applyOverrideMaterial();
+
+    // ============================================================
+    // Animation loop（毎フレーム）
+    // ============================================================
+    /*
+      毎フレームのアルゴリズム：
+      1) stats.update() で FPS 表示更新
+      2) scene.traverse で対象 Mesh を回転（床は除外）
+      3) requestAnimationFrame で次フレーム予約
+      4) renderer.render(scene, camera) で 1フレーム描画
+
+      scene.traverse はシーングラフ（階層構造）を辿るため、
+      「回転させたい Mesh だけ」を条件で選別するのが重要。
+    */
+    render();
+
+    function render() {
+      stats.update();
+
+      scene.traverse(function (obj) {
+        if (obj instanceof THREE.Mesh && obj !== plane) {
+          obj.rotation.x += controls.rotationSpeed;
+          obj.rotation.y += controls.rotationSpeed;
+          obj.rotation.z += controls.rotationSpeed;
+        }
+      });
+
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // Resize（ウィンドウサイズ変更対応）
+    // ============================================================
+    /*
+      画面サイズが変わると aspect（縦横比）がズレる。
+      そのままだと投影が歪むため、
+      - camera.aspect を更新
+      - camera.updateProjectionMatrix() で投影行列を再計算
+      - renderer.setSize(...) で canvas 解像度を更新
+      が必要になる。
+    */
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    });
+  }
+
+  function initStats() {
+    var stats = new Stats();
+    stats.showPanel(0); // 0: fps
+
+    // Align top-left
+    stats.dom.style.position = "absolute";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+
+    document.getElementById("Stats-output").appendChild(stats.dom);
+    return stats;
+  }
+
+  window.onload = init;
+</script>
+</body>
+</html>
