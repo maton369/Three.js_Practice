@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Example 02.02 - Foggy Scene</title>
+
+  <!--
+    【方針（ES Modules 前提）】
+    - 旧来の ../libs/three.js / stats.js / dat.gui.js を <script> 直読み（window.THREE 前提）から、
+      ES Modules + importmap に移行する。
+    - stats / GUI も three の addons から読み、CORS や配布形態差の事故を減らす。
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+    }
+  </style>
+</head>
+<body>
+
+<div id="Stats-output"></div>
+<div id="WebGL-output"></div>
+
+<script type="module">
+  import * as THREE from "three";
+  import Stats from "three/addons/libs/stats.module.js";
+  import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+  // once everything is loaded, we run our Three.js stuff.
+  function init() {
+
+    // ============================================================
+    // Stats：描画負荷（FPS）を可視化するデバッグ用オーバーレイ
+    // ============================================================
+    // stats.js は毎フレーム update() することで FPS が更新される。
+    // 表示自体は WebGL と無関係で、DOM 要素（<div>）として重ねて表示している。
+    var stats = initStats();
+
+    // ============================================================
+    // Scene：3D世界の入れ物
+    // ============================================================
+    var scene = new THREE.Scene();
+
+    // ============================================================
+    // Fog（霧）：距離に応じて色に溶け込ませる “ポスト効果に近い” 表現
+    // ============================================================
+    /*
+      Fog の基本：
+      - Fog(color, near, far) は “線形霧”
+        near より近い距離は霧 0%、far 以上は霧 100%、その間を線形補間する。
+      - FogExp2(color, density) は “指数霧”
+        距離に対して指数関数的に霧が濃くなる（遠景がより強く消える）。
+
+      ここでは元コードの Fog を維持しつつ、GUI で near/far を動かせるようにする。
+      ※ 霧の色と背景（clearColor）がズレると境界が不自然に見えるため、
+         renderer.setClearColor を fogColor に合わせるのが定石。
+    */
+    var fogColor = 0xffffff;
+    scene.fog = new THREE.Fog(fogColor, 0.015, 100); // ※ near/far の意味は「カメラからの距離」
+
+    // ============================================================
+    // Camera：視点（透視投影）
+    // ============================================================
+    var camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+    // ============================================================
+    // Renderer：GPUで描画して canvas を更新する装置
+    // ============================================================
+    var renderer = new THREE.WebGLRenderer({ antialias: true });
+
+    // 霧の色と背景色を一致させる（遠景が自然に溶ける）
+    renderer.setClearColor(new THREE.Color(fogColor));
+
+    // ウィンドウサイズに合わせて描画解像度を決める
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    // HiDPI 対応（Retina などでボケる問題を避ける）
+    // ※ 上限を設けないと高負荷になりやすいので 2 程度で頭打ちにするのが定番。
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+    // ============================================================
+    // Shadow Mapping（影）を有効化
+    // ============================================================
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap; // 影エッジを柔らかくして“黒い板感”を減らす
+
+    // ============================================================
+    // Ground Plane（床）
+    // ============================================================
+    var planeGeometry = new THREE.PlaneGeometry(60, 40, 1, 1);
+    var planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    var plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+    // 床は影を受ける
+    plane.receiveShadow = true;
+
+    // PlaneGeometry はデフォルトで XY 平面なので、床にするため XZ に寝かせる（-90°）
+    plane.rotation.x = -0.5 * Math.PI;
+
+    // 原点に置く（元コード通り）
+    plane.position.set(0, 0, 0);
+    scene.add(plane);
+
+    // ============================================================
+    // Camera placement（カメラ配置）
+    // ============================================================
+    camera.position.set(-30, 40, 30);
+    camera.lookAt(scene.position);
+
+    // ============================================================
+    // AmbientLight（環境光）：影の中の“黒つぶれ”を防ぐ最小の回り込み光
+    // ============================================================
+    // Lambert 材質は直射が弱いと暗くなりやすいので、少量の環境光で底上げする。
+    var ambientLight = new THREE.AmbientLight(0x0c0c0c);
+    scene.add(ambientLight);
+
+    // ============================================================
+    // SpotLight（スポットライト）：影を作るメイン光源
+    // ============================================================
+    var spotLight = new THREE.SpotLight(0xffffff);
+
+    // ライト位置（元コードと同じ）
+    spotLight.position.set(-20, 30, -5);
+
+    // 影を生成する
+    spotLight.castShadow = true;
+
+    /*
+      【decay（距離減衰）について】
+      - SpotLight / PointLight は距離で光が弱くなる（減衰）モデルを持つ。
+      - 教材スケール（座標が数十単位）＋ Lambert 材質だと、
+        減衰が強い設定だと “届く光量が足りず真っ暗” になりやすい。
+
+      そのため、今後の方針として decay は 0（減衰なし）をデフォルトにする。
+      - 「見えること」と「影が出ること」をまず優先し、学習体験の安定性を上げる狙い。
+    */
+    spotLight.decay = 0;
+
+    // 照射方向を安定させるため target を明示（position → target 方向に照射）
+    spotLight.target.position.set(0, 0, 0);
+    scene.add(spotLight.target);
+
+    // 影の品質（最小限の調整）
+    spotLight.shadow.mapSize.width = 1024;
+    spotLight.shadow.mapSize.height = 1024;
+    spotLight.shadow.bias = -0.0001;
+    spotLight.shadow.normalBias = 0.02;
+
+    scene.add(spotLight);
+
+    // ============================================================
+    // DOMへ canvas を追加（これが無いと画面に何も出ない）
+    // ============================================================
+    document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+    // ============================================================
+    // GUI（操作パネル）：dat.gui の代替として lil-gui を使用
+    // ============================================================
+    /*
+      lil-gui は dat.gui と操作感が近く、ES Modules で素直に読める。
+      ここでは元コードの UI（回転速度・追加/削除・数表示）を維持しつつ、
+      Fog の near/far も調整できるようにする（霧サンプルなので目的に合う）。
+    */
+    var controls = new function () {
+      this.rotationSpeed = 0.02;
+      this.numberOfObjects = scene.children.length;
+
+      // Fog（線形霧）のパラメータ（GUIで変更可能にする）
+      this.fogNear = scene.fog.near;
+      this.fogFar = scene.fog.far;
+
+      this.removeCube = function () {
+        // scene.children の最後尾が必ず “キューブ” とは限らないため、
+        // 「床(plane)以外の Mesh を後ろから探して消す」ようにして安全性を上げる。
+        for (var i = scene.children.length - 1; i >= 0; i--) {
+          var obj = scene.children[i];
+          if (obj instanceof THREE.Mesh && obj !== plane) {
+            scene.remove(obj);
+            this.numberOfObjects = scene.children.length;
+            break;
+          }
+        }
+      };
+
+      this.addCube = function () {
+        // 立方体サイズを 1〜3 の整数にする（見た目が極端になりにくい）
+        var cubeSize = Math.ceil((Math.random() * 3));
+
+        var cubeGeometry = new THREE.BoxGeometry(cubeSize, cubeSize, cubeSize);
+        var cubeMaterial = new THREE.MeshLambertMaterial({ color: Math.random() * 0xffffff });
+        var cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+
+        // 影を落とす
+        cube.castShadow = true;
+
+        // 追跡しやすいように名前を付ける（デバッグで便利）
+        cube.name = "cube-" + scene.children.length;
+
+        // 床のサイズに合わせてランダム配置する
+        // PlaneGeometry の中心は原点なので、[-w/2, w/2] / [-h/2, h/2] に散らす方が自然。
+        var w = planeGeometry.parameters.width;
+        var h = planeGeometry.parameters.height;
+
+        cube.position.x = -w / 2 + Math.round(Math.random() * w);
+        cube.position.y = Math.round(Math.random() * 5);
+        cube.position.z = -h / 2 + Math.round(Math.random() * h);
+
+        scene.add(cube);
+        this.numberOfObjects = scene.children.length;
+      };
+
+      this.outputObjects = function () {
+        console.log(scene.children);
+      };
+
+      this.updateFog = function () {
+        // Fog の near/far を更新（遠景の消え方が変わる）
+        scene.fog.near = this.fogNear;
+        scene.fog.far = this.fogFar;
+
+        // 背景色も霧色に合わせておく（境界が不自然になりにくい）
+        renderer.setClearColor(new THREE.Color(scene.fog.color));
+      };
+    };
+
+    var gui = new GUI();
+    gui.add(controls, "rotationSpeed", 0, 0.5);
+
+    // Fog パラメータ：霧サンプルとして重要なので GUI を追加
+    gui.add(controls, "fogNear", 0.0, 50.0, 0.001).onChange(() => controls.updateFog());
+    gui.add(controls, "fogFar",  10.0, 300.0, 0.1).onChange(() => controls.updateFog());
+
+    gui.add(controls, "addCube");
+    gui.add(controls, "removeCube");
+    gui.add(controls, "outputObjects");
+    gui.add(controls, "numberOfObjects").listen();
+
+    // ============================================================
+    // Animation loop（毎フレーム描画）
+    // ============================================================
+    /*
+      毎フレームのアルゴリズム：
+      1) stats.update() で計測表示更新
+      2) scene.traverse で “床以外の Mesh” を回転させる
+      3) requestAnimationFrame で次フレーム予約
+      4) renderer.render(scene, camera) で 1 フレーム描画
+
+      traverse は SceneGraph（シーングラフ）を DFS 的に辿る。
+      - “回転すべき対象だけ” を選別するのが重要（床まで回すと見た目が壊れる）。
+    */
+    render();
+
+    function render() {
+      stats.update();
+
+      scene.traverse(function (obj) {
+        if (obj instanceof THREE.Mesh && obj !== plane) {
+          obj.rotation.x += controls.rotationSpeed;
+          obj.rotation.y += controls.rotationSpeed;
+          obj.rotation.z += controls.rotationSpeed;
+        }
+      });
+
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // Resize（リサイズ対応）
+    // ============================================================
+    // 画面比率が変わったらカメラの aspect と投影行列を更新し、
+    // レンダラーの描画サイズも合わせないと “伸びる/潰れる/真っ白に見える” などが起こる。
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    });
+
+    function initStats() {
+      var stats = new Stats();
+      stats.showPanel(0); // 0: fps
+
+      // 左上固定
+      stats.dom.style.position = "absolute";
+      stats.dom.style.left = "0px";
+      stats.dom.style.top = "0px";
+
+      document.getElementById("Stats-output").appendChild(stats.dom);
+      return stats;
+    }
+  }
+
+  window.onload = init;
+</script>
+</body>
+</html>
