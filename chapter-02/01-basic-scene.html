@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Example 02.01 - Basic Scene</title>
+
+    <!--
+      【修正方針】
+      - 旧来の <script src="../libs/three.js"> 依存（window.THREE 前提）をやめ、
+        ES Modules（importmap + type="module"）に移行する（これからの方針に合わせる）。
+      - stats / dat.gui も “three の addons” から ES Modules として読み込む。
+        （外部パッケージ直参照で CORS に詰まるパターンを避ける）
+      - 影が暗すぎる・見えない問題の再発防止として、SpotLight の decay を 0 に固定する（ユーザー方針）。
+      - 元コードの構造（Scene → Camera → Renderer → Plane → Light → GUI → render loop）は極力維持し、
+        変更は「読み込み方式」と「decay 0 の設定」「軽微な安全性/説明コメント追加」に限定する。
+    -->
+
+    <!--
+      importmap:
+      - "three"           → Three.js 本体（ES Modules）
+      - "three/addons/"   → examples/jsm（Stats, lil-gui などがある）
+      バージョン固定は教材の再現性のため。
+    -->
+    <script type="importmap">
+        {
+          "imports": {
+            "three": "https://unpkg.com/three@0.182.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.182.0/examples/jsm/"
+          }
+        }
+    </script>
+
+    <style>
+        body {
+            /* 余白ゼロ + スクロール抑止 → canvas を画面いっぱいにしやすい */
+            margin: 0;
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body>
+
+<div id="Stats-output"></div>
+<div id="WebGL-output"></div>
+
+<!--
+  ES Modules 版のメインコード。
+  - type="module" により import が使用できる
+  - THREE はグローバルではなく、このモジュールスコープ内の変数になる
+-->
+<script type="module">
+
+    /*
+      Three.js 本体（ES Modules）
+    */
+    import * as THREE from "three";
+
+    /*
+      Stats: FPS 等の計測表示。
+      以前は ../libs/stats.js を script 直読みしていたが、ES Modules 化で import に寄せる。
+    */
+    import Stats from "three/addons/libs/stats.module.js";
+
+    /*
+      dat.gui は更新が止まりがちなので、教材用途の “dat.gui 相当” として
+      three 側に同梱されている lil-gui を使う。
+      （GUI API は dat.gui とほぼ同じ体験で使える）
+    */
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // once everything is loaded, we run our Three.js stuff.
+    function init() {
+
+        // ============================================================
+        // 0) DOM 取得（canvas の挿入先 / stats の挿入先）
+        // ============================================================
+        const webglContainer = document.getElementById("WebGL-output");
+        const statsContainer = document.getElementById("Stats-output");
+
+        // DOM が見つからない場合は描画できないため、原因が追えるように明示エラーにする
+        if (!webglContainer) {
+            console.error('Element "#WebGL-output" was not found.');
+            return;
+        }
+        if (!statsContainer) {
+            console.error('Element "#Stats-output" was not found.');
+            return;
+        }
+
+        // ============================================================
+        // 1) Stats 初期化（FPS 表示）
+        // ============================================================
+        // Stats は “毎フレーム update()” される前提のため、render loop とセット。
+        const stats = initStats(statsContainer);
+
+        // ============================================================
+        // 2) Scene（シーン）
+        // ============================================================
+        // Scene は 3D 世界の入れ物。Mesh / Light / Helper 等を scene.add(...) で追加していく。
+        const scene = new THREE.Scene();
+
+        // ============================================================
+        // 3) Camera（カメラ）
+        // ============================================================
+        // PerspectiveCamera(fov, aspect, near, far)
+        // near/far は視錐台（frustum）を規定し、外側は描画されない。
+        // 深度バッファ精度の観点では near を小さくし過ぎると不利になりやすい。
+        const camera = new THREE.PerspectiveCamera(
+            45,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            1000
+        );
+
+        // ※元コードは scene.add(camera) しているが、Three.js 的には必須ではない。
+        //   ただし「シーングラフにカメラも含めたい」意図があるなら add しても問題はないので踏襲する。
+        scene.add(camera);
+
+        // ============================================================
+        // 4) Renderer（レンダラー）
+        // ============================================================
+        // renderer.render(scene, camera) が 1フレーム描画。
+        // 影を使う場合、shadowMap.enabled などの追加設定が必要になる。
+        const renderer = new THREE.WebGLRenderer();
+
+        renderer.setClearColor(new THREE.Color(0xEEEEEE));
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        // 影（Shadow Mapping）を使うスイッチ
+        renderer.shadowMap.enabled = true;
+
+        // 影の境界を柔らかく（ジャギー低減）。教材用途で見た目が分かりやすくなる。
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+        // ============================================================
+        // 5) Plane（床）
+        // ============================================================
+        // PlaneGeometry(幅, 奥行, 分割X, 分割Y)
+        // この床は「影を受ける」役なので receiveShadow = true。
+        const planeGeometry = new THREE.PlaneGeometry(60, 40, 1, 1);
+        const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+        const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+        plane.receiveShadow = true;
+
+        // PlaneGeometry はデフォルトで XY 平面にあるので、床（XZ 平面）にするため -90度回転
+        plane.rotation.x = -0.5 * Math.PI;
+
+        // 床を原点に置く（元コード踏襲）
+        plane.position.set(0, 0, 0);
+
+        scene.add(plane);
+
+        // ============================================================
+        // 6) Camera 配置
+        // ============================================================
+        camera.position.set(-30, 40, 30);
+        camera.lookAt(scene.position);
+
+        // ============================================================
+        // 7) Light（照明）
+        // ============================================================
+        // Lambert 材質は「拡散反射」モデルで、光が無いと黒く見えやすい。
+        // そのため、(A) Ambient（回り込み） + (B) Spot（方向性 + 影） を組み合わせるのが教材として安定。
+        const ambientLight = new THREE.AmbientLight(0x0c0c0c);
+        scene.add(ambientLight);
+
+        const spotLight = new THREE.SpotLight(0xffffff);
+
+        spotLight.position.set(-20, 30, -5);
+        spotLight.castShadow = true;
+
+        /*
+          【重要：decay は 0（ユーザー方針）】
+          SpotLight / PointLight は距離 r に応じて照度が落ちる（距離減衰）ため、
+          教材スケール（ライトと対象の距離が数十）では、設定によっては “ほぼ無照明” になり黒落ちしやすい。
+
+          decay = 0 にすると距離減衰が無効化され、古い教材の見え方（強度 1 でも十分届く）に近づく。
+          影は「直射が遮られた領域」なので、直射光がちゃんと届くことが影の見えやすさに直結する。
+        */
+        spotLight.decay = 0.1;
+
+        // 直射の強さ（明るさの主調整ノブ）
+        spotLight.intensity = 1.0;
+
+        /*
+          SpotLight は position → target に向けて照射する。
+          target は Object3D なので、scene.add(spotLight.target) しておくと
+          “シーングラフの更新対象として明示される” ため、意図が伝わりやすく安全。
+        */
+        spotLight.target.position.set(0, 0, 0);
+        scene.add(spotLight.target);
+
+        /*
+          shadow map の品質調整（最小限）
+          - mapSize を上げるほど影のジャギーは減るが、ライト視点の追加レンダリング負荷が上がる。
+          - bias / normalBias は shadow acne（自己シャドウの縞）を抑えるための代表的パラメータ。
+        */
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+        spotLight.shadow.bias = -0.0001;
+        spotLight.shadow.normalBias = 0.02;
+
+        scene.add(spotLight);
+
+        // ============================================================
+        // 8) 出力（canvas を DOM に挿入）
+        // ============================================================
+        webglContainer.appendChild(renderer.domElement);
+
+        // ============================================================
+        // 9) GUI（オブジェクトの追加/削除 & 回転速度）
+        // ============================================================
+        // 元コードの dat.GUI を lil-gui で置き換える（GUI の概念は同じ）。
+        let step = 0;
+
+        const controls = {
+            rotationSpeed: 0.02,
+
+            // “numberOfObjects” は scene.children.length を表示するための値。
+            // scene.add/remove のたびに更新する。
+            numberOfObjects: scene.children.length,
+
+            removeCube: function () {
+                // 元コード同様「最後に追加された Mesh を消す」という簡易ロジック。
+                // 理論的には “可視オブジェクト集合の更新” であり、次フレームの描画結果が変わる。
+                const allChildren = scene.children;
+                const lastObject = allChildren[allChildren.length - 1];
+
+                // plane なども Mesh なので、最後が plane のときは消したくない場合がある。
+                // 元コードは “Mesh なら消す” なので踏襲するが、教材としては cube-* のみ消す設計も検討余地あり。
+                if (lastObject instanceof THREE.Mesh) {
+                    scene.remove(lastObject);
+                    this.numberOfObjects = scene.children.length;
+                }
+            },
+
+            addCube: function () {
+                /*
+                  立方体をランダムに生成して scene に追加する。
+
+                  アルゴリズム：
+                  1) cubeSize を [1..3] の整数でサンプル
+                  2) BoxGeometry と LambertMaterial（ランダム色）を生成
+                  3) castShadow を true（影を落とす遮蔽物にする）
+                  4) 床（planeGeometry）の幅/奥行レンジ内でランダム配置
+                  5) scene.add により “世界の要素集合” を更新
+                */
+                const cubeSize = Math.ceil((Math.random() * 3));
+                const cubeGeometry = new THREE.BoxGeometry(cubeSize, cubeSize, cubeSize);
+                const cubeMaterial = new THREE.MeshLambertMaterial({ color: Math.random() * 0xffffff });
+                const cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+
+                cube.castShadow = true;
+                cube.name = "cube-" + scene.children.length;
+
+                // 位置の乱数配置：
+                // planeGeometry.parameters.width / height を用いて床の範囲に収める。
+                // 元コードの式を踏襲しつつ、中心寄りに置くためのオフセットを入れている。
+                cube.position.x = -30 + Math.round((Math.random() * planeGeometry.parameters.width));
+                cube.position.y = Math.round((Math.random() * 5));
+                cube.position.z = -20 + Math.round((Math.random() * planeGeometry.parameters.height));
+
+                scene.add(cube);
+                this.numberOfObjects = scene.children.length;
+            },
+
+            outputObjects: function () {
+                // シーングラフ（children 配列）を出力して、何が追加されているか確認するデバッグ用。
+                console.log(scene.children);
+            }
+        };
+
+        const gui = new GUI();
+        gui.add(controls, "rotationSpeed", 0, 0.5, 0.01);
+        gui.add(controls, "addCube");
+        gui.add(controls, "removeCube");
+        gui.add(controls, "outputObjects");
+        gui.add(controls, "numberOfObjects").listen();
+
+        // ============================================================
+        // 10) Render loop（アニメーション）
+        // ============================================================
+        // 毎フレームの処理手順：
+        // 1) stats.update()
+        // 2) scene.traverse で各 Mesh を回転（床 plane は除外）
+        // 3) requestAnimationFrame で次フレーム予約
+        // 4) renderer.render(scene, camera)
+        //
+        // traverse はシーングラフ探索なので、子孫ノードも含めて処理できる。
+        // “シーン中のオブジェクト全体に同じ更新をかける” ときの典型パターン。
+        render();
+
+        function render() {
+            stats.update();
+
+            scene.traverse(function (obj) {
+                // “Mesh かつ床ではない” を回転対象とする
+                if (obj instanceof THREE.Mesh && obj !== plane) {
+                    obj.rotation.x += controls.rotationSpeed;
+                    obj.rotation.y += controls.rotationSpeed;
+                    obj.rotation.z += controls.rotationSpeed;
+                }
+            });
+
+            requestAnimationFrame(render);
+            renderer.render(scene, camera);
+        }
+
+        // ============================================================
+        // 11) Resize 対応
+        // ============================================================
+        // 画面サイズが変わると aspect が変わるので、
+        // camera.aspect 更新 → projectionMatrix 再計算 → renderer の canvas サイズ更新、が必要。
+        window.addEventListener("resize", () => {
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+
+            renderer.setSize(w, h);
+        });
+    }
+
+    function initStats(container) {
+        const stats = new Stats();
+
+        // 0: fps, 1: ms
+        // stats.module.js でも setMode が残っている場合があるが、showPanel の方が確実。
+        if (typeof stats.showPanel === "function") {
+            stats.showPanel(0);
+        } else {
+            // 互換用（古い API が残っている場合）
+            stats.setMode(0);
+        }
+
+        // 左上に固定
+        stats.dom.style.position = "absolute";
+        stats.dom.style.left = "0px";
+        stats.dom.style.top = "0px";
+
+        container.appendChild(stats.dom);
+        return stats;
+    }
+
+    // 元コードの体裁維持：onload で init
+    window.onload = init;
+
+</script>
+</body>
+</html>
