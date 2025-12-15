@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 02.05 - Custom geometry</title>
+
+  <!--
+    【今まで通りの方針（ES Modules + importmap）】
+    - window.THREE に依存する ../libs/three.js / stats.js / dat.gui.js の直読みは使わない
+    - three 本体 + addons（stats / lil-gui）を ES Modules として import する
+    - CDN は（以前の CORS 事故を避けるため）jsDelivr を使う
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden; /* フルスクリーンに近い表示にする */
+    }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    /*
+      ============================================================
+      このサンプルの主題：Custom Geometry（自作ジオメトリ）
+      ============================================================
+
+      旧コードは以下の “古い API” に依存していた：
+      - THREE.Geometry / THREE.Face3（r125+ で削除）
+      - THREE.SceneUtils.createMultiMaterialObject（廃止）
+
+      現行 Three.js では：
+      - BufferGeometry（属性配列で頂点/法線/UV等を持つ）
+      - Group + 複数 Mesh を重ねる（solid + wireframe など）
+      という形に置き換えるのが基本である。
+
+      また、頂点を GUI で動かすため、毎フレーム：
+      - position attribute の値を書き換える
+      - normals（法線）を再計算する
+      - boundingSphere を再計算（フラスタムカリング事故の予防）
+      を行う。
+
+      ここでの “全体アルゴリズム” は：
+      1) Scene / Camera / Renderer / Light を作る（描画の土台）
+      2) 8頂点 + 三角形インデックス（12面）で BufferGeometry を構築
+      3) 同じ geometry を使って
+         - 面（Lambert, 半透明）Mesh
+         - ワイヤ（Basic, wireframe）Mesh
+         を Group にまとめて表示
+      4) lil-gui で 8頂点の (x,y,z) を操作できる UI を作る
+      5) requestAnimationFrame ループで毎フレーム頂点を更新して描画
+    */
+
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS 表示）：WebGL とは別枠の DOM オーバーレイ
+      // ------------------------------------------------------------
+      const stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene：3D 世界の入れ物（シーングラフの root）
+      // ------------------------------------------------------------
+      const scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Camera：透視投影（fov, aspect, near, far）
+      // ------------------------------------------------------------
+      const camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      // ------------------------------------------------------------
+      // Renderer：WebGL 描画装置（canvas を内部生成）
+      // ------------------------------------------------------------
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xeeeeee));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // 影：renderer 側の有効化（これが無いと cast/receive が効かない）
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      // ------------------------------------------------------------
+      // Ground Plane：影を受ける床
+      // ------------------------------------------------------------
+      const planeGeometry = new THREE.PlaneGeometry(60, 40, 1, 1);
+      const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+      const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+      plane.receiveShadow = true;           // 影を受ける
+      plane.rotation.x = -0.5 * Math.PI;    // XY 平面 → XZ 平面（床化）
+      plane.position.set(0, 0, 0);
+      scene.add(plane);
+
+      // ------------------------------------------------------------
+      // Camera placement：元コードと同じ視点（対象を見下ろす）
+      // ------------------------------------------------------------
+      camera.position.set(-20, 25, 20);
+      const lookTarget = new THREE.Vector3(5, 0, 0);
+      camera.lookAt(lookTarget);
+
+      // ------------------------------------------------------------
+      // Light：SpotLight（影の主光源）
+      // ------------------------------------------------------------
+      // ※ 元コードは AmbientLight をコメントアウトしていたので、ここでも “基本は無し”。
+      //    必要なら少量の Ambient を足すと黒つぶれが減る（教材的に安定）。
+      // const ambientLight = new THREE.AmbientLight(0x494949);
+      // scene.add(ambientLight);
+
+      const spotLight = new THREE.SpotLight(0xffffff);
+      spotLight.position.set(-20, 30, 5);
+      spotLight.castShadow = true;
+
+      // ★方針：SpotLight / PointLight の decay は今後常に 0（距離減衰なし）
+      // - 教材スケール（座標が数十）で暗くなりすぎる事故を避ける
+      spotLight.decay = 0;
+
+      // SpotLight は position → target 方向に照射するので、target を明示して安定化
+      spotLight.target.position.copy(lookTarget);
+      scene.add(spotLight.target);
+
+      // 影の品質（最小限）
+      spotLight.shadow.mapSize.set(1024, 1024);
+      spotLight.shadow.bias = -0.0001;
+      spotLight.shadow.normalBias = 0.02;
+
+      scene.add(spotLight);
+
+      // ------------------------------------------------------------
+      // DOM へ canvas を追加（これが無いと何も表示されない）
+      // ------------------------------------------------------------
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ============================================================
+      // 1) 頂点（8点）を GUI で操作するための controlPoints を用意
+      // ============================================================
+      // 旧コードでは「最初に Geometry を作ってから、毎フレーム頂点を controlPoints で上書き」していた。
+      // 今回は “初期表示” も一致するよう、最初から controlPoints を頂点配列として使う。
+      const controlPoints = [
+        { x: 3, y: 5, z: 3 }, // v0
+        { x: 3, y: 5, z: 0 }, // v1
+        { x: 3, y: 0, z: 3 }, // v2
+        { x: 3, y: 0, z: 0 }, // v3
+        { x: 0, y: 5, z: 0 }, // v4
+        { x: 0, y: 5, z: 3 }, // v5
+        { x: 0, y: 0, z: 0 }, // v6
+        { x: 0, y: 0, z: 3 }  // v7
+      ];
+
+      // ============================================================
+      // 2) BufferGeometry を構築（positions + indices）
+      // ============================================================
+      // positions：8頂点 * 3成分（x,y,z）
+      const positions = new Float32Array(8 * 3);
+      for (let i = 0; i < 8; i++) {
+        positions[i * 3 + 0] = controlPoints[i].x;
+        positions[i * 3 + 1] = controlPoints[i].y;
+        positions[i * 3 + 2] = controlPoints[i].z;
+      }
+
+      // indices：旧 Face3 の三角形定義をそのまま移植（12面）
+      // Face3(a,b,c) → index 配列に [a,b,c] を追加するだけ
+      const indices = [
+        0, 2, 1,
+        2, 3, 1,
+        4, 6, 5,
+        6, 7, 5,
+        4, 5, 1,
+        5, 0, 1,
+        7, 6, 2,
+        6, 3, 2,
+        5, 7, 0,
+        7, 2, 0,
+        1, 3, 4,
+        3, 6, 4
+      ];
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geometry.setIndex(indices);
+
+      // 法線：
+      // - Lambert/Phong 等の “ライト計算” には法線が必要
+      // - 頂点を動かすので毎フレーム更新する（後で render() 内で再計算）
+      geometry.computeVertexNormals();
+      geometry.computeBoundingSphere();
+
+      // ============================================================
+      // 3) “面 + ワイヤ” の重ね描き（SceneUtils の代替）
+      // ============================================================
+      // solid（半透明Lambert）：
+      // - flatShading を true にすると “面単位の見え方” に寄り、ポリゴン構造が分かりやすい
+      const solidMat = new THREE.MeshLambertMaterial({
+        color: 0x44ff44,
+        opacity: 0.6,
+        transparent: true,
+        flatShading: true,
+        side: THREE.DoubleSide
+      });
+
+      // wireframe：
+      // - 同じ geometry を wireframe 表示
+      // - Z-fighting（面と線が同一深度でチラつく）を抑えるため polygonOffset を使う
+      const wireMat = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        wireframe: true
+      });
+      wireMat.polygonOffset = true;
+      wireMat.polygonOffsetFactor = -1;
+      wireMat.polygonOffsetUnits = -1;
+
+      // Group にまとめる（「1つのオブジェクト」として扱える）
+      const meshGroup = new THREE.Group();
+      meshGroup.name = "main";
+
+      const solidMesh = new THREE.Mesh(geometry, solidMat);
+      const wireMesh  = new THREE.Mesh(geometry, wireMat);
+
+      // 影：solid は必須。wire は “線の影” が邪魔なら false にしてもよい（ここでは旧コードに寄せて true）
+      solidMesh.castShadow = true;
+      wireMesh.castShadow  = true;
+
+      meshGroup.add(solidMesh);
+      meshGroup.add(wireMesh);
+      scene.add(meshGroup);
+
+      // ============================================================
+      // 4) GUI（lil-gui）：頂点操作 + clone ボタン
+      // ============================================================
+      const gui = new GUI({ title: "Controls" });
+
+      // clone：
+      // - 現在の頂点状態を geometry.clone() でコピーして別オブジェクトとして配置
+      // - 旧コード同様 “clone は固定（GUI操作で動かない）” にするため、更新ループでは main のみ更新する
+      const actions = {
+        clone: () => {
+          const old = scene.getObjectByName("clone");
+          if (old) scene.remove(old);
+
+          const clonedGeometry = geometry.clone();
+
+          const clonedSolidMat = new THREE.MeshLambertMaterial({
+            color: 0xff44ff,
+            opacity: 0.6,
+            transparent: true,
+            flatShading: true,
+            side: THREE.DoubleSide
+          });
+          const clonedWireMat = new THREE.MeshBasicMaterial({
+            color: 0x000000,
+            wireframe: true
+          });
+          clonedWireMat.polygonOffset = true;
+          clonedWireMat.polygonOffsetFactor = -1;
+          clonedWireMat.polygonOffsetUnits = -1;
+
+          const g = new THREE.Group();
+          g.name = "clone";
+
+          const s = new THREE.Mesh(clonedGeometry, clonedSolidMat);
+          const w = new THREE.Mesh(clonedGeometry, clonedWireMat);
+          s.castShadow = true;
+          w.castShadow = true;
+
+          g.add(s);
+          g.add(w);
+
+          // 旧コードの translateX/Z と同じ意図：少し横にずらして比較できるようにする
+          g.position.x += 5;
+          g.position.z += 5;
+
+          scene.add(g);
+        }
+      };
+      gui.add(actions, "clone");
+
+      // 8頂点分のフォルダを作り、x/y/z を -10〜10 で操作できるようにする
+      for (let i = 0; i < 8; i++) {
+        const f = gui.addFolder(`Vertices ${i + 1}`);
+        f.add(controlPoints[i], "x", -10, 10, 0.01);
+        f.add(controlPoints[i], "y", -10, 10, 0.01);
+        f.add(controlPoints[i], "z", -10, 10, 0.01);
+      }
+
+      // ============================================================
+      // 5) メインループ（requestAnimationFrame）
+      // ============================================================
+      // 毎フレームのアルゴリズム：
+      // 1) stats.update()（FPS更新）
+      // 2) main geometry の position attribute を controlPoints で更新
+      // 3) needsUpdate = true（GPUへ再アップロード）
+      // 4) computeVertexNormals（ライト計算のため）
+      // 5) computeBoundingSphere（カリング事故予防）
+      // 6) renderer.render(scene, camera)
+      const posAttr = geometry.getAttribute("position");
+
+      function render() {
+        stats.update();
+
+        // main のみ更新（clone は固定にする）
+        for (let i = 0; i < 8; i++) {
+          posAttr.setXYZ(i, controlPoints[i].x, controlPoints[i].y, controlPoints[i].z);
+        }
+        posAttr.needsUpdate = true;
+
+        // ライト計算に必要（Lambert/Phong は法線がないと立体感が出ない）
+        geometry.computeVertexNormals();
+
+        // 頂点が動くと境界球が古くなる → 画面外判定（フラスタムカリング）が壊れる可能性がある
+        geometry.computeBoundingSphere();
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+      render();
+
+      // ============================================================
+      // Resize：カメラの aspect と投影行列、レンダラーサイズを更新
+      // ============================================================
+      window.addEventListener("resize", () => {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+
+        renderer.setSize(w, h);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      });
+    }
+
+    function initStats() {
+      const stats = new Stats();
+      stats.showPanel(0); // 0: fps
+      stats.dom.style.position = "absolute";
+      stats.dom.style.left = "0px";
+      stats.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(stats.dom);
+      return stats;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
