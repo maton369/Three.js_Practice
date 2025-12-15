@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 02.08 - Cameras (ES Modules + detailed comments)</title>
+
+  <!--
+    【今まで通りの方針（ES Modules + importmap）】
+    - 旧来の ../libs/three.js / stats.js / dat.gui.js を <script> 直読みしない
+    - three は CDN から ESM import
+    - GUI は dat.gui 互換の lil-gui（three/addons）を使う
+    - Stats も three/addons から読む
+
+    このサンプルの主題（アルゴリズム上のポイント）：
+    - PerspectiveCamera と OrthographicCamera を切り替えつつ、
+      「lookAt のターゲット（赤球）が時間で動く」状況を観察する。
+    - 毎フレーム camera.lookAt(target) を行い、
+      “カメラの向き” が target に追従することを視覚化する。
+
+    注意点（今回の修正ポイント）：
+    - OrthographicCamera は fov を持たないため、left/right/top/bottom を
+      シーンスケールに合わせて決めないと「ズームしすぎ」になりやすい。
+    - そこで「Perspective(45deg) と同等の見え方」になるように、
+      カメラ位置→ターゲット距離 dist と “仮想FOV” から
+      viewHeight を計算して Orthographic の箱サイズを決める。
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（切替・リサイズ・ループで参照するため）
+    // ============================================================
+    let scene;
+    let renderer;
+    let camera;
+    let stats;
+
+    // 赤い球（lookAt のターゲット）＝「いまカメラが見ている点」を可視化
+    let lookAtMesh;
+
+    // 「カメラを置く場所」は投影を切り替えても固定（比較が簡単になる）
+    const CAM_POS = new THREE.Vector3(120, 60, 180);
+
+    // “透視投影の基準” として固定のFOVを採用（旧コードの 45deg を踏襲）
+    // ※ Orthographic でも “このFOVで見たときと同じ範囲” を写すように箱サイズを決める
+    const BASE_PERSPECTIVE_FOV_DEG = 45;
+
+    // ============================================================
+    // GUI用の状態（lil-gui はオブジェクトの値を参照して表示する）
+    // ============================================================
+    const controls = {
+      projection: "Perspective",
+
+      // ターゲット（赤球）の動き：x = baseX + amplitude * sin(t)
+      baseX: 10,
+      amplitude: 100,
+      targetY: 10,
+      speed: 0.02,
+
+      // Orthographic の“ズーム”相当（箱サイズに倍率を掛ける）
+      // - 1.0: Perspective(45deg) と同等
+      // - 0.5: さらにズームイン（箱が小さくなる）
+      // - 2.0: ズームアウト（箱が大きくなる）
+      orthoScale: 1.0,
+
+      // 投影切り替え
+      switchCamera: () => {
+        if (camera.isPerspectiveCamera) {
+          // Perspective → Orthographic
+          camera = makeOrthographicCamera();
+          controls.projection = "Orthographic";
+        } else {
+          // Orthographic → Perspective
+          camera = makePerspectiveCamera();
+          controls.projection = "Perspective";
+        }
+
+        // 切替後も比較条件を揃える（位置・注視点）
+        camera.position.copy(CAM_POS);
+        camera.lookAt(getTargetVector());
+
+        // Orthographic の場合は「今のターゲット」に対して箱サイズを更新
+        if (camera.isOrthographicCamera) {
+          updateOrthoFrustumToMatchPerspective(camera, getTargetVector());
+        }
+      }
+    };
+
+    // ループ用時間（旧コードの step を整理：二重定義をやめる）
+    let t = 0;
+
+    // ============================================================
+    // init：初期化（シーン構築 → GUI → ループ）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene：シーングラフのルート
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Renderer：描画装置（canvas生成）
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // 床（Plane）
+      // ------------------------------------------------------------
+      const planeGeometry = new THREE.PlaneGeometry(180, 180);
+      const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+      const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+      plane.rotation.x = -0.5 * Math.PI; // XY → XZ（床）
+      plane.position.set(0, 0, 0);
+      scene.add(plane);
+
+      // ------------------------------------------------------------
+      // キューブを格子状に配置（旧コードを踏襲）
+      // - geometry/material を共有するのは良い習慣（メモリ効率）
+      // ------------------------------------------------------------
+      const cubeGeometry = new THREE.BoxGeometry(4, 4, 4);
+      const cubeMaterial = new THREE.MeshLambertMaterial({ color: 0x00ee22 });
+
+      const rows = planeGeometry.parameters.height / 5; // 180/5=36
+      const cols = planeGeometry.parameters.width / 5;  // 180/5=36
+
+      for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+          const cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+
+          cube.position.z = -(planeGeometry.parameters.height / 2) + 2 + (j * 5);
+          cube.position.x = -(planeGeometry.parameters.width  / 2) + 2 + (i * 5);
+          cube.position.y = 2; // 高さ4の半分で接地
+
+          scene.add(cube);
+        }
+      }
+
+      // ------------------------------------------------------------
+      // lookAt のターゲットを示す赤い球
+      // - 「いま camera.lookAt している点」が動く様子が見える
+      // ------------------------------------------------------------
+      const lookAtGeom = new THREE.SphereGeometry(2);
+      lookAtMesh = new THREE.Mesh(
+        lookAtGeom,
+        new THREE.MeshLambertMaterial({ color: 0xff0000 })
+      );
+      scene.add(lookAtMesh);
+
+      // ------------------------------------------------------------
+      // 光源（Lambert を可視化する最小構成）
+      // ------------------------------------------------------------
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
+      directionalLight.position.set(-20, 40, 60);
+      scene.add(directionalLight);
+
+      const ambientLight = new THREE.AmbientLight(0x292929);
+      scene.add(ambientLight);
+
+      // ------------------------------------------------------------
+      // 初期カメラ：Perspective から開始
+      // ------------------------------------------------------------
+      camera = makePerspectiveCamera();
+      camera.position.copy(CAM_POS);
+      camera.lookAt(getTargetVector());
+
+      // ------------------------------------------------------------
+      // GUI：投影切替 + ターゲット運動パラメータ
+      // ------------------------------------------------------------
+      const gui = new GUI({ title: "Controls" });
+      gui.add(controls, "switchCamera").name("switchCamera");
+      gui.add(controls, "projection").name("projection").listen();
+
+      const fTarget = gui.addFolder("lookAt target motion");
+      fTarget.add(controls, "baseX", -200, 200, 0.1);
+      fTarget.add(controls, "amplitude", 0, 300, 0.1);
+      fTarget.add(controls, "targetY", -50, 50, 0.1);
+      fTarget.add(controls, "speed", 0.001, 0.2, 0.001);
+
+      const fOrtho = gui.addFolder("orthographic tuning");
+      fOrtho.add(controls, "orthoScale", 0.2, 4.0, 0.01).name("orthoScale");
+
+      // ------------------------------------------------------------
+      // Resize：投影行列の更新が必須
+      // - Perspective: aspect更新
+      // - Orthographic: left/right/top/bottom更新（ズーム相当）
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // ループ開始
+      // ------------------------------------------------------------
+      render();
+    }
+
+    // ============================================================
+    // ターゲット座標の計算（毎フレーム変化）
+    // x = baseX + amplitude * sin(t), y = targetY, z = 0
+    // ============================================================
+    function getTargetVector() {
+      const x = controls.baseX + controls.amplitude * Math.sin(t);
+      return new THREE.Vector3(x, controls.targetY, 0);
+    }
+
+    // ============================================================
+    // PerspectiveCamera 生成
+    // ============================================================
+    function makePerspectiveCamera() {
+      const cam = new THREE.PerspectiveCamera(
+        BASE_PERSPECTIVE_FOV_DEG,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      return cam;
+    }
+
+    // ============================================================
+    // OrthographicCamera 生成
+    // - left/right/top/bottom は後で updateOrthoFrustumToMatchPerspective で決める
+    // ============================================================
+    function makeOrthographicCamera() {
+      // 仮の箱（あとで必ず更新する）
+      const aspect = window.innerWidth / window.innerHeight;
+      const dummySize = 10;
+      const cam = new THREE.OrthographicCamera(
+        (-dummySize * aspect) / 2,
+        ( dummySize * aspect) / 2,
+        ( dummySize) / 2,
+        (-dummySize) / 2,
+        0.1,
+        1000
+      );
+      return cam;
+    }
+
+    // ============================================================
+    // 重要：Orthographic の “ズームしすぎ” 対策（今回の修正の核）
+    //
+    // OrthographicCamera は視野角(fov)を持たないため、
+    // 「どれくらいの範囲が画面に入るか」を left/right/top/bottom で直接決める。
+    //
+    // ここでは「Perspective(45deg) で同じ位置から target を見たときの画角」を計算し、
+    // それと同等の “見える縦サイズ(viewHeight)” を Orthographic の箱高さに採用する。
+    //
+    // 計算（透視投影の基本式）：
+    //   viewHeight = 2 * dist * tan(fov/2)
+    // dist は「カメラ位置→ターゲット距離」
+    // fov はラジアンに変換して使う
+    //
+    // さらに controls.orthoScale を掛けて、正射影側の見え方を微調整できるようにする。
+    // ============================================================
+    function updateOrthoFrustumToMatchPerspective(orthoCam, target) {
+      const aspect = window.innerWidth / window.innerHeight;
+
+      // カメラ位置→ターゲット距離（この距離が変わると “同等画角” の高さも変わる）
+      const dist = orthoCam.position.distanceTo(target);
+
+      // “仮想Perspective” のFOV（deg→rad）
+      const fovRad = THREE.MathUtils.degToRad(BASE_PERSPECTIVE_FOV_DEG);
+
+      // 透視投影での target 面における縦方向の見えるサイズ
+      let viewHeight = 2 * dist * Math.tan(fovRad / 2);
+
+      // Orthographic の調整（>1 でズームアウト、<1 でズームイン）
+      viewHeight *= controls.orthoScale;
+
+      const top = viewHeight / 2;
+      const bottom = -top;
+      const right = top * aspect;
+      const left = -right;
+
+      orthoCam.left = left;
+      orthoCam.right = right;
+      orthoCam.top = top;
+      orthoCam.bottom = bottom;
+
+      orthoCam.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // Resize：レンダラーとカメラの投影行列を更新
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      if (camera.isPerspectiveCamera) {
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      } else {
+        // Orthographic は箱サイズを再計算（=ズーム再調整）
+        updateOrthoFrustumToMatchPerspective(camera, getTargetVector());
+      }
+    }
+
+    // ============================================================
+    // render：毎フレーム
+    //
+    // 全体アルゴリズム：
+    // 1) stats.update()（FPS更新）
+    // 2) 時間 t を進める
+    // 3) target（lookAt点）を計算
+    // 4) camera.lookAt(target) で “カメラの向き” を target に追従させる
+    // 5) 赤球も target に移動（視覚化）
+    // 6) Orthographic の場合は target に合わせて箱サイズも更新
+    //    - これにより、ターゲットが動いても “ズーム感” が破綻しにくい
+    // 7) renderer.render(scene, camera)
+    // ============================================================
+    function render() {
+      stats.update();
+
+      // 時間更新（速度はGUIで調整）
+      t += controls.speed;
+
+      // いま注視するターゲット
+      const target = getTargetVector();
+
+      // カメラは常にターゲットを見る（=lookAtのデモ）
+      camera.lookAt(target);
+
+      // ターゲット可視化（赤球を追従）
+      lookAtMesh.position.copy(target);
+
+      // Orthographic では target 追従に伴い “同等画角” の箱サイズも更新する
+      // ※ Perspective は fov で自然に画角が決まるが、Orthographic は手動で決める必要がある
+      if (camera.isOrthographicCamera) {
+        updateOrthoFrustumToMatchPerspective(camera, target);
+      }
+
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // Stats 初期化（FPS表示）
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    // 元コードの体裁維持
+    window.onload = init;
+  </script>
+</body>
+</html>
