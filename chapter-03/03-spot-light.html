@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 03.03 - Spot Light (ES Modules + detailed comments)</title>
+
+  <!--
+    【方針（これまで通り：ES Modules + importmap）】
+    - 旧来の ../libs/three.js / stats.js / dat.gui.js の <script> 直読み（window.THREE前提）をやめる
+    - three は CDN から ESM で import
+    - GUI は dat.gui 互換の lil-gui（three/addons）を使う
+    - Stats も three/addons から読む
+
+    【このサンプルの主題】
+    - SpotLight（スポットライト）の “円錐状に照らす” 性質を観察する
+    - 角度（angle）・ぼかし（penumbra）・距離（distance）・強度（intensity）・影（castShadow）
+      をGUIで触って、見え方がどう変わるかを理解する
+    - ライト自体を動かして「光源位置が変わると陰影がどう変わるか」を体感する
+
+    【重要な修正点（旧コード→現代three.js）】
+    1) penumbra は “0〜1” が正しい範囲です（旧コードの 30/100 などは現代では意味がズレます）
+       - penumbra = 0 だとエッジが硬い
+       - penumbra = 1 だとエッジが最大に柔らかい
+    2) SpotLight.angle の実用的な最大は Math.PI / 2（=90度）です
+    3) SpotLight/PointLight の decay は今後の方針として 0 をデフォルトにします（距離減衰なし）
+       - distance と decay の理解自体は大事ですが、教材スケール（座標が数十）で真っ黒事故を避けるため
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // ここから先は「初期化 → 毎フレーム更新 → 描画」の王道構成です
+    // ============================================================
+
+    // いろいろな箇所（resize / GUI / render）から参照したいので外に出します
+    let scene, camera, renderer, stats;
+
+    // 動かす対象（後から target を切り替えるので参照を保持）
+    let plane, cube, sphere;
+
+    // ライト関連（主役）
+    let ambientLight;
+    let spotLight;           // 本体の SpotLight
+    let spotLightFill;       // 補助の薄いスポット（影の黒つぶれ緩和）
+    let lightMarkerMesh;     // ライト位置の可視化（小さい球）
+    let shadowCameraHelper;  // 影用の “ライト視点カメラ” の可視化（デバッグ用）
+    let spotLightHelper;     // スポットの円錐を可視化（デバッグ用）
+
+    // アニメーション用の内部状態
+    let step = 0;   // 球のバウンド用
+    let phase = 0;  // ライトの軌道用
+    let invert = 1; // 軌道を折り返すための符号
+
+    // 旧コードにもあった「ライトを止める」フラグ
+    let stopMovingLight = false;
+
+    // カメラ配置（観察しやすい固定視点）
+    const CAM_POS = new THREE.Vector3(-35, 30, 25);
+    const LOOK_TARGET = new THREE.Vector3(10, 0, 0);
+
+    // ============================================================
+    // init：初期化（シーン構築 → GUI → ループ開始）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene：シーングラフのルート
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Camera：透視投影
+      // - このサンプルは投影の比較ではないので Perspective 固定でOK
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.copy(CAM_POS);
+      camera.lookAt(LOOK_TARGET);
+
+      // ------------------------------------------------------------
+      // Renderer：WebGL 描画装置
+      // - shadowMap を有効化し、影を観察できるようにする
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xeeeeee));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // 影が成立する条件（4点セット）
+      // 1) renderer.shadowMap.enabled = true
+      // 2) 光源: light.castShadow = true
+      // 3) 影を落とす: mesh.castShadow = true
+      // 4) 影を受ける: mesh.receiveShadow = true
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap; // PCFShadowMapより柔らかい傾向
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // 床（Plane）
+      // - PlaneGeometry はデフォルト XY 平面なので、床にするため XZ に寝かせる
+      // ------------------------------------------------------------
+      {
+        const planeGeometry = new THREE.PlaneGeometry(60, 20, 1, 1);
+        const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+        plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+        plane.receiveShadow = true;          // 影を受ける
+        plane.rotation.x = -0.5 * Math.PI;   // -90度回転
+        plane.position.set(15, 0, 0);
+
+        scene.add(plane);
+      }
+
+      // ------------------------------------------------------------
+      // 立方体（回転して陰影変化を見せる）
+      // ------------------------------------------------------------
+      {
+        const cubeGeometry = new THREE.BoxGeometry(4, 4, 4);
+        const cubeMaterial = new THREE.MeshLambertMaterial({ color: 0xff3333 });
+        cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+
+        cube.castShadow = true;           // 影を落とす
+        cube.position.set(-4, 3, 0);
+
+        scene.add(cube);
+      }
+
+      // ------------------------------------------------------------
+      // 球（バウンドしてライトの当たり方が変わるのを見せる）
+      // ------------------------------------------------------------
+      {
+        const sphereGeometry = new THREE.SphereGeometry(4, 20, 20);
+        const sphereMaterial = new THREE.MeshLambertMaterial({ color: 0x7777ff });
+        sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+
+        sphere.castShadow = true;         // 影を落とす
+        sphere.position.set(20, 0, 2);
+
+        scene.add(sphere);
+      }
+
+      // ------------------------------------------------------------
+      // 環境光：影の中が真っ黒にならないよう底上げ
+      // - AmbientLight は方向性が無いので “陰影” は作れない
+      // - ただし全体の見やすさのために必須級
+      // ------------------------------------------------------------
+      const ambiColor = "#1c1c1c";
+      ambientLight = new THREE.AmbientLight(ambiColor);
+      scene.add(ambientLight);
+
+      // ------------------------------------------------------------
+      // 補助ライト（弱め）
+      // - 主役の SpotLight だけだと、暗部が極端になり観察がしづらい場合がある
+      // - そこで、影を作らない補助のスポットを少し足す
+      // ------------------------------------------------------------
+      spotLightFill = new THREE.SpotLight(0xcccccc, 0.4);
+      spotLightFill.position.set(-40, 30, -10);
+      spotLightFill.castShadow = false;          // 補助なので影は作らない（軽い）
+      spotLightFill.decay = 0;                   // ★方針：decay=0
+      spotLightFill.distance = 0;                // 0 は無限距離扱い（減衰の上限なし）
+      spotLightFill.angle = 0.6;
+      spotLightFill.penumbra = 0.2;
+      spotLightFill.target = plane;              // 床の方を向けておく
+      scene.add(spotLightFill);
+
+      // ------------------------------------------------------------
+      // 主役：SpotLight（スポットライト）
+      // - angle：円錐の広がり（ラジアン）
+      // - penumbra：円錐のエッジの柔らかさ（0〜1）
+      // - distance：届く距離（0 は無限）
+      // - decay：距離減衰（★方針で 0 をデフォルト）
+      // ------------------------------------------------------------
+      const spotColor = "#ffffff";
+      spotLight = new THREE.SpotLight(spotColor, 1.0);
+      spotLight.position.set(-40, 60, -10);
+      spotLight.castShadow = true;
+
+      // ★方針：decay=0（距離減衰なし）
+      // - distance/decay を学ぶのは大事だが、デフォルトは事故りにくさ優先
+      spotLight.decay = 0;
+
+      spotLight.distance = 0;       // 0 は無限距離（上限無し）
+      spotLight.angle = 0.4;        // 広がり（0〜π/2 推奨）
+      spotLight.penumbra = 0.2;     // 0〜1
+
+      // SpotLight は「position → target」方向に照射する
+      // - target は Object3D であり、座標で向きが決まる
+      // - ここでは “床” を向くようにして開始
+      spotLight.target = plane;
+
+      // 影の品質（やりすぎると重いので最小限）
+      spotLight.shadow.mapSize.set(1024, 1024);
+      spotLight.shadow.camera.near = 2;
+      spotLight.shadow.camera.far = 200;
+
+      // スポットライトの影用カメラは PerspectiveCamera なので fov が効く
+      // - ただし angle とは別物（影を取る “ライト視点” の範囲）
+      // - 観察のために旧コードの意図を残しつつ、過剰に弄らない
+      spotLight.shadow.camera.fov = 30;
+
+      scene.add(spotLight);
+
+      // ------------------------------------------------------------
+      // デバッグ用ヘルパー
+      // - SpotLightHelper：スポットの円錐を可視化
+      // - CameraHelper：影用カメラ（ライト視点）を可視化
+      // ------------------------------------------------------------
+      spotLightHelper = new THREE.SpotLightHelper(spotLight);
+      spotLightHelper.visible = false;
+      scene.add(spotLightHelper);
+
+      shadowCameraHelper = new THREE.CameraHelper(spotLight.shadow.camera);
+      shadowCameraHelper.visible = false;
+      scene.add(shadowCameraHelper);
+
+      // ------------------------------------------------------------
+      // 光源位置の可視化（ライトは“見えない”ので、小球で示す）
+      // - これにより「どこから照らしているか」が直感的に分かる
+      // ------------------------------------------------------------
+      {
+        const markerGeom = new THREE.SphereGeometry(0.3, 16, 16);
+        const markerMat = new THREE.MeshBasicMaterial({ color: 0xac6c25 });
+        lightMarkerMesh = new THREE.Mesh(markerGeom, markerMat);
+        lightMarkerMesh.position.set(3, 20, 3);
+        scene.add(lightMarkerMesh);
+
+        // 初期状態でライトもマーカーへ合わせる
+        spotLight.position.copy(lightMarkerMesh.position);
+      }
+
+      // ------------------------------------------------------------
+      // GUI：SpotLight のパラメータを触って理解する
+      // ------------------------------------------------------------
+      const controls = {
+        // アニメーション
+        rotationSpeed: 0.03,
+        bouncingSpeed: 0.03,
+
+        // 色
+        ambientColor: ambiColor,
+        spotColor: spotColor,
+
+        // SpotLightの主要パラメータ
+        intensity: 1.0,
+        distance: 0,     // 0=無限
+        decay: 0,        // ★方針：デフォルト0
+        angle: 0.4,      // 0〜π/2 推奨
+        penumbra: 0.2,   // 0〜1
+
+        // デバッグ
+        debug: false,
+        castShadow: true,
+
+        // target 切り替え
+        target: "Plane",
+
+        // ライト移動停止
+        stopMovingLight: false
+      };
+
+      // 初期値をライト側へ反映（GUIの値と一致させる）
+      spotLight.intensity = controls.intensity;
+      spotLight.distance  = controls.distance;
+      spotLight.decay     = controls.decay;
+      spotLight.angle     = controls.angle;
+      spotLight.penumbra  = controls.penumbra;
+      spotLight.castShadow = controls.castShadow;
+
+      const gui = new GUI({ title: "Controls" });
+
+      gui.addColor(controls, "ambientColor").name("ambientColor").onChange((v) => {
+        ambientLight.color = new THREE.Color(v);
+      });
+
+      gui.addColor(controls, "spotColor").name("spotColor").onChange((v) => {
+        spotLight.color = new THREE.Color(v);
+      });
+
+      gui.add(controls, "intensity", 0, 5, 0.01).name("intensity").onChange((v) => {
+        spotLight.intensity = v;
+      });
+
+      // distance: 0 は “無限” なので、UIでは 0〜200 の範囲で観察しやすくする
+      gui.add(controls, "distance", 0, 200, 1).name("distance").onChange((v) => {
+        spotLight.distance = v;
+      });
+
+      // decay: ★方針でデフォルト0。ただし学習用に 0〜2 程度で触れるようにする
+      // - 大きくしすぎるとすぐ暗くなる（教材スケールでは事故りやすい）
+      gui.add(controls, "decay", 0, 2, 0.01).name("decay").onChange((v) => {
+        spotLight.decay = v;
+      });
+
+      // angle: 0〜π/2 くらいが見やすい（それ以上は広すぎて“スポット感”が薄れる）
+      gui.add(controls, "angle", 0.01, Math.PI / 2, 0.001).name("angle").onChange((v) => {
+        spotLight.angle = v;
+
+        // Helper類は “内部の計算結果” を持つので、変更後に更新が必要
+        spotLightHelper.update();
+
+        // 影用カメラの見た目（CameraHelper）も更新しておくとデバッグが一致する
+        shadowCameraHelper.update();
+      });
+
+      // penumbra: 0〜1（ここが旧コードからの重要な修正点）
+      gui.add(controls, "penumbra", 0, 1, 0.001).name("penumbra").onChange((v) => {
+        spotLight.penumbra = v;
+        spotLightHelper.update();
+      });
+
+      gui.add(controls, "castShadow").name("castShadow").onChange((v) => {
+        spotLight.castShadow = v;
+      });
+
+      gui.add(controls, "debug").name("debug").onChange((v) => {
+        spotLightHelper.visible = v;
+        shadowCameraHelper.visible = v;
+
+        // visible切替直後に update しておくとズレが出にくい
+        spotLightHelper.update();
+        shadowCameraHelper.update();
+      });
+
+      gui.add(controls, "target", ["Plane", "Sphere", "Cube"]).name("target").onChange((v) => {
+        // target は Object3D の参照を差し替えるだけでOK
+        // - plane/cube/sphere は既に scene にいるので、targetとして安全に使える
+        if (v === "Plane")  spotLight.target = plane;
+        if (v === "Sphere") spotLight.target = sphere;
+        if (v === "Cube")   spotLight.target = cube;
+
+        // target を変えたら、向きの計算が更新されるように matrixWorld を更新
+        spotLight.target.updateMatrixWorld();
+        spotLightHelper.update();
+      });
+
+      gui.add(controls, "stopMovingLight").name("stopMovingLight").onChange((v) => {
+        stopMovingLight = v;
+      });
+
+      // ------------------------------------------------------------
+      // Resize：画面サイズが変わったら aspect / renderer を更新
+      // ------------------------------------------------------------
+      window.addEventListener("resize", () => onResize());
+
+      // ------------------------------------------------------------
+      // ループ開始
+      // ------------------------------------------------------------
+      render(controls);
+    }
+
+    // ============================================================
+    // render：毎フレーム更新 → 描画
+    // ============================================================
+    function render(controls) {
+      stats.update();
+
+      // ------------------------------------------------------------
+      // (1) 立方体を回転させる
+      // - 回転により面の向き（法線）が変わり、スポットライトの当たり方が分かりやすい
+      // ------------------------------------------------------------
+      cube.rotation.x += controls.rotationSpeed;
+      cube.rotation.y += controls.rotationSpeed;
+      cube.rotation.z += controls.rotationSpeed;
+
+      // ------------------------------------------------------------
+      // (2) 球をバウンドさせる
+      // - y は abs(sin) を使うことで床より下に行かない
+      // ------------------------------------------------------------
+      step += controls.bouncingSpeed;
+      sphere.position.x = 20 + (10 * Math.cos(step));
+      sphere.position.y = 2 + (10 * Math.abs(Math.sin(step)));
+
+      // ------------------------------------------------------------
+      // (3) ライト（＆マーカー）を動かす
+      // - 旧コードの意図：円運動に “折り返し” を混ぜて変化を出す
+      // - invert/pivot は「右半分に来たときだけ反転」みたいな動きを作るための工夫
+      // ------------------------------------------------------------
+      if (!stopMovingLight) {
+        // phase を進める（2πで周期）
+        if (phase > 2 * Math.PI) {
+          invert *= -1;
+          phase -= 2 * Math.PI;
+        } else {
+          phase += controls.rotationSpeed;
+        }
+
+        // 半径 14 の円運動（x,z）＋固定高さ y=10
+        const x = 14 * Math.cos(phase);
+        const z = 7  * Math.sin(phase);
+        lightMarkerMesh.position.set(x, 10, z);
+
+        // invert が負のときだけ、x を pivot=14 を中心に反転させる
+        // - pivot は “円運動の半径” に合わせた基準点
+        // - こうすると「片側に寄った運動」になり、観察に変化が出る
+        if (invert < 0) {
+          const pivot = 14;
+          lightMarkerMesh.position.x = (invert * (lightMarkerMesh.position.x - pivot)) + pivot;
+        }
+
+        // SpotLight は “位置” と “target” で向きが決まる
+        spotLight.position.copy(lightMarkerMesh.position);
+      }
+
+      // ------------------------------------------------------------
+      // (4) Helper 更新（debug表示がONのときは特に重要）
+      // - SpotLightHelper は内部状態をキャッシュするので、毎フレーム update してOK
+      // ------------------------------------------------------------
+      if (spotLightHelper.visible) {
+        spotLightHelper.update();
+      }
+      if (shadowCameraHelper.visible) {
+        shadowCameraHelper.update();
+      }
+
+      // ------------------------------------------------------------
+      // (5) 描画
+      // ------------------------------------------------------------
+      requestAnimationFrame(() => render(controls));
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // onResize：リサイズ時の更新
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // initStats：FPS表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    // 旧コードの体裁維持：window.onload
+    window.onload = init;
+  </script>
+</body>
+</html>
