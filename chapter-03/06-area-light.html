@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 03.06 - Area Light（RectAreaLight / ES Modules）</title>
+
+  <!--
+    このサンプルは、古い three.js 書籍サンプルにある
+      - THREE.AreaLight
+      - WebGLDeferredRenderer（遅延レンダラ）
+    を使う実装を、現代の three.js（ES Modules）で動く形に「修正」したもの。
+
+    ■重要（互換性の理由）
+    - THREE.AreaLight は、現代 three.js では廃止されている（存在しない）
+    - 代わりに「面光源」は THREE.RectAreaLight を使う
+    - RectAreaLight は、基本的に MeshStandardMaterial / MeshPhysicalMaterial（PBR材質）に対して効く
+      → 旧サンプルの MeshPhongMaterial 前提（Deferred）から材質を置き換える必要がある
+
+    ■アルゴリズム（レンダリング全体の流れ）
+    1) init() で Scene / Camera / Renderer を作る
+    2) 床（地面）を PBR 材質で用意し、ライトが効く土台を作る
+    3) RectAreaLight（面光源）を3つ配置（RGB）
+       - 面光源は「面から放射される光」を近似し、拡散反射が自然に見えやすい
+    4) GUI で色・強度・露出などを操作できるようにする
+    5) requestAnimationFrame のループで毎フレーム描画
+
+    ■補足（RectAreaLight の注意点）
+    - RectAreaLight を正しくシェーダに反映するため、RectAreaLightUniformsLib.init() が必要
+    - 面の向きが重要：ライトは「ライトのローカル -Z 方向」に照射される
+      → 下向きに照らしたいなら回転が必要
+  -->
+
+  <!-- ES Modules + importmap（前回と同じ方針） -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // RectAreaLight を動かすためのシェーダ拡張（必須）
+    import { RectAreaLightUniformsLib } from "three/addons/lights/RectAreaLightUniformsLib.js";
+    import { RectAreaLightHelper } from "three/addons/helpers/RectAreaLightHelper.js";
+
+    // ============================================================
+    // グローバル（render / resize で参照するもの）
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let ground;
+
+    // 面光源（RectAreaLight）
+    let areaLight1, areaLight2, areaLight3;
+
+    // 「光源そのもの」を見せるための “発光パネル”（ただの見た目用メッシュ）
+    // ※RectAreaLight 自体は「形が見える」わけではないので、教材ではパネルを置くと分かりやすい
+    let panel1, panel2, panel3;
+
+    // Helper（ライトの枠を可視化）
+    let helper1, helper2, helper3;
+
+    // ============================================================
+    // init：初期化
+    // ============================================================
+    function init() {
+      // 1) Stats（FPS表示）
+      stats = initStats();
+
+      // 2) RectAreaLight を有効化（これを呼ばないと面光源が効かない）
+      RectAreaLightUniformsLib.init();
+
+      // 3) Scene
+      scene = new THREE.Scene();
+      // 背景色（見やすさ用）
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // 4) Camera（Perspective）
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      // 旧サンプルの雰囲気に近い位置
+      camera.position.set(20, 30, 21);
+      camera.lookAt(new THREE.Vector3(0, 0, -30));
+      scene.add(camera);
+
+      // 5) Renderer
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // 色空間：最終出力を sRGB に（見た目が自然になる）
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      // トーンマッピング：旧 DeferredRenderer の tonemapping/brightness 相当の“現代版”
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 2.5;
+
+      // このサンプルは「面光源の見え方」が主題なので影は省略（必要なら後で追加）
+      renderer.shadowMap.enabled = false;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ============================================================
+      // 地面（ground）
+      // ============================================================
+      // RectAreaLight は PBR 系（Standard/Physical）材質に効く。
+      // 旧サンプルは Phong を使っていたが、ここでは MeshStandardMaterial に置き換える。
+      const groundGeo = new THREE.PlaneGeometry(70, 70, 1, 1);
+
+      const groundMat = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        // roughness を上げると反射が拡散し、面光源の“柔らかさ”が出やすい
+        roughness: 0.85,
+        metalness: 0.0
+      });
+
+      ground = new THREE.Mesh(groundGeo, groundMat);
+      ground.rotation.x = -0.5 * Math.PI; // XY 平面 → XZ の床へ
+      ground.position.set(0, 0, 0);
+      scene.add(ground);
+
+      // ============================================================
+      // 補助ライト（旧サンプルにあった SpotLight を“ほんの少し”残す）
+      // ============================================================
+      // 面光源だけだと極端に暗い領域が出やすいので、教材として視認性を上げる目的。
+      // ※ユーザー方針：SpotLight/PointLight の decay は 0
+      const fillSpot = new THREE.SpotLight(0xcccccc, 0.10);
+      fillSpot.position.set(-40, 60, -10);
+      fillSpot.decay = 0;      // ★方針：距離減衰なし
+      fillSpot.distance = 0;   // 0 は無限扱い（減衰しないイメージ）
+      fillSpot.target = ground;
+      scene.add(fillSpot);
+      scene.add(fillSpot.target);
+
+      // ============================================================
+      // 面光源（RectAreaLight）3つ：RGB
+      // ============================================================
+      // RectAreaLight は
+      //  - color（光の色）
+      //  - intensity（強さ）
+      //  - width/height（面の大きさ）
+      // を持つ。位置・回転で照射方向が決まる（ローカル -Z 方向へ照射）。
+
+      // 共通パラメータ（旧サンプルから踏襲）
+      const baseY = 10;
+      const baseZ = -35;
+      const w = 4;
+      const h = 9.9;
+      const intensity = 3;
+
+      // 3つ並べる（x=-10,0,10）
+      areaLight1 = new THREE.RectAreaLight(0xff0000, intensity, w, h);
+      areaLight1.position.set(-10, baseY, baseZ);
+
+      areaLight2 = new THREE.RectAreaLight(0x00ff00, intensity, w, h);
+      areaLight2.position.set(0, baseY, baseZ);
+
+      areaLight3 = new THREE.RectAreaLight(0x0000ff, intensity, w, h);
+      areaLight3.position.set(10, baseY, baseZ);
+
+      // 下向き（床へ）に照らすため、-90度回転（-Z → -Y 方向へ）
+      // 直感：光源パネルが“天井に付いていて床へ照射している”状態
+      areaLight1.rotation.x = -Math.PI / 2;
+      areaLight2.rotation.x = -Math.PI / 2;
+      areaLight3.rotation.x = -Math.PI / 2;
+
+      scene.add(areaLight1, areaLight2, areaLight3);
+
+      // ============================================================
+      // 光源の「見た目」用パネル（MeshBasicMaterial）
+      // ============================================================
+      // これは照明計算には関係せず、ユーザーが「ここが光源」というのを見えるようにするだけ。
+      // 面光源と同じ位置・向き・サイズの板を置く。
+      panel1 = createLightPanel(areaLight1.color, w, h);
+      panel2 = createLightPanel(areaLight2.color, w, h);
+      panel3 = createLightPanel(areaLight3.color, w, h);
+
+      // パネルはライトの子にして、ライトの transform（位置・回転）に追従させる
+      // z-fighting 回避のために、ほんの少しだけライト面の手前にオフセットする（-Z 方向へ 0.01）
+      // ※ライトのローカル座標で -Z が照射方向なので、パネルは +Z へ少し出して“前面”に見せる
+      panel1.position.set(0, 0, 0.01);
+      panel2.position.set(0, 0, 0.01);
+      panel3.position.set(0, 0, 0.01);
+
+      areaLight1.add(panel1);
+      areaLight2.add(panel2);
+      areaLight3.add(panel3);
+
+      // ============================================================
+      // Helper（RectAreaLightHelper）
+      // ============================================================
+      // ライトの枠をワイヤーで可視化できる（デバッグ用）
+      helper1 = new RectAreaLightHelper(areaLight1);
+      helper2 = new RectAreaLightHelper(areaLight2);
+      helper3 = new RectAreaLightHelper(areaLight3);
+
+      helper1.visible = false;
+      helper2.visible = false;
+      helper3.visible = false;
+
+      scene.add(helper1, helper2, helper3);
+
+      // ============================================================
+      // GUI（lil-gui）
+      // ============================================================
+      const controls = {
+        // renderer
+        exposure: renderer.toneMappingExposure,
+
+        // 補助ライト（fill）
+        fillIntensity: fillSpot.intensity,
+
+        // area light 1
+        color1: 0xff0000,
+        intensity1: areaLight1.intensity,
+
+        // area light 2
+        color2: 0x00ff00,
+        intensity2: areaLight2.intensity,
+
+        // area light 3
+        color3: 0x0000ff,
+        intensity3: areaLight3.intensity,
+
+        // サイズ（3つ共通で変える：教材として分かりやすい）
+        width: w,
+        height: h,
+
+        // debug
+        showHelpers: false
+      };
+
+      const gui = new GUI({ title: "Controls" });
+
+      const fRenderer = gui.addFolder("renderer");
+      fRenderer.add(controls, "exposure", 0.1, 10, 0.01).onChange((v) => {
+        renderer.toneMappingExposure = v;
+      });
+
+      const fFill = gui.addFolder("fill light (spot)");
+      fFill.add(controls, "fillIntensity", 0, 2, 0.01).onChange((v) => {
+        fillSpot.intensity = v;
+      });
+
+      const fSize = gui.addFolder("area light size");
+      fSize.add(controls, "width", 0.1, 20, 0.1).onChange((v) => {
+        setAreaLightSize(v, controls.height);
+      });
+      fSize.add(controls, "height", 0.1, 20, 0.1).onChange((v) => {
+        setAreaLightSize(controls.width, v);
+      });
+
+      const fA1 = gui.addFolder("area light 1 (red)");
+      fA1.addColor(controls, "color1").onChange((v) => {
+        const c = new THREE.Color(v);
+        areaLight1.color = c;
+        panel1.material.color = c;
+        // helper は “ライトの色” は自動反映されない場合があるので update を呼ぶ
+        helper1.update();
+      });
+      fA1.add(controls, "intensity1", 0, 10, 0.01).onChange((v) => {
+        areaLight1.intensity = v;
+      });
+
+      const fA2 = gui.addFolder("area light 2 (green)");
+      fA2.addColor(controls, "color2").onChange((v) => {
+        const c = new THREE.Color(v);
+        areaLight2.color = c;
+        panel2.material.color = c;
+        helper2.update();
+      });
+      fA2.add(controls, "intensity2", 0, 10, 0.01).onChange((v) => {
+        areaLight2.intensity = v;
+      });
+
+      const fA3 = gui.addFolder("area light 3 (blue)");
+      fA3.addColor(controls, "color3").onChange((v) => {
+        const c = new THREE.Color(v);
+        areaLight3.color = c;
+        panel3.material.color = c;
+        helper3.update();
+      });
+      fA3.add(controls, "intensity3", 0, 10, 0.01).onChange((v) => {
+        areaLight3.intensity = v;
+      });
+
+      const fDebug = gui.addFolder("debug");
+      fDebug.add(controls, "showHelpers").onChange((v) => {
+        helper1.visible = v;
+        helper2.visible = v;
+        helper3.visible = v;
+      });
+
+      // ============================================================
+      // リサイズ対応
+      // ============================================================
+      window.addEventListener("resize", onResize);
+
+      // ============================================================
+      // ループ開始
+      // ============================================================
+      render();
+    }
+
+    // ============================================================
+    // createLightPanel：光源可視化用の板
+    // ============================================================
+    function createLightPanel(color, width, height) {
+      // 面光源の“発光面”をそれっぽく見せるだけの板
+      // MeshBasicMaterial はライトの影響を受けない（常に指定色で表示）
+      const geo = new THREE.PlaneGeometry(width, height);
+      const mat = new THREE.MeshBasicMaterial({
+        color,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.9
+      });
+      return new THREE.Mesh(geo, mat);
+    }
+
+    // ============================================================
+    // setAreaLightSize：3つの RectAreaLight と パネル / Helper をまとめて更新
+    // ============================================================
+    function setAreaLightSize(width, height) {
+      // RectAreaLight は width/height を直接持つ
+      areaLight1.width = width; areaLight1.height = height;
+      areaLight2.width = width; areaLight2.height = height;
+      areaLight3.width = width; areaLight3.height = height;
+
+      // パネルの Geometry を作り直す（サイズ変更のため）
+      // ※geometry.scale でもいいが、繰り返し操作で誤差が積み上がるので作り直しが安全
+      panel1.geometry.dispose();
+      panel2.geometry.dispose();
+      panel3.geometry.dispose();
+      panel1.geometry = new THREE.PlaneGeometry(width, height);
+      panel2.geometry = new THREE.PlaneGeometry(width, height);
+      panel3.geometry = new THREE.PlaneGeometry(width, height);
+
+      // helper も更新（枠の大きさが変わるので）
+      helper1.update();
+      helper2.update();
+      helper3.update();
+    }
+
+    // ============================================================
+    // render：毎フレーム描画
+    // ============================================================
+    function render() {
+      stats.update();
+
+      // RectAreaLightHelper は「ライトの transform が変わる」場合に update が必要。
+      // 今回は GUI でサイズ/色を変えるとき update しているので、ここでは毎フレーム不要。
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(render);
+    }
+
+    // ============================================================
+    // onResize：画面リサイズ
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // initStats：FPS表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
