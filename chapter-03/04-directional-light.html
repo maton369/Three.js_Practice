@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 03.04 - Directional Light (ES Modules + detailed comments)</title>
+
+  <!--
+    【方針（これまで通り：ES Modules + importmap）】
+    - 旧: ../libs/three.js / stats.js / dat.gui.js を <script> 直読み（window.THREE 前提）
+    - 新: three 本体＋Stats＋GUI を ESM import に統一する
+      - three: CDN（jsDelivr）
+      - Stats: three/addons/libs/stats.module.js
+      - GUI : three/addons/libs/lil-gui.module.min.js（dat.gui互換の後継的ポジション）
+
+    【この回（DirectionalLight）の学習ポイント】
+    - DirectionalLight は「太陽光」のような“平行光”
+      - 光源位置は“方向”を決めるためのダミー的なもので、距離減衰は基本ない（distance は意味を持たない）
+      - 影（shadow）は「平行光の視点＝OrthographicCamera」で生成する
+        => shadow.camera.left/right/top/bottom が “影が写る範囲” を決める最重要パラメータ
+    - つまり「SpotLightと違って angle/penumbra/decay などは登場しない」
+      - 旧コードに残っていた penumbra / angle / distance GUI は削除（意味がズレるため）
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // 目的：DirectionalLight（平行光）の影の作り方を理解する
+    //
+    // DirectionalLight の影の本質：
+    // - 影マップは「ライト視点から深度をレンダリングして作る」
+    // - DirectionalLight は平行光なのでライト視点は “正射影カメラ（Orthographic）”
+    //   => shadow.camera.left/right/top/bottom が影マップの撮影領域になる
+    //
+    // ここがポイント：
+    // - left/right/top/bottom が小さすぎると → 影が途中で切れる（クリップされる）
+    // - 大きすぎると → 1枚の影マップに広範囲を詰め込むので解像度が下がり、影が荒くなる
+    //   （= 同じ1024pxを広い範囲に割り当てることになる）
+    // ============================================================
+
+    let scene, camera, renderer, stats;
+    let ambientLight, directionalLight;
+    let plane, cube, sphere;
+    let dirShadowHelper, dirLightHelper, lightMarker;
+
+    // アニメーションの位相（cube回転・sphereバウンド・ライト移動に使う）
+    let step = 0;
+
+    // 「これからの方針」：SpotLight/PointLight の decay は 0 にする、というルールがあったが、
+    // DirectionalLight には decay の概念がそもそも無い（距離減衰しない平行光）ので、ここでは登場しない。
+
+    // ============================================================
+    // init：初期化
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene：シーングラフのルート
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Camera：観察用の透視カメラ（DirectionalLightの影を見るため）
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+      camera.position.set(-35, 30, 25);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ------------------------------------------------------------
+      // Renderer：WebGL 描画装置 + 影有効化
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // Shadow map を有効にする（影が出るための必須条件）
+      renderer.shadowMap.enabled = true;
+
+      // PCFSoftShadowMap の方が影が滑らかになりやすい（教材用途で見やすい）
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Plane：床（receiveShadow = true を必ず付ける）
+      // ------------------------------------------------------------
+      const planeGeometry = new THREE.PlaneGeometry(600, 200, 20, 20);
+      const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+      plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+      // 影を受ける（receiveShadow）
+      plane.receiveShadow = true;
+
+      // XY平面のPlaneを床にするためXZへ寝かせる
+      plane.rotation.x = -0.5 * Math.PI;
+      plane.position.set(15, -5, 0);
+      scene.add(plane);
+
+      // ------------------------------------------------------------
+      // Cube：影を落とす対象（castShadow = true）
+      // ------------------------------------------------------------
+      const cubeGeometry = new THREE.BoxGeometry(4, 4, 4);
+      const cubeMaterial = new THREE.MeshLambertMaterial({ color: 0xff3333 });
+      cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+      cube.castShadow = true;
+      cube.position.set(-4, 3, 0);
+      scene.add(cube);
+
+      // ------------------------------------------------------------
+      // Sphere：影を落とす対象（castShadow = true）
+      // ------------------------------------------------------------
+      const sphereGeometry = new THREE.SphereGeometry(4, 20, 20);
+      const sphereMaterial = new THREE.MeshLambertMaterial({ color: 0x7777ff });
+      sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+      sphere.castShadow = true;
+      sphere.position.set(20, 0, 2);
+      scene.add(sphere);
+
+      // ------------------------------------------------------------
+      // AmbientLight：影の暗部が真っ黒になりすぎないように底上げ
+      // ------------------------------------------------------------
+      const ambiColor = "#1c1c1c";
+      ambientLight = new THREE.AmbientLight(ambiColor);
+      scene.add(ambientLight);
+
+      // ------------------------------------------------------------
+      // DirectionalLight：主役（平行光）
+      // - position は “光の方向” を決めるためのベクトルとして機能する
+      // - target に向かって光が飛ぶ（方向が決まる）
+      // ------------------------------------------------------------
+      const dirColor = "#ff5808";
+      directionalLight = new THREE.DirectionalLight(dirColor, 0.5);
+
+      // 影を出す（castShadow = true）
+      directionalLight.castShadow = true;
+
+      // 光源位置（この位置→target 方向へ平行光が飛ぶ）
+      directionalLight.position.set(-40, 60, -10);
+
+      // DirectionalLight の target はデフォルトで(0,0,0)だが、
+      // GUIで切り替えるので “明示的に scene にぶら下げておく” のが安全
+      // ※ target は Object3D なので、scene に add しないと matrixWorld が更新されないケースがある
+      scene.add(directionalLight.target);
+      directionalLight.target.position.copy(new THREE.Vector3(10, 0, 0)); // 初期はシーン中心付近
+
+      // ------------------------------------------------------------
+      // 影用の「ライト視点カメラ（Orthographic）」の設定
+      // - near/far はライト視点のクリップ範囲（影が生成される奥行き）
+      // - left/right/top/bottom は影マップの撮影範囲（最重要）
+      // ------------------------------------------------------------
+      directionalLight.shadow.camera.near = 2;
+      directionalLight.shadow.camera.far = 200;
+
+      // 影の撮影範囲（ここを狭くすると影がシャープに、広げると荒くなる）
+      directionalLight.shadow.camera.left   = -50;
+      directionalLight.shadow.camera.right  =  50;
+      directionalLight.shadow.camera.top    =  50;
+      directionalLight.shadow.camera.bottom = -50;
+
+      // 影マップの解像度（上げると綺麗だが重くなる）
+      directionalLight.shadow.mapSize.set(1024, 1024);
+
+      // シャドウの“にじみ/アクネ”調整（必要なら）
+      // directionalLight.shadow.bias = -0.0001;
+      // directionalLight.shadow.normalBias = 0.02;
+
+      scene.add(directionalLight);
+
+      // ------------------------------------------------------------
+      // Helper：デバッグ可視化
+      // - CameraHelper：影用カメラの撮影範囲（箱）を表示
+      // - DirectionalLightHelper：光の方向の目安を表示
+      // ------------------------------------------------------------
+      dirShadowHelper = new THREE.CameraHelper(directionalLight.shadow.camera);
+      dirShadowHelper.visible = false;
+      scene.add(dirShadowHelper);
+
+      dirLightHelper = new THREE.DirectionalLightHelper(directionalLight, 10);
+      dirLightHelper.visible = false;
+      scene.add(dirLightHelper);
+
+      // ------------------------------------------------------------
+      // Light marker：ライト位置を小球で可視化（教材として分かりやすい）
+      // - DirectionalLight は点光源ではないが、「方向を決める点」として位置を見せるのは有用
+      // ------------------------------------------------------------
+      const markerGeom = new THREE.SphereGeometry(0.6, 16, 16);
+      const markerMat  = new THREE.MeshBasicMaterial({ color: 0xac6c25 });
+      lightMarker = new THREE.Mesh(markerGeom, markerMat);
+      lightMarker.position.copy(directionalLight.position);
+      scene.add(lightMarker);
+
+      // ------------------------------------------------------------
+      // GUI：DirectionalLight向けに “意味のある” パラメータだけを出す
+      // - distance / angle / penumbra は DirectionalLight には無いので削除
+      // - 影範囲（left/right/top/bottom）は学習上めちゃ重要なのでGUI化する
+      // ------------------------------------------------------------
+      const controls = {
+        rotationSpeed: 0.03,
+        bouncingSpeed: 0.03,
+
+        ambientColor: ambiColor,
+        dirColor: dirColor,
+        intensity: 0.5,
+        castShadow: true,
+
+        // 影の撮影範囲（Orthographic shadow frustum）
+        shadowLeft: -50,
+        shadowRight: 50,
+        shadowTop: 50,
+        shadowBottom: -50,
+        shadowNear: 2,
+        shadowFar: 200,
+        shadowMapSize: 1024,
+
+        // デバッグ表示
+        debugShadowCamera: false,
+        debugLightHelper: false,
+
+        // どこへ照らすか（target）
+        target: "Plane"
+      };
+
+      const gui = new GUI({ title: "Controls" });
+
+      // 色・強度
+      gui.addColor(controls, "ambientColor").name("ambientColor").onChange((v) => {
+        ambientLight.color = new THREE.Color(v);
+      });
+
+      gui.addColor(controls, "dirColor").name("dirColor").onChange((v) => {
+        directionalLight.color = new THREE.Color(v);
+      });
+
+      gui.add(controls, "intensity", 0, 5, 0.01).name("intensity").onChange((v) => {
+        directionalLight.intensity = v;
+      });
+
+      gui.add(controls, "castShadow").name("castShadow").onChange((v) => {
+        directionalLight.castShadow = v;
+      });
+
+      // 影の範囲（重要）
+      const fShadow = gui.addFolder("shadow frustum (orthographic)");
+      fShadow.add(controls, "shadowLeft", -200, 0, 1).name("left").onChange(() => applyShadowFrustum(controls));
+      fShadow.add(controls, "shadowRight", 0, 200, 1).name("right").onChange(() => applyShadowFrustum(controls));
+      fShadow.add(controls, "shadowTop", 0, 200, 1).name("top").onChange(() => applyShadowFrustum(controls));
+      fShadow.add(controls, "shadowBottom", -200, 0, 1).name("bottom").onChange(() => applyShadowFrustum(controls));
+      fShadow.add(controls, "shadowNear", 0.1, 50, 0.1).name("near").onChange(() => applyShadowFrustum(controls));
+      fShadow.add(controls, "shadowFar", 50, 500, 1).name("far").onChange(() => applyShadowFrustum(controls));
+
+      fShadow.add(controls, "shadowMapSize", [256, 512, 1024, 2048]).name("mapSize").onChange((v) => {
+        const size = Number(v);
+        directionalLight.shadow.mapSize.set(size, size);
+
+        // mapSize を変えたら “影マップの再生成” が必要になるため、
+        // 通常は renderer が次フレームで更新するが、分かりやすく helper を更新しておく
+        if (dirShadowHelper.visible) dirShadowHelper.update();
+      });
+
+      // target 切り替え（照射方向）
+      gui.add(controls, "target", ["Plane", "Sphere", "Cube"]).name("target").onChange((name) => {
+        switch (name) {
+          case "Plane":
+            directionalLight.target = plane;
+            break;
+          case "Sphere":
+            directionalLight.target = sphere;
+            break;
+          case "Cube":
+            directionalLight.target = cube;
+            break;
+        }
+
+        // target を差し替えた場合、target が scene に入っていないと更新されない可能性がある
+        // plane/sphere/cube は scene にあるので OK だが、念のため update
+        directionalLight.target.updateMatrixWorld();
+        if (dirLightHelper.visible) dirLightHelper.update();
+      });
+
+      // デバッグ表示
+      gui.add(controls, "debugShadowCamera").name("debugShadowCamera").onChange((v) => {
+        dirShadowHelper.visible = v;
+        if (v) dirShadowHelper.update();
+      });
+
+      gui.add(controls, "debugLightHelper").name("debugLightHelper").onChange((v) => {
+        dirLightHelper.visible = v;
+        if (v) dirLightHelper.update();
+      });
+
+      // ------------------------------------------------------------
+      // Resize：投影更新（Perspective なので aspect を更新）
+      // ------------------------------------------------------------
+      window.addEventListener("resize", () => {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+
+        renderer.setSize(w, h);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      });
+
+      // 初回反映（GUI初期値→ライトへ）
+      applyShadowFrustum(controls);
+
+      // ------------------------------------------------------------
+      // ループ開始
+      // ------------------------------------------------------------
+      render(controls);
+    }
+
+    // ============================================================
+    // applyShadowFrustum：
+    // GUI の値を shadow.camera に反映し、投影行列を更新する
+    // ============================================================
+    function applyShadowFrustum(controls) {
+      const cam = directionalLight.shadow.camera;
+
+      cam.left   = controls.shadowLeft;
+      cam.right  = controls.shadowRight;
+      cam.top    = controls.shadowTop;
+      cam.bottom = controls.shadowBottom;
+      cam.near   = controls.shadowNear;
+      cam.far    = controls.shadowFar;
+
+      // OrthographicCamera も “行列更新” が必要
+      cam.updateProjectionMatrix();
+
+      // helper 表示中なら更新
+      if (dirShadowHelper && dirShadowHelper.visible) {
+        dirShadowHelper.update();
+      }
+    }
+
+    // ============================================================
+    // render：毎フレーム更新→描画
+    // ============================================================
+    function render(controls) {
+      stats.update();
+
+      // ------------------------------------------------------------
+      // 1) Cube を回転：面の向きが変わり、影の形・濃さが変化しやすい
+      // ------------------------------------------------------------
+      cube.rotation.x += controls.rotationSpeed;
+      cube.rotation.y += controls.rotationSpeed;
+      cube.rotation.z += controls.rotationSpeed;
+
+      // ------------------------------------------------------------
+      // 2) Sphere をバウンド：高さが変わると影のサイズ・柔らかさが変化する
+      // ------------------------------------------------------------
+      step += controls.bouncingSpeed;
+      sphere.position.x = 20 + (10 * Math.cos(step));
+      sphere.position.y = 2 + (10 * Math.abs(Math.sin(step)));
+
+      // ------------------------------------------------------------
+      // 3) DirectionalLight の “方向” を変えるために position を動かす
+      // - DirectionalLight は点光源ではないが、position→target のベクトルが方向になる
+      // - 位置を動かすことで「太陽の位置が変わる」ような影の変化を観察できる
+      // ------------------------------------------------------------
+      const t = step / 3;
+      const lx = 10 + (26 * Math.cos(t));
+      const ly = 27 * Math.sin(t);
+      const lz = -8;
+
+      directionalLight.position.set(lx, ly, lz);
+      lightMarker.position.copy(directionalLight.position);
+
+      // helper 更新（表示中のみ）
+      if (dirLightHelper.visible) dirLightHelper.update();
+      if (dirShadowHelper.visible) dirShadowHelper.update();
+
+      requestAnimationFrame(() => render(controls));
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // Stats 初期化（FPS）
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0);
+
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
