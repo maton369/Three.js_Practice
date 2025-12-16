@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 03.02 - Point Light (ES Modules + detailed comments)</title>
+
+  <!--
+    【方針（これまで通り：ES Modules + importmap）】
+    - 旧来の ../libs/three.js / stats.js / dat.gui.js の <script> 直読みをやめる
+    - three は CDN から ESM で import
+    - GUI は dat.gui 互換の lil-gui（three/addons）を使う
+    - Stats も three/addons から読む
+
+    【今回の主題：PointLight】
+    - PointLight は「点光源」＝電球のように一点から全方向へ光が出る
+    - 距離減衰は distance / decay で制御される（physicallyCorrectLights の有無にも注意）
+    - このサンプルでは “光源を動かして” 影と陰影の変化を観察する
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // 目的：
+    // - AmbientLight（環境光）＋ PointLight（点光源）で
+    //   「距離減衰」「動く光」「影の変化」を観察する。
+    //
+    // 学習ポイント：
+    // - AmbientLight は “一様な底上げ” なので方向性がない（影の主役ではない）
+    // - PointLight は “光源位置” を持ち、そこからの距離で明るさが変わる
+    // - distance / decay が見た目にどう効くかは、動かすと理解が速い
+    // ============================================================
+
+    let scene, camera, renderer, stats;
+    let cube, sphere;
+
+    // PointLight と、それを可視化する “小球” メッシュ
+    let pointLight, sphereLightMesh;
+
+    // アニメーション用の位相
+    let step = 0;
+
+    // “光源が往復する”動きを作るための補助変数（元コードの意図を踏襲）
+    let invert = 1;
+    let phase = 0;
+
+    // ------------------------------------------------------------
+    // ★方針：SpotLight/PointLight の decay は今後 0 をデフォルトにする
+    // ただし、このサンプルは「decay を GUI で変えて観察する」教材なので、
+    // 初期値だけ 0 にして、スライダーで 0〜10 程度を触れるようにする。
+    // ------------------------------------------------------------
+    const DEFAULT_DECAY = 0;
+
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene：シーングラフのルート
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Camera：透視投影
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      // ------------------------------------------------------------
+      // Renderer：WebGL 描画装置
+      // - antialias で輪郭のジャギを軽減
+      // - shadowMap を有効化（影を見るため）
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // 影を有効化（影が成立するための前提条件の 1つ）
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // 床：PhongMaterial にするのは「ハイライトが出て光の位置が分かりやすい」ため
+      // - subdivide（20,20）しているのは見た目上の密度のため（必須ではない）
+      // ------------------------------------------------------------
+      const planeGeometry = new THREE.PlaneGeometry(60, 20, 20, 20);
+      const planeMaterial = new THREE.MeshPhongMaterial({ color: 0xffffff });
+      const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+      plane.receiveShadow = true;       // 影を受ける
+      plane.rotation.x = -0.5 * Math.PI; // XZ 平面へ寝かせる
+      plane.position.set(15, 0, 0);     // サンプルの配置意図を維持
+      scene.add(plane);
+
+      // ------------------------------------------------------------
+      // 立方体：回転させて陰影変化を観察
+      // ------------------------------------------------------------
+      const cubeGeometry = new THREE.BoxGeometry(4, 4, 4);
+      const cubeMaterial = new THREE.MeshLambertMaterial({ color: 0xff7777 });
+      cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+
+      cube.castShadow = true;           // 影を落とす
+      cube.position.set(-4, 3, 0);      // 床から浮かせて影を出す
+      scene.add(cube);
+
+      // ------------------------------------------------------------
+      // 球：バウンドさせて影と明暗が時間で変わるようにする
+      // ------------------------------------------------------------
+      const sphereGeometry = new THREE.SphereGeometry(4, 20, 20);
+      const sphereMaterial = new THREE.MeshLambertMaterial({ color: 0x7777ff });
+      sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+
+      sphere.castShadow = true;
+      sphere.position.set(20, 0, 2);
+      scene.add(sphere);
+
+      // ------------------------------------------------------------
+      // カメラ位置：シーン全体（cube + sphere + plane）が見える角度
+      // ------------------------------------------------------------
+      camera.position.set(-25, 30, 25);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ------------------------------------------------------------
+      // AmbientLight：暗部の黒つぶれ防止
+      // - GUI で色を変えて “全体が染まる” 感覚を掴める
+      // ------------------------------------------------------------
+      const ambiColor = "#0c0c0c";
+      const ambientLight = new THREE.AmbientLight(ambiColor);
+      scene.add(ambientLight);
+
+      // ------------------------------------------------------------
+      // PointLight：点光源（今回の主役）
+      // - color: 光の色
+      // - intensity: 強さ
+      // - distance: 距離制限（0だと無限）
+      // - decay: 距離減衰（0だと減衰なし）
+      //
+      // 注意：
+      // - Three.js では “物理ベース” の扱いが時代で変化することがある。
+      // - 教材としては「distance/decay を変えると何が起きるか」を観察できればOK。
+      // ------------------------------------------------------------
+      const pointColor = "#ccffcc";
+      pointLight = new THREE.PointLight(pointColor, 1, 100);
+      pointLight.decay = DEFAULT_DECAY; // ★方針：初期は減衰なし（観察しやすい）
+      pointLight.castShadow = true;     // 点光源でも影を作れる（重いので mapSize は控えめ推奨）
+
+      // 影の品質を適度に調整（重すぎない範囲）
+      pointLight.shadow.mapSize.set(1024, 1024);
+      pointLight.shadow.bias = -0.0001;
+      pointLight.shadow.normalBias = 0.02;
+
+      scene.add(pointLight);
+
+      // ------------------------------------------------------------
+      // “光源位置の可視化”：
+      // - PointLight 自体は見えないので、小さい球を置いて「今どこに光源があるか」を見せる
+      // ------------------------------------------------------------
+      const sphereLightGeometry = new THREE.SphereGeometry(0.2, 12, 12);
+      const sphereLightMaterial = new THREE.MeshBasicMaterial({ color: 0xac6c25 });
+      sphereLightMesh = new THREE.Mesh(sphereLightGeometry, sphereLightMaterial);
+
+      // 光源マーカーにも影を落とすと“浮いてる感”が出るが、教材では必須ではない
+      sphereLightMesh.castShadow = true;
+
+      // 初期位置
+      sphereLightMesh.position.set(3, 5, 3);
+      scene.add(sphereLightMesh);
+
+      // Light と marker を一致させる（最初の整合）
+      pointLight.position.copy(sphereLightMesh.position);
+
+      // ------------------------------------------------------------
+      // GUI：dat.gui 相当（lil-gui）
+      // - ambientColor / pointColor / intensity / distance / decay を操作する
+      // - 旧コードは decay 1〜100 だったが、現代的には 0〜10 程度で十分変化が見える
+      // ------------------------------------------------------------
+      const controls = {
+        rotationSpeed: 0.03,
+        bouncingSpeed: 0.03,
+
+        ambientColor: ambiColor,
+        pointColor: pointColor,
+
+        intensity: 1,
+        distance: 100,
+        decay: DEFAULT_DECAY
+      };
+
+      const gui = new GUI({ title: "Controls" });
+
+      gui.addColor(controls, "ambientColor").onChange((v) => {
+        ambientLight.color = new THREE.Color(v);
+      });
+
+      gui.addColor(controls, "pointColor").onChange((v) => {
+        pointLight.color = new THREE.Color(v);
+      });
+
+      gui.add(controls, "intensity", 0, 3, 0.01).onChange((v) => {
+        pointLight.intensity = v;
+      });
+
+      // distance:
+      // - 0 にすると無限距離（減衰は decay 側で効く）
+      // - 100 くらいでシーンスケールにちょうど良い
+      gui.add(controls, "distance", 0, 200, 1).onChange((v) => {
+        pointLight.distance = v;
+      });
+
+      // decay:
+      // - ★方針：デフォルト 0（減衰なし）
+      // - 教材として 0〜10 程度を触ると変化が分かりやすい
+      gui.add(controls, "decay", 0, 10, 0.01).onChange((v) => {
+        pointLight.decay = v;
+      });
+
+      // ------------------------------------------------------------
+      // resize：aspect と投影行列を更新（歪み防止）
+      // ------------------------------------------------------------
+      window.addEventListener("resize", () => {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+
+        renderer.setSize(w, h);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      });
+
+      // ループ開始
+      render(controls);
+    }
+
+    function render(controls) {
+      stats.update();
+
+      // ------------------------------------------------------------
+      // 1) Cube を回転：陰影（Lambert）の変化を強調
+      // ------------------------------------------------------------
+      cube.rotation.x += controls.rotationSpeed;
+      cube.rotation.y += controls.rotationSpeed;
+      cube.rotation.z += controls.rotationSpeed;
+
+      // ------------------------------------------------------------
+      // 2) Sphere をバウンド：影とライト距離が時間で変化する
+      // ------------------------------------------------------------
+      step += controls.bouncingSpeed;
+      sphere.position.x = 20 + (10 * Math.cos(step));
+      sphere.position.y = 2 + (10 * Math.abs(Math.sin(step)));
+
+      // ------------------------------------------------------------
+      // 3) 光源（sphereLightMesh）を移動：
+      //
+      // 元コードの動きの意図：
+      // - 位相 phase を進めながら sin/cos で円運動っぽく動かす
+      // - phase が 2π を超えたら invert を反転して “往復” っぽい軌道にする
+      //
+      // ここでのアルゴリズムは「光源が動くことで陰影が動く」ことを見せるのが目的。
+      // ------------------------------------------------------------
+      if (phase > 2 * Math.PI) {
+        invert *= -1;
+        phase -= 2 * Math.PI;
+      } else {
+        phase += controls.rotationSpeed;
+      }
+
+      sphereLightMesh.position.z = +(7 * Math.sin(phase));
+      sphereLightMesh.position.x = +(14 * Math.cos(phase));
+      sphereLightMesh.position.y = 5;
+
+      // invert が負の時だけ x を左右反転して、動きに“折り返し”を作る
+      if (invert < 0) {
+        const pivot = 14;
+        sphereLightMesh.position.x = (invert * (sphereLightMesh.position.x - pivot)) + pivot;
+      }
+
+      // ------------------------------------------------------------
+      // 4) PointLight は “見えない”ので、マーカー位置に追従させる
+      // ------------------------------------------------------------
+      pointLight.position.copy(sphereLightMesh.position);
+
+      requestAnimationFrame(() => render(controls));
+      renderer.render(scene, camera);
+    }
+
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
