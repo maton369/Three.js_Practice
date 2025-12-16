@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 03.01 - Ambient Light (ES Modules + detailed comments)</title>
+
+  <!--
+    【方針（これまで通り：ES Modules + importmap）】
+    - 旧来の ../libs/three.js / stats.js / dat.gui.js の <script> 直読みをやめる
+    - three は CDN（jsDelivr）から ESM で import
+    - GUI は dat.gui 互換の lil-gui（three/addons）を使う
+    - Stats も three/addons から読む
+
+    この章の主題（AmbientLight）：
+    - AmbientLight は「方向を持たない一様な光」。
+    - Lambert/Phong など “ライトに反応する材質” では、
+      AmbientLight を足すことで影が真っ黒に落ちるのを防げる。
+    - ただし AmbientLight だけだと陰影が出ないので立体感は弱くなる。
+      → SpotLight 等と併用して「立体感（直射光）」と「黒つぶれ防止（環境光）」を両立する。
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（リサイズや GUI から参照するもの）
+    // ============================================================
+    let scene, camera, renderer, stats;
+
+    // サンプル内で動かす対象
+    let cube, sphere;
+
+    // 光源（GUI で操作する）
+    let ambientLight, spotLight;
+
+    // アニメーション用
+    let step = 0;
+
+    // ------------------------------------------------------------
+    // ★方針：SpotLight/PointLight の decay は 0 をデフォルトにする
+    // - 教材スケール（座標が数十）で “暗すぎて見えない” 事故を避けるため
+    // ------------------------------------------------------------
+
+    // ============================================================
+    // init：初期化（シーン構築 → GUI → ループ開始）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ----------------------------------------------------------
+      // Scene：シーングラフのルート（全オブジェクトの親）
+      // ----------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ----------------------------------------------------------
+      // Camera：透視投影（fov / aspect / near / far）
+      // - このサンプルは「床 + 立方体 + 球」を斜め上から見る構図
+      // ----------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      // 視点（元コードの意図を維持）
+      camera.position.set(-25, 30, 25);
+
+      // 注視点：床の中心より少し右側（plane が x=15 にずれているため）
+      const lookTarget = new THREE.Vector3(10, 0, 0);
+      camera.lookAt(lookTarget);
+
+      // ----------------------------------------------------------
+      // Renderer：WebGL 描画装置
+      // - clearColor：背景色
+      // - pixelRatio：Retina 等のボケ回避（上げすぎると重いので上限2）
+      // ----------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // ----------------------------------------------------------
+      // Shadow（影）を有効化
+      // 影が成立する “4点セット”：
+      // 1) renderer.shadowMap.enabled = true
+      // 2) 光源: light.castShadow = true
+      // 3) 影を落とす: mesh.castShadow = true
+      // 4) 影を受ける: mesh.receiveShadow = true
+      // ----------------------------------------------------------
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      // canvas を DOM に追加（これが無いと画面に何も出ない）
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ----------------------------------------------------------
+      // 床（Plane）
+      // - PlaneGeometry はデフォルトで XY 平面なので、床にするため XZ に寝かせる
+      // - 位置を x=15 にずらしているのは、立方体(-4)と球(20)を左右に置きつつ
+      //   “床の真ん中” を (10,0,0) 付近に作る教材上の配置都合
+      // ----------------------------------------------------------
+      const planeGeometry = new THREE.PlaneGeometry(60, 20, 1, 1);
+      const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+      const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+      plane.receiveShadow = true;
+      plane.rotation.x = -0.5 * Math.PI;
+      plane.position.set(15, 0, 0);
+      scene.add(plane);
+
+      // ----------------------------------------------------------
+      // 立方体（回転させる対象）
+      // - MeshLambertMaterial は「拡散反射」ベース。Ambient の効きが分かりやすい。
+      // ----------------------------------------------------------
+      const cubeGeometry = new THREE.BoxGeometry(4, 4, 4);
+      const cubeMaterial = new THREE.MeshLambertMaterial({ color: 0xff0000 });
+      cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+
+      cube.castShadow = true;
+      cube.position.set(-4, 3, 0);
+      scene.add(cube);
+
+      // ----------------------------------------------------------
+      // 球（跳ねさせる対象）
+      // - こちらも Lambert にして “Spot を消したときに Ambient だけで見えるか” を観察できる
+      // ----------------------------------------------------------
+      const sphereGeometry = new THREE.SphereGeometry(4, 20, 20);
+      const sphereMaterial = new THREE.MeshLambertMaterial({ color: 0x7777ff });
+      sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+
+      sphere.castShadow = true;
+      sphere.position.set(20, 0, 2);
+      scene.add(sphere);
+
+      // ----------------------------------------------------------
+      // AmbientLight（環境光）
+      // - 方向を持たず “全体を一様に明るくする”
+      // - 影の黒つぶれを防ぐが、これだけだと陰影が無く立体感が薄い
+      // ----------------------------------------------------------
+      const ambiColor = "#0c0c0c"; // 元コードの値を維持
+      ambientLight = new THREE.AmbientLight(ambiColor);
+      scene.add(ambientLight);
+
+      // ----------------------------------------------------------
+      // SpotLight（直射光 + 影）
+      // - 立体感を作る主役
+      // - decay=0 は方針として維持（教材で暗くなりすぎる事故回避）
+      // ----------------------------------------------------------
+      spotLight = new THREE.SpotLight(0xffffff);
+      spotLight.position.set(-20, 30, -5);
+      spotLight.castShadow = true;
+
+      spotLight.decay = 0; // ★方針
+
+      // 影品質（必要最小限）
+      spotLight.shadow.mapSize.set(1024, 1024);
+      spotLight.shadow.bias = -0.0001;
+      spotLight.shadow.normalBias = 0.02;
+
+      // 照射方向の安定化：床中央付近を照らす
+      spotLight.target.position.copy(lookTarget);
+      scene.add(spotLight.target);
+
+      scene.add(spotLight);
+
+      // ----------------------------------------------------------
+      // GUI（lil-gui）
+      // - ambientColor：環境光色を変えて “全体がどう染まるか” を観察
+      // - disableSpotlight：Spot を切って “Ambient だけだとどう見えるか” を観察
+      // - rotation/bounce：動きで陰影変化を見やすくする
+      // ----------------------------------------------------------
+      const controls = {
+        rotationSpeed: 0.02,
+        bouncingSpeed: 0.03,
+        ambientColor: ambiColor,
+        disableSpotlight: false
+      };
+
+      const gui = new GUI({ title: "Controls" });
+
+      // AmbientLight の色を変更
+      gui.addColor(controls, "ambientColor")
+        .name("ambientColor")
+        .onChange((v) => {
+          ambientLight.color = new THREE.Color(v);
+        });
+
+      // SpotLight の ON/OFF（disableSpotlight: true のとき消す）
+      gui.add(controls, "disableSpotlight")
+        .name("disableSpotlight")
+        .onChange((v) => {
+          spotLight.visible = !v;
+        });
+
+      gui.add(controls, "rotationSpeed", 0, 0.5, 0.001).name("rotationSpeed");
+      gui.add(controls, "bouncingSpeed", 0, 0.2, 0.001).name("bouncingSpeed");
+
+      // ----------------------------------------------------------
+      // リサイズ対応：
+      // - aspect 更新 + 投影行列再計算
+      // - renderer の描画サイズ更新
+      // ----------------------------------------------------------
+      window.addEventListener("resize", () => onResize());
+
+      // ----------------------------------------------------------
+      // ループ開始
+      // ----------------------------------------------------------
+      render(controls);
+    }
+
+    // ============================================================
+    // render：毎フレームの更新 → 描画
+    //
+    // アルゴリズム：
+    // 1) stats.update() で FPS 更新
+    // 2) cube を回転（rotationSpeed）
+    // 3) sphere をバウンド（bouncingSpeed）
+    // 4) requestAnimationFrame で次フレーム予約
+    // 5) renderer.render(scene, camera) で描画
+    //
+    // ここでの狙い：
+    // - 動かすことで、SpotLight がある/ない時の陰影変化が分かりやすくなる
+    // - AmbientLight の色を変えると “陰影は残るが全体が染まる” ことが観察できる
+    // ============================================================
+    function render(controls) {
+      stats.update();
+
+      // 立方体：自転（ローカル軸回転）
+      cube.rotation.x += controls.rotationSpeed;
+      cube.rotation.y += controls.rotationSpeed;
+      cube.rotation.z += controls.rotationSpeed;
+
+      // 球：バウンド
+      step += controls.bouncingSpeed;
+      sphere.position.x = 20 + (10 * Math.cos(step));
+      sphere.position.y = 2 + (10 * Math.abs(Math.sin(step)));
+
+      requestAnimationFrame(() => render(controls));
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // onResize：画面サイズ変更に追従
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // Stats 初期化
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    // 元コードの体裁維持：window.onload
+    window.onload = init;
+  </script>
+</body>
+</html>
