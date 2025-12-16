@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 03.07 - Lensflare (ES Modules + detailed comments)</title>
+
+  <!--
+    【修正方針】
+    - 旧: <script src="../libs/three.js"> で window.THREE を使う構成
+    - 新: ES Modules + importmap で three を import する構成（現行 three.js に寄せる）
+    - 旧: THREE.LensFlare（かなり古いAPI）を使用
+    - 新: three/examples の Lensflare（Lensflare / LensflareElement）を使用
+
+    【このサンプルの狙い】
+    - 太陽光っぽい DirectionalLight を置き、その位置に「レンズフレア」を重ねて
+      “強い光源をカメラが見た時のアーティファクト” を疑似的に表現する。
+    - Lensflare は物理ベースの正しい現象ではなく、ポスト的な視覚効果に近い。
+      そのため「強すぎ」「白飛び」「色が濁る」などは、露出(toneMappingExposure)や
+      フレア要素のサイズ/色でバランスを取る。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+    import { Lensflare, LensflareElement } from "three/addons/objects/Lensflare.js";
+
+    // ============================================================
+    // グローバル（render / resize から触るもの）
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let plane, cube, sphere;
+    let ambientLight, fillSpotLight, sunLight;
+    let lensflare;
+
+    // アニメーション用
+    let step = 0;
+
+    // テクスチャURL（あなたの環境で assets を取れている前提）
+    const GRASS_TEX_URL = "../assets/textures/ground/grasslight-big.jpg";
+    const FLARE0_URL = "../assets/textures/lensflare/lensflare0.png";
+    const FLARE3_URL = "../assets/textures/lensflare/lensflare3.png";
+
+    // ============================================================
+    // init
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // 旧コードは Fog(0xaaaaaa, 0.010, 200) だったが、
+      // near が小さすぎて「ほぼ常にフォグがかかる」状態になりやすい。
+      // 地面が 1000×200 のスケールなので、距離感に合わせて調整する。
+      scene.fog = new THREE.Fog(0xaaaaaa, 50, 250);
+
+      // ------------------------------------------------------------
+      // Camera
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-20, 15, 45);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ------------------------------------------------------------
+      // Renderer
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // 背景色（旧コード踏襲）
+      renderer.setClearColor(new THREE.Color(0xaaaaff), 1.0);
+
+      // 色空間（テクスチャ色が“濁る”のを防ぐために重要）
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      // 露出（明るさ）はレンダラー側でまとめて調整するのが扱いやすい
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.2;
+
+      // ShadowMap
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Ground (Plane) + Texture
+      // ------------------------------------------------------------
+      const textureLoader = new THREE.TextureLoader();
+
+      // 草テクスチャ（色テクスチャは sRGB として扱う）
+      const textureGrass = textureLoader.load(GRASS_TEX_URL);
+      textureGrass.colorSpace = THREE.SRGBColorSpace;
+      textureGrass.wrapS = THREE.RepeatWrapping;
+      textureGrass.wrapT = THREE.RepeatWrapping;
+      textureGrass.repeat.set(4, 4);
+      textureGrass.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+
+      const planeGeometry = new THREE.PlaneGeometry(1000, 200, 20, 20);
+
+      // Lensflare の視認性を上げる目的もあり、床は少し反射っぽくしても良い。
+      // ただし旧コードは Lambert。ここでは Lambert を維持（教材としてライトの効きが分かりやすい）。
+      const planeMaterial = new THREE.MeshLambertMaterial({ map: textureGrass });
+
+      plane = new THREE.Mesh(planeGeometry, planeMaterial);
+      plane.receiveShadow = true;
+      plane.rotation.x = -0.5 * Math.PI;
+      plane.position.set(15, 0, 0);
+      scene.add(plane);
+
+      // ------------------------------------------------------------
+      // Objects (Cube / Sphere)
+      // ------------------------------------------------------------
+      cube = new THREE.Mesh(
+        new THREE.BoxGeometry(4, 4, 4),
+        new THREE.MeshLambertMaterial({ color: 0xff3333 })
+      );
+      cube.castShadow = true;
+      cube.position.set(-4, 3, 0);
+      scene.add(cube);
+
+      sphere = new THREE.Mesh(
+        new THREE.SphereGeometry(4, 25, 25),
+        new THREE.MeshLambertMaterial({ color: 0x7777ff })
+      );
+      sphere.castShadow = true;
+      sphere.position.set(10, 5, 10);
+      scene.add(sphere);
+
+      // ------------------------------------------------------------
+      // Lights
+      // ------------------------------------------------------------
+
+      // (1) AmbientLight：最低限の地の明るさ（暗部が完全に潰れないように）
+      ambientLight = new THREE.AmbientLight(new THREE.Color("#1c1c1c"), 1.0);
+      scene.add(ambientLight);
+
+      // (2) Fill SpotLight：補助光（影側の見えを少し持ち上げる）
+      // ★方針：SpotLight/PointLight の decay は 0 をデフォルトにする
+      fillSpotLight = new THREE.SpotLight(0xcccccc, 0.1);
+      fillSpotLight.position.set(-40, 60, -10);
+      fillSpotLight.decay = 0;
+      fillSpotLight.distance = 0;
+      fillSpotLight.target = plane;
+      scene.add(fillSpotLight);
+      scene.add(fillSpotLight.target);
+
+      // (3) Sun DirectionalLight：太陽光っぽいメイン光源
+      // 旧コードでは変数名が spotLight だが、実体は DirectionalLight なので名前を修正する。
+      sunLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      sunLight.position.set(30, 80, -50);
+      sunLight.castShadow = true;
+
+      // DirectionalLight の影カメラは OrthographicCamera
+      // - left/right/top/bottom が「影が計算される範囲」
+      // - 範囲が広すぎると影マップが粗くなる
+      sunLight.shadow.camera.near = 2;
+      sunLight.shadow.camera.far = 250;
+      sunLight.shadow.camera.left = -100;
+      sunLight.shadow.camera.right = 100;
+      sunLight.shadow.camera.top = 100;
+      sunLight.shadow.camera.bottom = -100;
+
+      // 影の解像度
+      sunLight.shadow.mapSize.set(2048, 2048);
+
+      // 影のアーティファクト（シャドウアクネ/ピーターパン）を抑える微調整
+      sunLight.shadow.bias = -0.0001;
+      sunLight.shadow.normalBias = 0.02;
+
+      // 照射先（DirectionalLight は position → target を向く）
+      sunLight.target = plane;
+      scene.add(sunLight);
+      scene.add(sunLight.target);
+
+      // デバッグ（任意）
+      const shadowCamHelper = new THREE.CameraHelper(sunLight.shadow.camera);
+      shadowCamHelper.visible = false;
+      scene.add(shadowCamHelper);
+
+      const dirHelper = new THREE.DirectionalLightHelper(sunLight, 10);
+      dirHelper.visible = false;
+      scene.add(dirHelper);
+
+      // ------------------------------------------------------------
+      // Lensflare
+      // ------------------------------------------------------------
+      // Lensflare は「光源スプライト群」をカメラ方向に並べて出す表現。
+      // 現象としての正しさより、視覚的に“それっぽい”を狙う。
+      //
+      // 注意点:
+      // - テクスチャは通常 sRGB（色画像）なので colorSpace を揃える
+      // - 露出(toneMappingExposure)が高いとフレアが白飛びしやすい
+      const textureFlare0 = textureLoader.load(FLARE0_URL);
+      const textureFlare3 = textureLoader.load(FLARE3_URL);
+      textureFlare0.colorSpace = THREE.SRGBColorSpace;
+      textureFlare3.colorSpace = THREE.SRGBColorSpace;
+
+      lensflare = new Lensflare();
+
+      lensflare.frustumCulled = false;
+
+      // フレア要素の色（Additive で足されるので、彩度が高いと派手になる）
+      const flareColor = new THREE.Color(0xffaacc);
+
+      // LensflareElement(texture, size, distance, color)
+      // - size: ピクセル基準っぽい感覚（画面に対して大きさが決まる）
+      // - distance: 0..1（光源↔画面中心のライン上のどこに配置するか）
+      const flareBaseSizes = { a: 350, b: 60, c: 70, d: 120, e: 70 };
+      let flareScale = 1.0;
+
+      const e0 = new LensflareElement(textureFlare0, flareBaseSizes.a, 0.0, flareColor);
+      const e1 = new LensflareElement(textureFlare3, flareBaseSizes.b, 0.6);
+      const e2 = new LensflareElement(textureFlare3, flareBaseSizes.c, 0.7);
+      const e3 = new LensflareElement(textureFlare3, flareBaseSizes.d, 0.9);
+      const e4 = new LensflareElement(textureFlare3, flareBaseSizes.e, 1.0);
+
+      lensflare.addElement(e0);
+      lensflare.addElement(e1);
+      lensflare.addElement(e2);
+      lensflare.addElement(e3);
+      lensflare.addElement(e4);
+
+      // Lensflare の位置は「光源の位置」に追従させる（毎フレーム copy してもよい）
+      lensflare.position.copy(sunLight.position);
+      scene.add(lensflare);
+
+      // フレアサイズをまとめて変える関数（GUI 用）
+      function applyFlareScale(scale) {
+        flareScale = scale;
+        e0.size = flareBaseSizes.a * flareScale;
+        e1.size = flareBaseSizes.b * flareScale;
+        e2.size = flareBaseSizes.c * flareScale;
+        e3.size = flareBaseSizes.d * flareScale;
+        e4.size = flareBaseSizes.e * flareScale;
+      }
+
+      // ------------------------------------------------------------
+      // GUI
+      // ------------------------------------------------------------
+      const controls = {
+        // animation
+        rotationSpeed: 0.03,
+        bouncingSpeed: 0.03,
+
+        // ambient
+        ambientColor: "#1c1c1c",
+        ambientIntensity: 1.0,
+
+        // fill
+        fillIntensity: 0.1,
+
+        // sun
+        sunColor: "#ffffff",
+        sunIntensity: 0.8,
+        sunPosX: 30,
+        sunPosY: 80,
+        sunPosZ: -50,
+
+        // renderer
+        exposure: 1.2,
+
+        // flare
+        flareColor: "#ffaacc",
+        flareScale: 1.0,
+
+        // debug
+        showHelpers: false
+      };
+
+      const gui = new GUI({ title: "Controls" });
+
+      const fAnim = gui.addFolder("animation");
+      fAnim.add(controls, "rotationSpeed", 0, 0.2, 0.001);
+      fAnim.add(controls, "bouncingSpeed", 0, 0.2, 0.001);
+
+      const fAmbient = gui.addFolder("ambient");
+      fAmbient.addColor(controls, "ambientColor").onChange((v) => {
+        ambientLight.color = new THREE.Color(v);
+      });
+      fAmbient.add(controls, "ambientIntensity", 0, 3, 0.01).onChange((v) => {
+        ambientLight.intensity = v;
+      });
+
+      const fFill = gui.addFolder("fill light (spot)");
+      fFill.add(controls, "fillIntensity", 0, 2, 0.01).onChange((v) => {
+        fillSpotLight.intensity = v;
+      });
+
+      const fSun = gui.addFolder("sun (directional)");
+      fSun.addColor(controls, "sunColor").onChange((v) => {
+        sunLight.color = new THREE.Color(v);
+      });
+      fSun.add(controls, "sunIntensity", 0, 5, 0.01).onChange((v) => {
+        sunLight.intensity = v;
+      });
+      fSun.add(controls, "sunPosX", -200, 200, 1).onChange(updateSunPos);
+      fSun.add(controls, "sunPosY", 0, 300, 1).onChange(updateSunPos);
+      fSun.add(controls, "sunPosZ", -300, 300, 1).onChange(updateSunPos);
+
+      function updateSunPos() {
+        sunLight.position.set(controls.sunPosX, controls.sunPosY, controls.sunPosZ);
+        // レンズフレアは“光源の位置”に置いて疑似表現するので追従させる
+        lensflare.position.copy(sunLight.position);
+        // helper（表示中なら更新）
+        if (dirHelper.visible) dirHelper.update();
+        if (shadowCamHelper.visible) shadowCamHelper.update();
+      }
+
+      const fRenderer = gui.addFolder("renderer");
+      fRenderer.add(controls, "exposure", 0.1, 3.0, 0.01).onChange((v) => {
+        renderer.toneMappingExposure = v;
+      });
+
+      const fFlare = gui.addFolder("lens flare");
+      fFlare.addColor(controls, "flareColor").onChange((v) => {
+        // LensflareElement の色を更新（主に先頭要素を色付けして“核”を作る）
+        e0.color = new THREE.Color(v);
+      });
+      fFlare.add(controls, "flareScale", 0.1, 2.5, 0.01).onChange((v) => {
+        applyFlareScale(v);
+      });
+
+      const fDebug = gui.addFolder("debug");
+      fDebug.add(controls, "showHelpers").onChange((v) => {
+        shadowCamHelper.visible = v;
+        dirHelper.visible = v;
+      });
+
+      // ------------------------------------------------------------
+      // Resize
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // Render loop
+      // ------------------------------------------------------------
+      render();
+    }
+
+    // ============================================================
+    // render loop
+    // ============================================================
+    function render() {
+      stats.update();
+
+      // cube 回転（ローカル軸）
+      // - rotation は Euler
+      cube.rotation.x += 0.03;
+      cube.rotation.y += 0.03;
+      cube.rotation.z += 0.03;
+
+      // sphere バウンド（周期運動）
+      step += 0.03;
+      sphere.position.x = 20 + (10 * Math.cos(step));
+      sphere.position.y = 2 + (10 * Math.abs(Math.sin(step)));
+
+      // Lensflare は光源の位置に追従（光源を動かしていないなら毎フレーム不要だが保険）
+      // - 将来 sunLight を動かす拡張に備えて追従処理を残す
+      // - もし固定ならこの copy は消してよい
+      lensflare.position.copy(sunLight.position);
+
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // resize
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // stats
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
