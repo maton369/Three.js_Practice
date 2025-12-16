@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 03.05 - Directional Light (ES Modules + detailed comments)</title>
+
+  <!--
+    【方針：ES Modules + importmap】
+    - three は CDN から ESM で import
+    - GUI は lil-gui（three/addons）
+    - Stats も three/addons
+
+    【今回のポイント（床が暗い問題の原因と対策）】
+    - Lambert/Phong 系の床は「光の入射角」で明るさが決まる（拡散反射：N・L）。
+      旧コード相当の DirectionalLight の高さ(y) が低いと、床に対して光が“かすめる”角度になり
+      N・L が小さくなって床だけ暗くなりやすい（逆に立方体や球の側面は明るく見えることがある）。
+    - 対策：
+      (1) DirectionalLight の高さ(y)を上げる（最重要・いちばん自然）
+      (2) Hemisphere/Ambient を少し足して“ベース照明”を確保
+      (3) 必要なら床Materialに emissive（自己発光）を少し足して底上げ（物理的ではないが見やすい）
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（render / resize / GUI から参照）
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let plane, cube, sphere;
+    let hemiLight, dirLight, fillSpotLight;
+    let shadowCamHelper, dirLightHelper;
+
+    // 地面テクスチャ（ローカル配信想定）
+    const GRASS_TEX_URL = "../assets/textures/ground/grasslight-big.jpg";
+
+    // アニメーション用
+    let step = 0;
+
+    // DirectionalLight の影は OrthographicCamera で “箱” を作って定義する
+    // - 小さすぎる：影が途中で切れる
+    // - 大きすぎる：影が粗くなる（mapSize が同じでも広範囲をカバーするため）
+    const SHADOW_FRUSTUM_DEFAULT = {
+      left: -50, right: 50, top: 50, bottom: -50,
+      near: 0.1, far: 200
+    };
+
+    // ============================================================
+    // init：初期化
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // -----------------------------
+      // Scene
+      // -----------------------------
+      scene = new THREE.Scene();
+
+      // Fog：遠景を薄くして距離感を出す（暗くする要素ではない）
+      // ただし near が小さすぎると全域が霞んで見えるのでスケールに合わせる
+      scene.fog = new THREE.Fog(0xaaaaaa, 50, 350);
+
+      // -----------------------------
+      // Camera（透視投影）
+      // -----------------------------
+      camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(-20, 15, 45);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // -----------------------------
+      // Renderer
+      // -----------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setClearColor(new THREE.Color(0xaaaaff));
+
+      // 色空間：テクスチャ（sRGB）→ リニア計算 → 出力（sRGB）
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      // トーンマッピング：強制ではないが “暗すぎ/白飛び” を扱いやすくなる
+      //（見やすさ優先。物理的厳密さより教材としての視認性を取る）
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.0;
+
+      // 影
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // -----------------------------
+      // Ground（床）
+      // -----------------------------
+      const planeGeometry = new THREE.PlaneGeometry(1000, 200, 20, 20);
+
+      // テクスチャ読み込み（失敗しても床は描画できるようにする）
+      const loader = new THREE.TextureLoader();
+      const textureGrass = loader.load(
+        GRASS_TEX_URL,
+        () => { /* onLoad: 特に何もしなくてOK（three が自動で再描画に反映） */ },
+        undefined,
+        (err) => {
+          console.warn("Texture load failed:", GRASS_TEX_URL, err);
+        }
+      );
+
+      // 色テクスチャは sRGB として扱うのが基本
+      textureGrass.colorSpace = THREE.SRGBColorSpace;
+
+      // 繰り返し
+      textureGrass.wrapS = THREE.RepeatWrapping;
+      textureGrass.wrapT = THREE.RepeatWrapping;
+      textureGrass.repeat.set(4, 4);
+
+      // 斜めから見たときのテクスチャの潰れを軽減（任意）
+      textureGrass.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+
+      // 床Material：
+      // - MeshPhongMaterial は拡散+鏡面（古典的モデル）で教材に分かりやすい
+      // - emissive を少し足すと「床だけ暗い」問題の緩和になる（最後の保険）
+      const planeMaterial = new THREE.MeshPhongMaterial({
+        map: textureGrass,
+        shininess: 10,
+        color: 0xffffff,
+        emissive: new THREE.Color(0x000000), // 最初は発光なし（GUIで増やせる）
+        emissiveIntensity: 0.0
+      });
+
+      plane = new THREE.Mesh(planeGeometry, planeMaterial);
+      plane.receiveShadow = true;
+
+      // PlaneGeometry は初期XY平面（法線 +Z）
+      // - 床にするには XZ 平面へ寝かせる（法線 +Y）
+      plane.rotation.x = -0.5 * Math.PI;
+      plane.position.set(15, 0, 0);
+      scene.add(plane);
+
+      // -----------------------------
+      // Objects（cube / sphere）
+      // -----------------------------
+      cube = new THREE.Mesh(
+        new THREE.BoxGeometry(4, 4, 4),
+        new THREE.MeshLambertMaterial({ color: 0xff3333 })
+      );
+      cube.castShadow = true;
+      cube.position.set(-4, 3, 0);
+      scene.add(cube);
+
+      sphere = new THREE.Mesh(
+        new THREE.SphereGeometry(4, 25, 25),
+        new THREE.MeshLambertMaterial({ color: 0x7777ff })
+      );
+      sphere.castShadow = true;
+      sphere.position.set(10, 5, 10);
+      scene.add(sphere);
+
+      // -----------------------------
+      // Lights
+      // -----------------------------
+
+      // (A) HemisphereLight：上（空）と下（地面）から来る環境光
+      // - 床を明るくする“底上げ”に効く（Ambient より自然に方向性が出る）
+      hemiLight = new THREE.HemisphereLight(0x0000ff, 0x00ff00, 0.6);
+      hemiLight.position.set(0, 500, 0);
+      scene.add(hemiLight);
+
+      // (B) DirectionalLight：太陽光（平行光）
+      // ★床が暗い最大要因：ライトの高さ(y)が低いと床に対して入射角が浅くなり暗くなる
+      // → デフォルトで y を大きくする（ここが最重要修正点）
+      dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      dirLight.position.set(30, 80, -50); // ← 旧: y=10 だと床が暗くなりやすい
+      dirLight.castShadow = true;
+
+      // 照射先（target）
+      // - Light は position と target を結ぶ方向を向く
+      dirLight.target = plane;            // plane は scene に add 済みなのでOK
+      scene.add(dirLight);
+
+      // 影の範囲（Orthographic）
+      applyShadowFrustum(dirLight, SHADOW_FRUSTUM_DEFAULT);
+
+      // 影マップ解像度
+      dirLight.shadow.mapSize.set(2048, 2048);
+
+      // 影のアーティファクト対策
+      dirLight.shadow.bias = -0.0001;
+      dirLight.shadow.normalBias = 0.02;
+
+      // (C) fillSpotLight：補助光（暗部を少し持ち上げる）
+      // - Spot/Point の decay は 0（方針）
+      fillSpotLight = new THREE.SpotLight(0xcccccc, 0.25);
+      fillSpotLight.position.set(-40, 60, -10);
+      fillSpotLight.target = plane;
+      fillSpotLight.decay = 0;   // ★方針
+      fillSpotLight.distance = 0; // 0=無限（減衰させない）
+      scene.add(fillSpotLight);
+      scene.add(fillSpotLight.target);
+
+      // -----------------------------
+      // Helpers（デバッグ表示）
+      // -----------------------------
+      shadowCamHelper = new THREE.CameraHelper(dirLight.shadow.camera);
+      shadowCamHelper.visible = false;
+      scene.add(shadowCamHelper);
+
+      dirLightHelper = new THREE.DirectionalLightHelper(dirLight, 5);
+      dirLightHelper.visible = false;
+      scene.add(dirLightHelper);
+
+      // -----------------------------
+      // GUI
+      // -----------------------------
+      const controls = {
+        // animation
+        rotationSpeed: 0.03,
+        bouncingSpeed: 0.03,
+
+        // hemisphere
+        hemisphere: true,
+        skyColor: 0x0000ff,
+        groundColor: 0x00ff00,
+        hemiIntensity: 0.6,
+
+        // directional
+        dirColor: 0xffffff,
+        dirIntensity: 0.8,
+        dirPosX: 30,
+        dirPosY: 80,  // ★床を明るくしたいならまずここ
+        dirPosZ: -50,
+        castShadow: true,
+
+        // renderer
+        exposure: 1.0,
+
+        // ground tuning（最後の保険：床だけ明るくする）
+        groundEmissive: 0.0, // 0〜1 くらいで十分効くことが多い
+
+        // shadow frustum
+        shadowLeft: SHADOW_FRUSTUM_DEFAULT.left,
+        shadowRight: SHADOW_FRUSTUM_DEFAULT.right,
+        shadowTop: SHADOW_FRUSTUM_DEFAULT.top,
+        shadowBottom: SHADOW_FRUSTUM_DEFAULT.bottom,
+        shadowNear: SHADOW_FRUSTUM_DEFAULT.near,
+        shadowFar: SHADOW_FRUSTUM_DEFAULT.far,
+        mapSize: 2048,
+
+        // debug
+        debugShadowCamera: false,
+        debugLightHelper: false
+      };
+
+      const gui = new GUI({ title: "Controls" });
+
+      const fAnim = gui.addFolder("animation");
+      fAnim.add(controls, "rotationSpeed", 0, 0.2, 0.001);
+      fAnim.add(controls, "bouncingSpeed", 0, 0.2, 0.001);
+
+      const fHemi = gui.addFolder("hemisphere light");
+      fHemi.add(controls, "hemisphere").onChange((v) => {
+        hemiLight.intensity = v ? controls.hemiIntensity : 0;
+      });
+      fHemi.addColor(controls, "skyColor").onChange((v) => {
+        hemiLight.color = new THREE.Color(v);
+      });
+      fHemi.addColor(controls, "groundColor").onChange((v) => {
+        hemiLight.groundColor = new THREE.Color(v);
+      });
+      fHemi.add(controls, "hemiIntensity", 0, 5, 0.01).onChange((v) => {
+        if (controls.hemisphere) hemiLight.intensity = v;
+      });
+
+      const fDir = gui.addFolder("directional light");
+      fDir.addColor(controls, "dirColor").onChange((v) => {
+        dirLight.color = new THREE.Color(v);
+      });
+      fDir.add(controls, "dirIntensity", 0, 5, 0.01).onChange((v) => {
+        dirLight.intensity = v;
+      });
+
+      // ★床が暗いときの本命：ライト位置（特にY）
+      const updateDirPos = () => {
+        dirLight.position.set(controls.dirPosX, controls.dirPosY, controls.dirPosZ);
+        // Helper 表示中なら update
+        if (dirLightHelper.visible) dirLightHelper.update();
+      };
+      fDir.add(controls, "dirPosX", -200, 200, 1).onChange(updateDirPos);
+      fDir.add(controls, "dirPosY",   0, 200, 1).onChange(updateDirPos);
+      fDir.add(controls, "dirPosZ", -200, 200, 1).onChange(updateDirPos);
+
+      fDir.add(controls, "castShadow").onChange((v) => {
+        dirLight.castShadow = v;
+      });
+
+      const fRenderer = gui.addFolder("renderer");
+      fRenderer.add(controls, "exposure", 0.1, 2.5, 0.01).onChange((v) => {
+        renderer.toneMappingExposure = v;
+      });
+
+      const fGround = gui.addFolder("ground tuning");
+      fGround.add(controls, "groundEmissive", 0, 1, 0.001).onChange((v) => {
+        // emissive は “光に関係なく足される色” なので、床だけ底上げできる
+        plane.material.emissive = new THREE.Color(0xffffff);
+        plane.material.emissiveIntensity = v;
+      });
+
+      const fShadow = gui.addFolder("shadow frustum (orthographic)");
+      const updateShadow = () => updateShadowCameraFromControls(controls, dirLight, shadowCamHelper);
+      fShadow.add(controls, "shadowLeft", -300, 0, 1).onChange(updateShadow);
+      fShadow.add(controls, "shadowRight", 0, 300, 1).onChange(updateShadow);
+      fShadow.add(controls, "shadowTop", 0, 300, 1).onChange(updateShadow);
+      fShadow.add(controls, "shadowBottom", -300, 0, 1).onChange(updateShadow);
+      fShadow.add(controls, "shadowNear", 0.01, 100, 0.01).onChange(updateShadow);
+      fShadow.add(controls, "shadowFar", 10, 800, 1).onChange(updateShadow);
+      fShadow.add(controls, "mapSize", { "512": 512, "1024": 1024, "2048": 2048, "4096": 4096 })
+        .onChange((v) => {
+          dirLight.shadow.mapSize.set(Number(v), Number(v));
+        });
+
+      const fDebug = gui.addFolder("debug");
+      fDebug.add(controls, "debugShadowCamera").onChange((v) => {
+        shadowCamHelper.visible = v;
+      });
+      fDebug.add(controls, "debugLightHelper").onChange((v) => {
+        dirLightHelper.visible = v;
+      });
+
+      // -----------------------------
+      // resize
+      // -----------------------------
+      window.addEventListener("resize", onResize);
+
+      // -----------------------------
+      // loop
+      // -----------------------------
+      render(controls);
+    }
+
+    // ============================================================
+    // applyShadowFrustum：shadow camera をまとめて設定
+    // ============================================================
+    function applyShadowFrustum(light, frustum) {
+      const cam = light.shadow.camera; // OrthographicCamera
+      cam.left = frustum.left;
+      cam.right = frustum.right;
+      cam.top = frustum.top;
+      cam.bottom = frustum.bottom;
+      cam.near = frustum.near;
+      cam.far = frustum.far;
+      cam.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // GUI の値 → shadow camera へ反映
+    // ============================================================
+    function updateShadowCameraFromControls(controls, light, helper) {
+      const cam = light.shadow.camera;
+      cam.left = controls.shadowLeft;
+      cam.right = controls.shadowRight;
+      cam.top = controls.shadowTop;
+      cam.bottom = controls.shadowBottom;
+      cam.near = controls.shadowNear;
+      cam.far = controls.shadowFar;
+      cam.updateProjectionMatrix();
+      helper.update();
+    }
+
+    // ============================================================
+    // resize：カメラの aspect と renderer サイズ更新
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // render：毎フレーム更新
+    // ============================================================
+    function render(controls) {
+      stats.update();
+
+      // cube 回転（Euler）
+      cube.rotation.x += controls.rotationSpeed;
+      cube.rotation.y += controls.rotationSpeed;
+      cube.rotation.z += controls.rotationSpeed;
+
+      // sphere バウンド
+      step += controls.bouncingSpeed;
+      sphere.position.x = 20 + (10 * Math.cos(step));
+      sphere.position.y = 2 + (10 * Math.abs(Math.sin(step)));
+
+      // helper の更新（見えているときだけ）
+      if (dirLightHelper.visible) dirLightHelper.update();
+      if (shadowCamHelper.visible) shadowCamHelper.update();
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(() => render(controls));
+    }
+
+    // ============================================================
+    // Stats 初期化
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0);
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
