@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 04.01 - MeshBasicMaterial (ES Modules + detailed comments)</title>
+
+  <!--
+    【修正方針（旧サンプル → 現行 Three.js）】
+    - 旧: ../libs/three.js / dat.gui / stats / CanvasRenderer / Projector を <script> 直読み
+    - 新: ES Modules + importmap で three を import（現行の書き方に寄せる）
+    - CanvasRenderer / Projector は現行 three.js では基本的に廃止されているため削除し、
+      「WebGLRenderer のみ」に統一する（switchRenderer 機能は廃止）
+
+    【このサンプルの主題（アルゴリズム/流れ）】
+    1) Scene / Camera / Renderer を初期化
+    2) 床（参照物）を置く
+    3) MeshBasicMaterial を 1つ作り、球/立方体/平面の 3メッシュに共用する
+       - MeshBasicMaterial は “ライトの影響を受けない”
+       - つまり AmbientLight / SpotLight を置いても「明るさ・陰影」は変化しない
+    4) ローカルクリッピング（material.clippingPlanes + renderer.localClippingEnabled）を GUI で操作する
+       - renderer.localClippingEnabled = true のときだけ clippingPlanes が効く
+       - Plane(normal, constant) の constant を動かして切断位置を変える
+    5) GUI でマテリアルの基本パラメータ（opacity / transparent / wireframe / side / color）と
+       表示メッシュ（cube/sphere/plane）を切り替える
+    6) requestAnimationFrame のループでメッシュを回転させる（比較しやすい）
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（render / resize から参照）
+    // ============================================================
+    let scene, camera, renderer, stats;
+
+    // 参照物（床）
+    let groundMesh;
+
+    // 切り替え対象の3メッシュ
+    let cube, sphere, planeMesh;
+    let activeMesh; // 現在 scene に置いているメッシュ参照（切り替えの管理用）
+
+    // 主役のマテリアル（3メッシュで共用）
+    let meshMaterial;
+
+    // ローカルクリッピング用 Plane
+    // - Plane(normal, constant)
+    // - normal の方向（どちら側を切るか）と constant（切断位置）を GUI で制御する
+    let clippingPlane;
+
+    // アニメーション用
+    let step = 0;
+
+    // ============================================================
+    // init：初期化（シーン構築 → GUI → ループ開始）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Camera
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-20, 50, 40);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ------------------------------------------------------------
+      // Renderer（WebGLRenderer のみ）
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xeeeeee));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // ShadowMap（影）
+      // - MeshBasicMaterial はライトで陰影は付かないが、
+      //   “影の投影/受け取り” はレンダラの別工程なので有効にできる
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      // ローカルクリッピングの有効/無効（GUI で切り替える）
+      renderer.localClippingEnabled = false;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Ground（床）：参照物
+      // ------------------------------------------------------------
+      // - 視点や回転で「何もない空間」にならないよう床を置く
+      // - 床も MeshBasicMaterial にする（ライトの影響がないことを統一して観察できる）
+      const groundGeom = new THREE.PlaneGeometry(100, 100, 4, 4);
+      const groundMat = new THREE.MeshBasicMaterial({ color: 0x777777 });
+
+      groundMesh = new THREE.Mesh(groundGeom, groundMat);
+      groundMesh.rotation.x = -Math.PI / 2;
+      groundMesh.position.y = -20;
+
+      // 影を受ける（床に影が落ちる）
+      groundMesh.receiveShadow = true;
+
+      scene.add(groundMesh);
+
+      // ------------------------------------------------------------
+      // Geometry（球 / 立方体 / 平面）
+      // ------------------------------------------------------------
+      const sphereGeometry = new THREE.SphereGeometry(14, 20, 20);
+      const cubeGeometry = new THREE.BoxGeometry(15, 15, 15);
+      const planeGeometry = new THREE.PlaneGeometry(14, 14, 4, 4);
+
+      // ------------------------------------------------------------
+      // MeshBasicMaterial（主役）
+      // ------------------------------------------------------------
+      // - “ライト計算なし” なので、色はそのままベタ塗りになる
+      // - opacity を効かせたいなら transparent=true が基本
+      meshMaterial = new THREE.MeshBasicMaterial({
+        color: 0x7777ff,
+        transparent: false,
+        opacity: 1.0,
+        wireframe: false,
+        side: THREE.FrontSide
+      });
+
+      // ------------------------------------------------------------
+      // ローカルクリッピング（material 側の設定）
+      // ------------------------------------------------------------
+      // - normal=(0,0,-1) は「Z方向の切断」を分かりやすくするための例
+      // - constant を動かすと、見た目として“スライス位置が前後に動く”
+      clippingPlane = new THREE.Plane(new THREE.Vector3(0, 0, -1), 0);
+      meshMaterial.clippingPlanes = [clippingPlane];
+
+      // ------------------------------------------------------------
+      // Mesh（3種）を作って位置を揃える
+      // ------------------------------------------------------------
+      sphere = new THREE.Mesh(sphereGeometry, meshMaterial);
+      cube = new THREE.Mesh(cubeGeometry, meshMaterial);
+      planeMesh = new THREE.Mesh(planeGeometry, meshMaterial);
+
+      // 同一座標に置く（比較用）
+      const basePos = new THREE.Vector3(0, 3, 2);
+      sphere.position.copy(basePos);
+      cube.position.copy(basePos);
+      planeMesh.position.copy(basePos);
+
+      // 影を落とす（castShadow）
+      // - MeshBasicMaterial でも castShadow は有効（影は別工程）
+      sphere.castShadow = true;
+      cube.castShadow = true;
+      planeMesh.castShadow = true;
+
+      // 初期表示は cube（旧コード踏襲）
+      activeMesh = cube;
+      scene.add(activeMesh);
+
+      // ------------------------------------------------------------
+      // Lights（教材として残す）
+      // ------------------------------------------------------------
+      // 重要：
+      // - MeshBasicMaterial は「ライトの影響で明暗が変わらない」ため、
+      //   これらライトは“見た目の色”には影響しない。
+      // - ただし shadow を生成するには、影を落とせるライト（SpotLight等）が必要。
+      const ambientLight = new THREE.AmbientLight(0x0c0c0c, 1.0);
+      scene.add(ambientLight);
+
+      // ★方針：SpotLight/PointLight の decay は 0 をデフォルトにする
+      const spotLight = new THREE.SpotLight(0xffffff, 1.0);
+      spotLight.position.set(-40, 60, -10);
+      spotLight.castShadow = true;
+      spotLight.decay = 0;     // 距離減衰なし
+      spotLight.distance = 0;  // 0 は無限扱い
+
+      // 影の品質（任意）
+      spotLight.shadow.mapSize.set(1024, 1024);
+      spotLight.shadow.bias = -0.0001;
+
+      scene.add(spotLight);
+
+      // ------------------------------------------------------------
+      // GUI（lil-gui）
+      // ------------------------------------------------------------
+      const controls = {
+        // animation
+        rotationSpeed: 0.02,
+
+        // material
+        opacity: meshMaterial.opacity,
+        transparent: meshMaterial.transparent,
+        visible: meshMaterial.visible,
+        side: "front",
+        color: "#7777ff",
+        wireframe: meshMaterial.wireframe,
+
+        // clipping
+        clippingEnabled: false,
+        clippingPlaneZ: clippingPlane.constant,
+
+        // mesh select
+        selectedMesh: "cube"
+      };
+
+      const gui = new GUI({ title: "Controls" });
+
+      const fAnim = gui.addFolder("animation");
+      fAnim.add(controls, "rotationSpeed", 0, 0.2, 0.001);
+
+      const fMat = gui.addFolder("MeshBasicMaterial");
+      fMat.addColor(controls, "color").onChange((v) => {
+        meshMaterial.color = new THREE.Color(v);
+      });
+      fMat.add(controls, "opacity", 0, 1, 0.01).onChange((v) => {
+        meshMaterial.opacity = v;
+      });
+      fMat.add(controls, "transparent").onChange((v) => {
+        meshMaterial.transparent = v;
+        // transparent 切替は内部の描画パスが変わるので needsUpdate を入れておくと安全
+        meshMaterial.needsUpdate = true;
+      });
+      fMat.add(controls, "wireframe").onChange((v) => {
+        meshMaterial.wireframe = v;
+      });
+      fMat.add(controls, "visible").onChange((v) => {
+        meshMaterial.visible = v;
+      });
+      fMat.add(controls, "side", ["front", "back", "double"]).onChange((v) => {
+        switch (v) {
+          case "front":
+            meshMaterial.side = THREE.FrontSide;
+            break;
+          case "back":
+            meshMaterial.side = THREE.BackSide;
+            break;
+          case "double":
+            meshMaterial.side = THREE.DoubleSide;
+            break;
+        }
+        // side はシェーダ定義が変わりうるので needsUpdate
+        meshMaterial.needsUpdate = true;
+      });
+
+      const fClip = gui.addFolder("clipping");
+      fClip.add(controls, "clippingEnabled").onChange((v) => {
+        // renderer 側のスイッチが “本体”
+        renderer.localClippingEnabled = v;
+      });
+      fClip.add(controls, "clippingPlaneZ", -20.0, 20.0, 0.01).onChange((v) => {
+        // Plane.constant を動かしてスライス位置を変える
+        clippingPlane.constant = v;
+      });
+
+      const fSel = gui.addFolder("mesh selection");
+      fSel.add(controls, "selectedMesh", ["cube", "sphere", "plane"]).onChange((v) => {
+        // 旧コードには「scene.add(e)（文字列を add する）」というバグがあったので修正する。
+        // 正しくは “選ばれたメッシュ” を scene に add する。
+
+        if (activeMesh) scene.remove(activeMesh);
+
+        switch (v) {
+          case "cube":
+            activeMesh = cube;
+            break;
+          case "sphere":
+            activeMesh = sphere;
+            break;
+          case "plane":
+            activeMesh = planeMesh;
+            break;
+        }
+
+        scene.add(activeMesh);
+      });
+
+      // ------------------------------------------------------------
+      // Resize
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // Render loop
+      // ------------------------------------------------------------
+      render(controls);
+    }
+
+    // ============================================================
+    // render：毎フレーム更新
+    // ============================================================
+    function render(controls) {
+      stats.update();
+
+      // step を進めて回転角に使う
+      step += controls.rotationSpeed;
+
+      // 表示中のメッシュだけ回転（比較しやすい）
+      // - meshMaterial を共用しているので、マテリアル変更の効果がすぐ見える
+      if (activeMesh) {
+        activeMesh.rotation.y = step;
+      }
+
+      requestAnimationFrame(() => render(controls));
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // resize：画面リサイズ対応
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // stats：FPS 表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
