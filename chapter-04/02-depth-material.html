@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Example 04.02 - Depth Material (fixed + detailed comments)</title>
+
+  <!--
+    このサンプルの主題：
+    - 「深度（Depth）」を色として可視化する MeshDepthMaterial を使って、
+      カメラからの距離（正確には深度値）がどう描画に反映されるかを見る。
+
+    重要ポイント（アルゴリズム）：
+    1) scene.overrideMaterial を使うと「シーン中の全メッシュを同じマテリアルで強制描画」できる。
+       => 通常の色・ライト計算を無視して “深度だけ” の描画に切り替えられる。
+    2) 深度の見え方は camera.near / camera.far に強く依存する（射影変換後の深度は非線形）。
+       => near/far を動かすと「白〜黒の分布」が大きく変わる。
+    3) 物体の追加/削除は「scene に Mesh を add/remove」するだけ。
+       => render ループでは traverse して回転を加え、毎フレーム描画する。
+
+    ※ 旧コードの問題点（修正済み）：
+    - setClearColor(0x00000) は桁が変（0x000000 が正しい）なので修正
+    - addCube 内で LambertMaterial を作った直後に MeshDepthMaterial で上書きしていた
+      -> 「overrideMaterial で深度表示する」方針なら各メッシュは通常マテリアルでOK
+         （深度表示は overrideMaterial 側で統一して行う）
+    - near/far をGUIで動かすので、ProjectionMatrix の更新を確実に行う
+    - resize 対応を追加（画面サイズ変更時に aspect / renderer サイズを更新）
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    // ============================================================
+    // グローバル（このサンプルでは分かりやすさ優先で function-scope を縮めすぎない）
+    // ============================================================
+    var scene, camera, renderer, stats;
+    var depthOverrideMaterial;     // シーン全体を深度表示にするためのマテリアル
+    var normalLight;              // 通常表示モードの見え確認用ライト（Depth表示では基本不要）
+    var step = 0;
+
+    // ------------------------------------------------------------
+    // init：初期化
+    // ------------------------------------------------------------
+    function init() {
+      stats = initStats();
+
+      // ----------------------------------------------------------
+      // Scene：全オブジェクトの入れ物
+      // ----------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // MeshDepthMaterial を作成しておく（overrideMaterial で使う）
+      // depthPacking:
+      // - BasicDepthPacking（デフォルト）は 1ch 的な深度表現
+      // - RGBADepthPacking は RGBA に詰めて精度を確保する方式（教材として切替可能にする）
+      depthOverrideMaterial = new THREE.MeshDepthMaterial({
+        depthPacking: THREE.BasicDepthPacking
+      });
+
+      // 旧コードは最初から overrideMaterial を固定でONにしていたが、
+      // “比較”できるように GUI でON/OFFできるようにする。
+      // scene.overrideMaterial = depthOverrideMaterial; // <- ここではまだ固定しない
+
+      // ----------------------------------------------------------
+      // Camera：Perspective
+      // - near/far は深度の分布に直結するので、GUIで動かす前提で設計する。
+      // - near を小さくしすぎると深度精度が落ち（Z-fighting しやすくなる）ので注意。
+      // ----------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        30,   // near（旧コード踏襲）
+        170   // far（旧コード踏襲）
+      );
+
+      camera.position.set(-50, 40, 50);
+      camera.lookAt(scene.position);
+
+      // ----------------------------------------------------------
+      // Renderer：WebGLRenderer
+      // ----------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0x000000)); // 修正：0x00000 -> 0x000000
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // このサンプルでは影が主題ではないが、旧教材の流れを踏襲してONのままでもOK。
+      // Depth表示（overrideMaterial）の場合、ライトや影の影響は受けない（深度なので）。
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ----------------------------------------------------------
+      // 通常表示用ライト（Depth表示だけなら本来不要）
+      // - overrideMaterial OFF のときに “色が見える” ように置く
+      // ----------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x222222));
+
+      normalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+      normalLight.position.set(-40, 60, -10);
+      normalLight.castShadow = true;
+      scene.add(normalLight);
+
+      // ----------------------------------------------------------
+      // 初期キューブを生成（10個）
+      // - 各キューブは「通常表示用の LambertMaterial（ランダム色）」を持つ。
+      // - 深度表示に切り替えると overrideMaterial が優先されるため、
+      //   キューブ個別の material は “無視される”。
+      // ----------------------------------------------------------
+      for (var i = 0; i < 10; i++) addCube();
+
+      // ----------------------------------------------------------
+      // GUI：操作パネル
+      // ----------------------------------------------------------
+      var controls = {
+        // アニメーション
+        rotationSpeed: 0.02,
+
+        // カメラ
+        cameraNear: camera.near,
+        cameraFar: camera.far,
+
+        // シーン状態
+        numberOfObjects: countMeshesInScene(),
+
+        // 深度表示のON/OFF
+        useOverrideDepth: true,
+
+        // depthPacking の切替（見えの変化・精度の違いを観察用）
+        useRGBADepthPacking: false,
+
+        // 操作
+        addCube: function () {
+          addCube();
+          this.numberOfObjects = countMeshesInScene();
+        },
+
+        removeCube: function () {
+          // “最後に追加された Mesh” を 1つ消す（教材なので単純実装）
+          // 注意：ライトやヘルパー等が混ざると想定が崩れるので Mesh のみを対象にする。
+          var allChildren = scene.children;
+          for (var idx = allChildren.length - 1; idx >= 0; idx--) {
+            if (allChildren[idx] instanceof THREE.Mesh) {
+              scene.remove(allChildren[idx]);
+              break;
+            }
+          }
+          this.numberOfObjects = countMeshesInScene();
+        },
+
+        outputObjects: function () {
+          console.log(scene.children);
+        }
+      };
+
+      var gui = new dat.GUI();
+
+      gui.add(controls, "rotationSpeed", 0, 0.5);
+
+      gui.add(controls, "useOverrideDepth").onChange(function (v) {
+        // overrideMaterial は “シーン全体に適用される強制マテリアル”
+        // ON: 深度表示、OFF: 各 Mesh の material で通常表示
+        scene.overrideMaterial = v ? depthOverrideMaterial : null;
+      });
+
+      gui.add(controls, "useRGBADepthPacking").onChange(function (v) {
+        // depthPacking を変えたら material を更新
+        depthOverrideMaterial.depthPacking = v ? THREE.RGBADepthPacking : THREE.BasicDepthPacking;
+        depthOverrideMaterial.needsUpdate = true;
+      });
+
+      gui.add(controls, "addCube");
+      gui.add(controls, "removeCube");
+      gui.add(controls, "outputObjects");
+
+      gui.add(controls, "cameraNear", 0.1, 100).onChange(function (e) {
+        // near を変えると「深度の割当」が大きく変わる（非線形）
+        camera.near = e;
+        camera.updateProjectionMatrix();
+      });
+
+      gui.add(controls, "cameraFar", 50, 400).onChange(function (e) {
+        camera.far = e;
+        camera.updateProjectionMatrix();
+      });
+
+      // 初期状態は深度表示ON（教材の主題）
+      scene.overrideMaterial = controls.useOverrideDepth ? depthOverrideMaterial : null;
+
+      // ----------------------------------------------------------
+      // リサイズ対応
+      // ----------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ----------------------------------------------------------
+      // ループ開始
+      // ----------------------------------------------------------
+      render(controls);
+    }
+
+    // ------------------------------------------------------------
+    // addCube：ランダム位置・ランダムサイズのキューブを追加
+    // ------------------------------------------------------------
+    function addCube() {
+      // サイズ：3〜6程度のランダム
+      var cubeSize = Math.ceil(3 + (Math.random() * 3));
+      var cubeGeometry = new THREE.BoxGeometry(cubeSize, cubeSize, cubeSize);
+
+      // 通常表示用の色（Depth表示ONなら overrideMaterial が優先されて無視される）
+      var cubeMaterial = new THREE.MeshLambertMaterial({ color: Math.random() * 0xffffff });
+
+      var cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+      cube.castShadow = true;
+
+      // 旧コード踏襲：シーン内にバラ撒く
+      cube.position.x = -60 + Math.round((Math.random() * 100));
+      cube.position.y = Math.round((Math.random() * 10));
+      cube.position.z = -100 + Math.round((Math.random() * 150));
+
+      scene.add(cube);
+    }
+
+    // ------------------------------------------------------------
+    // countMeshesInScene：GUI 表示用に Mesh の数を数える
+    // ------------------------------------------------------------
+    function countMeshesInScene() {
+      var n = 0;
+      scene.traverse(function (obj) {
+        if (obj instanceof THREE.Mesh) n++;
+      });
+      return n;
+    }
+
+    // ------------------------------------------------------------
+    // render：毎フレーム処理
+    // - アルゴリズムの中心：scene.traverse で Mesh を回し、回転を加算する
+    // ------------------------------------------------------------
+    function render(controls) {
+      stats.update();
+
+      // 1フレームの時間変数（回転角のためだけに使用）
+      step += controls.rotationSpeed;
+
+      // シーン内の Mesh を列挙して回転を更新
+      // ※ overrideMaterial のON/OFFに関係なく「ジオメトリの変換」は同じように効く
+      scene.traverse(function (obj) {
+        if (obj instanceof THREE.Mesh) {
+          obj.rotation.x = step;
+          obj.rotation.y = step;
+          obj.rotation.z = step;
+        }
+      });
+
+      requestAnimationFrame(function () { render(controls); });
+      renderer.render(scene, camera);
+    }
+
+    // ------------------------------------------------------------
+    // onResize：画面サイズ変更
+    // ------------------------------------------------------------
+    function onResize() {
+      var w = window.innerWidth;
+      var h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+    }
+
+    // ------------------------------------------------------------
+    // initStats：FPS表示
+    // ------------------------------------------------------------
+    function initStats() {
+      var s = new Stats();
+      s.setMode(0); // 0: fps, 1: ms
+
+      s.domElement.style.position = "absolute";
+      s.domElement.style.left = "0px";
+      s.domElement.style.top = "0px";
+
+      document.getElementById("Stats-output").appendChild(s.domElement);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
