@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 04.03 - Combined Material (fixed + detailed comments)</title>
+
+  <!--
+    これは『Learning Three.js（旧版）』系の Example 04.03 を、現行の three.js でも破綻しにくいように
+    「意図（アルゴリズム）を保ったまま」整理・修正した版である。
+
+    ============================================================
+    このサンプルの “アルゴリズム（何をやっているか）”
+    ============================================================
+    目的は「1つの形状（BoxGeometry）に対して、2種類の見た目を重ねて描く」こと。
+
+    - ① Color layer（色レイヤー）
+      MeshBasicMaterial（ライティング無視）を使い、指定色を “MultiplyBlending” で重ねる
+      → 下地に対して乗算で暗く/色付けする表現（半透明で扱いやすい）
+
+    - ② Depth layer（深度レイヤー）
+      MeshDepthMaterial を重ねる
+      → カメラからの距離（深度）をグレースケールとして出す “深度の可視化” のレイヤー
+
+    これら2枚を “同じ場所に同じ形状で” 描画すると Z-fighting（ちらつき）が起きるため、
+    Depth layer を 0.99 倍にスケールして “ほんの少し” 内側に入れ、深度競合を避ける。
+    （旧コードの cube.children[1].scale.set(0.99,0.99,0.99) の意図はこれ）
+
+    さらに GUI で:
+      - 色（color layer の色）
+      - 回転速度
+      - near/far（深度の見え方に直結）
+      - 追加/削除（複数個の比較）
+    を操作できるようにして、深度表現の変化とブレンディングの重なりを観察する。
+
+    ============================================================
+    旧コードからの主な修正点
+    ============================================================
+    - setClearColor(0x00000) を 0x000000 に修正（桁不足）
+    - THREE.SceneUtils.createMultiMaterialObject は現行では削除/非推奨のため、
+      Group を自前で作り、同一 Geometry の Mesh を2枚重ねる実装に置き換え
+    - renderer.sortObjects=false は現行では基本不要だが、
+      “重ね描きの順序” を理解しやすくするため、renderOrder を明示して安定化
+    - scene.traverse で Mesh を回すと「Groupの子 Mesh しか回らない」ため、
+      Group ごと回す方式に変更（見た目が一貫する）
+    - resize 対応を追加（camera aspect / renderer size）
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ============================================================
+      // Stats（FPS表示）
+      // ============================================================
+      var stats = initStats();
+
+      // ============================================================
+      // Scene
+      // ============================================================
+      var scene = new THREE.Scene();
+
+      // ============================================================
+      // Camera
+      // - 旧コードは near=30, far=170 とかなり特殊なレンジ。
+      //   深度レイヤー（MeshDepthMaterial）は near/far に強く依存するため、この設定は教材的に重要。
+      // ============================================================
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        30,
+        170
+      );
+
+      camera.position.set(-50, 40, 50);
+      camera.lookAt(scene.position);
+
+      // ============================================================
+      // Renderer
+      // ============================================================
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+
+      // 旧コードは sortObjects=false だが、現行では基本 true のままで良い。
+      // ただし「多層の重ね描き」を安定させたいので、後段で renderOrder を明示する。
+      // renderer.sortObjects = false;
+
+      // 桁不足を修正（黒背景）
+      renderer.setClearColor(new THREE.Color(0x000000));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ============================================================
+      // ライト（本サンプルは MeshBasicMaterial と MeshDepthMaterial が主役）
+      // - MeshBasicMaterial はライトを無視
+      // - MeshDepthMaterial もライトを無視（深度で色が決まる）
+      // → つまりライトは “ほぼ意味がない”
+      // ただし、教材として「通常の材質にしたらライトが効く」という比較をしたい場合のため、
+      // 最低限の Ambient + Spot を置いておく。
+      // ============================================================
+      var ambientLight = new THREE.AmbientLight(0x0c0c0c);
+      scene.add(ambientLight);
+
+      var spotLight = new THREE.SpotLight(0xffffff);
+      spotLight.position.set(-40, 60, -10);
+      spotLight.castShadow = true;
+      scene.add(spotLight);
+
+      // ============================================================
+      // コントロール（dat.GUI）
+      // ============================================================
+      var controls = new function () {
+        this.cameraNear = camera.near;
+        this.cameraFar = camera.far;
+
+        // 回転速度（rad/frame くらいの感覚）
+        this.rotationSpeed = 0.02;
+
+        // 追加されているオブジェクト数（scene.children はライトも含むので、後で補正更新する）
+        this.numberOfObjects = 0;
+
+        // Color layer に使う色
+        this.color = 0x00ff00;
+
+        // ------------------------------------------------------------
+        // removeCube：最後に追加された Group（複合メッシュ）を削除する
+        // - scene.children の末尾が必ず Group とは限らないため、
+        //   後ろから探して Group を見つけたら消すようにする方が安全。
+        // ------------------------------------------------------------
+        this.removeCube = function () {
+          for (var i = scene.children.length - 1; i >= 0; i--) {
+            var obj = scene.children[i];
+            if (obj instanceof THREE.Group && obj.userData && obj.userData.isCombinedCube) {
+              scene.remove(obj);
+              break;
+            }
+          }
+          this.numberOfObjects = countCombined(scene);
+        };
+
+        // ------------------------------------------------------------
+        // addCube：複合材質の “箱” を1つ追加する
+        //
+        // 重要なポイント（アルゴリズム）
+        // - 同じ Geometry を2枚の Mesh で重ねる
+        //   1) color layer : MeshBasicMaterial + MultiplyBlending
+        //   2) depth layer : MeshDepthMaterial
+        // - 深度競合（Z-fighting）を避けるため、depth layer を 0.99 倍で内側に入れる
+        // - 描画順序を固定するため renderOrder を設定する
+        // ------------------------------------------------------------
+        this.addCube = function () {
+          var cubeSize = Math.ceil(3 + (Math.random() * 3));
+          var geom = new THREE.BoxGeometry(cubeSize, cubeSize, cubeSize);
+
+          // (A) 色レイヤー：乗算合成で “色が乗ってる感” を出す
+          // MeshBasicMaterial はライト計算をしないので、色が安定する（教材に向く）
+          var colorMaterial = new THREE.MeshBasicMaterial({
+            color: this.color,
+            transparent: true,
+            opacity: 1.0,
+            blending: THREE.MultiplyBlending,
+            depthWrite: true,   // 深度バッファに書く（通常は true）
+            depthTest: true
+          });
+
+          // (B) 深度レイヤー：距離に応じた濃淡
+          // 近いほど明るい（実装により逆もあり得る）/ far の設定で圧縮される
+          var depthMaterial = new THREE.MeshDepthMaterial({
+            // depthPacking を変えるとエンコードが変わる（教材拡張ポイント）
+            // depthPacking: THREE.BasicDepthPacking
+          });
+
+          // 2枚重ねの Group を作る（旧 SceneUtils の代替）
+          var group = new THREE.Group();
+          group.userData.isCombinedCube = true; // 削除判定用フラグ
+
+          var meshColor = new THREE.Mesh(geom, colorMaterial);
+          var meshDepth = new THREE.Mesh(geom, depthMaterial);
+
+          // Z-fighting 対策：ほんの少し小さくして深度競合を避ける
+          meshDepth.scale.set(0.99, 0.99, 0.99);
+
+          // 影（今回の材質では主題ではないが、旧コード踏襲）
+          meshColor.castShadow = true;
+          meshDepth.castShadow = true;
+
+          // 描画順序を固定する
+          // - まず depth を描いて、その上に色を乗せたい → depth を先、color を後
+          //   （逆にすると深度色が上に乗って “色が消える” 見え方になる）
+          meshDepth.renderOrder = 0;
+          meshColor.renderOrder = 1;
+
+          group.add(meshDepth);
+          group.add(meshColor);
+
+          // ランダム配置
+          group.position.x = -60 + Math.round((Math.random() * 100));
+          group.position.y = Math.round((Math.random() * 10));
+          group.position.z = -100 + Math.round((Math.random() * 150));
+
+          scene.add(group);
+
+          this.numberOfObjects = countCombined(scene);
+        };
+
+        this.outputObjects = function () {
+          console.log(scene.children);
+        };
+      };
+
+      // GUI
+      var gui = new dat.GUI();
+      gui.addColor(controls, "color").onChange(function () {
+        // 既存の Cube の色レイヤーも更新したい場合は traverse して material.color を更新する。
+        // 教材としては「新規追加分だけ色が変わる」でもOKだが、ここでは全体も更新する。
+        updateAllColorLayers(scene, controls.color);
+      });
+
+      gui.add(controls, "rotationSpeed", 0, 0.5);
+      gui.add(controls, "addCube");
+      gui.add(controls, "removeCube");
+
+      gui.add(controls, "cameraNear", 0, 50).onChange(function (e) {
+        camera.near = e;
+        camera.updateProjectionMatrix();
+      });
+
+      gui.add(controls, "cameraFar", 100, 300).onChange(function (e) {
+        camera.far = e;
+        camera.updateProjectionMatrix();
+      });
+
+      // 初期配置（10個）
+      for (var i = 0; i < 10; i++) {
+        controls.addCube();
+      }
+      controls.numberOfObjects = countCombined(scene);
+
+      // ============================================================
+      // render loop
+      // - Group を回転させる（2枚の Mesh が同じ回転を共有できる）
+      // - Mesh を個別に回すと “片方だけ回る/ズレる” 事故が起きやすい
+      // ============================================================
+      render();
+
+      function render() {
+        stats.update();
+
+        scene.traverse(function (obj) {
+          if (obj instanceof THREE.Group && obj.userData && obj.userData.isCombinedCube) {
+            obj.rotation.x += controls.rotationSpeed;
+            obj.rotation.y += controls.rotationSpeed;
+            obj.rotation.z += controls.rotationSpeed;
+          }
+        });
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ============================================================
+      // resize 対応
+      // ============================================================
+      window.addEventListener("resize", function () {
+        var w = window.innerWidth;
+        var h = window.innerHeight;
+
+        renderer.setSize(w, h);
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      });
+
+      // ============================================================
+      // ユーティリティ
+      // ============================================================
+      function countCombined(scene) {
+        var count = 0;
+        scene.traverse(function (obj) {
+          if (obj instanceof THREE.Group && obj.userData && obj.userData.isCombinedCube) count++;
+        });
+        return count;
+      }
+
+      function updateAllColorLayers(scene, color) {
+        scene.traverse(function (obj) {
+          if (obj instanceof THREE.Mesh && obj.material && obj.material.isMeshBasicMaterial) {
+            // MultiplyBlending の “色レイヤー” だけ更新したいが、
+            // 本サンプルでは MeshBasicMaterial を色レイヤーにしか使っていない前提で更新する。
+            obj.material.color = new THREE.Color(color);
+          }
+        });
+      }
+
+      // ============================================================
+      // initStats
+      // ============================================================
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
