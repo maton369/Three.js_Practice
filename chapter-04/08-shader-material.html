@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 04.08 - ShaderMaterial (ES Modules + fixed + detailed comments)</title>
+
+  <!--
+    ============================================================
+    このファイルの目的
+    ============================================================
+    - ShaderMaterial（自作GLSL）で「立方体の各面に別々のフラグメントシェーダ」を貼り、
+      time を進めてアニメーションするデモです。
+    - 旧コード（window.THREE / dat.gui / stats.js / MeshFaceMaterial など古いAPI）を
+      現行three.js（ES Modules）へ移植しつつ、コンパイルが壊れやすいGLSLのミスも修正しています。
+
+    ============================================================
+    旧コードの主な問題点（修正済み）
+    ============================================================
+    1) MeshFaceMaterial / MeshFaceMaterial.materials は廃止済み
+       - 現行three.jsでは「mesh.material に Material配列を渡す」方式を使います。
+       - BoxGeometry は最初から面ごとに group が切られているので、6個のMaterial配列を渡すだけでOKです。
+
+    2) Vertex shader が vUv を使うのに varying を渡していない
+       - fragment-shader-1 が varying vec2 vUv を参照していましたが、頂点側で vUv をセットしていませんでした。
+       - vUv = uv; を追加しました。
+
+    3) Vertex shader の括弧ミス
+       - posChanged.y の行が閉じ括弧不足でコンパイルエラーでした。
+       - abs(cos(...)) の括弧を修正しました。
+
+    4) Fragment shader の精度指定不足 / ループの書き方が不安定
+       - WebGL1/2で動きやすいよう precision 指定を補強。
+       - fragment-shader-1 の N=68.5 など「floatループ」が壊れやすいので、定数 int ループへ変更。
+
+    5) 解像度 uniform をリサイズで更新していない
+       - gl_FragCoord と resolution を使うシェーダは、リサイズ時に resolution を更新しないと見えが崩れます。
+       - resize ハンドラで共通 uniform の resolution を更新するようにしました。
+
+    ============================================================
+    注意（ライトについて）
+    ============================================================
+    - ShaderMaterial は「ライトが勝手に効く」わけではありません。
+      ここで表示される色はフラグメントシェーダが gl_FragColor に直接書いたものです。
+    - そのため、AmbientLight / SpotLight を置いても、シェーダ側でライト計算を書かなければ見えは変わりません。
+      （旧コードのライトは実質飾りでした）
+    - 今回は教材として、ライトは最小限にして「ShaderMaterialで描く」ことに集中します。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #Stats-output { position: absolute; left: 0; top: 0; }
+    #WebGL-output { position: relative; }
+  </style>
+</head>
+
+<body>
+  <!-- ==========================================================
+       GLSL（頂点シェーダ）
+       ==========================================================
+       - position を time に応じてスケール変形して、オブジェクトが脈動するように見せます
+       - vUv を fragment に渡します（UVが必要なシェーダがあるため）
+  -->
+  <script id="vertex-shader" type="x-shader/x-vertex">
+    precision highp float;
+
+    uniform float time;
+    varying vec2 vUv;
+
+    void main() {
+      // フラグメント側でUVを使えるように渡す
+      vUv = uv;
+
+      // time を使って頂点位置を変形
+      vec3 posChanged = position;
+
+      // abs(sin/cos) で 0..1 の係数にしてスケール変形
+      // 0付近になると形が潰れるので、好みで +0.2 など下駄を履かせてもよい
+      float sx = abs(sin(time * 1.0));
+      float sy = abs(cos(time * 1.0));
+      float sz = abs(sin(time * 1.0));
+
+      posChanged.x *= sx;
+      posChanged.y *= sy;  // ← 旧コードはここが括弧不足でコンパイルエラーだった
+      posChanged.z *= sz;
+
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(posChanged, 1.0);
+    }
+  </script>
+
+  <!-- ==========================================================
+       GLSL（フラグメントシェーダ 1）
+       ==========================================================
+       - 元のコードは「floatループ + N=68.5」など、環境により壊れやすい書き方だったため
+         intループ + N=68 にして安定させています。
+  -->
+  <script id="fragment-shader-1" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform float time;
+    uniform float alpha;
+    uniform vec2 resolution;
+    varying vec2 vUv;
+
+    #define PI 3.14159265359
+    #define TWO_PI (PI * 2.0)
+    #define N 68
+
+    void main() {
+      // gl_FragCoord は「画面上のピクセル座標」
+      // resolution は「画面サイズ（px）」なので、正規化してエフェクトを作る
+      vec2 v = (gl_FragCoord.xy - resolution / 20.0) / min(resolution.y, resolution.x) * 15.0;
+      v.x -= 10.0;
+      v.y -= 200.0;
+
+      float col = 0.0;
+
+      // 旧コード: for(float i=0.0; i<N; i++) で N=68.5 のような値 → 環境によってコンパイル失敗しやすい
+      // 改: intループにして安定化
+      for (int i = 0; i < N; i++) {
+        float fi = float(i);
+        float a = fi * (TWO_PI / float(N)) * 61.95;
+        col += cos(TWO_PI * (v.y * cos(a) + v.x * sin(a) + sin(time * 0.004) * 100.0));
+      }
+
+      col /= 5.0;
+
+      // 元の色味を踏襲（符号が混ざって派手になるタイプ）
+      vec3 rgb = vec3(col * 1.0, -col * 1.0, -col * 4.0);
+      gl_FragColor = vec4(rgb, alpha);
+    }
+  </script>
+
+  <!-- ==========================================================
+       GLSL（フラグメントシェーダ 2）
+       ==========================================================
+       - 元ネタの glsl.heroku の雰囲気を維持しつつ
+       - GLSLの atan は atan(y, x) が一般的なので、引数順を正しい形に修正しています
+         （元の意図が逆だった場合は戻してもOK）
+  -->
+  <script id="fragment-shader-2" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform float time;
+    uniform float alpha;
+    uniform vec2 resolution;
+
+    #define M_PI 3.14159265359
+
+    vec3 hsvtorgb(float h, float s, float v) {
+      float c = v * s;
+      h = mod((h * 6.0), 6.0);
+      float x = c * (1.0 - abs(mod(h, 2.0) - 1.0));
+      vec3 color;
+
+      if (0.0 <= h && h < 1.0)       color = vec3(c, x, 0.0);
+      else if (1.0 <= h && h < 2.0)  color = vec3(x, c, 0.0);
+      else if (2.0 <= h && h < 3.0)  color = vec3(0.0, c, x);
+      else if (3.0 <= h && h < 4.0)  color = vec3(0.0, x, c);
+      else if (4.0 <= h && h < 5.0)  color = vec3(x, 0.0, c);
+      else if (5.0 <= h && h < 6.0)  color = vec3(c, 0.0, x);
+      else                           color = vec3(0.0);
+
+      color += v - c;
+      return color;
+    }
+
+    void main(void) {
+      vec2 position = (gl_FragCoord.xy - 0.5 * resolution) / resolution.y;
+      float x = position.x;
+      float y = position.y;
+
+      // GLSLの atan は atan(y, x) が一般的（yが先）
+      float a = atan(y, x);
+
+      float d  = sqrt(x*x + y*y);
+      float d0 = 0.5 * (sin(d - time) + 1.5) * d;
+      float d1 = 5.0;
+
+      float u = mod(a * d1 + sin(d * 10.0 + time), M_PI * 2.0) / M_PI * 0.5 - 0.5;
+      float v = mod(pow(d0 * 4.0, 0.75), 1.0) - 0.5;
+
+      float dd = sqrt(u*u + v*v);
+
+      float aa = atan(v, u); // こちらも一般的な順序（y, x）
+
+      float uu = mod(aa * 3.0 + 3.0 * cos(dd * 30.0 - time), M_PI * 2.0) / M_PI * 0.5 - 0.5;
+      float d2 = sqrt(uu*uu + v*v) * 1.5;
+
+      vec3 rgb = hsvtorgb(dd + time * 0.5 / d1, sin(dd * time), d2);
+      gl_FragColor = vec4(rgb, alpha);
+    }
+  </script>
+
+  <!-- ==========================================================
+       GLSL（フラグメントシェーダ 3）
+  -->
+  <script id="fragment-shader-3" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform vec2 resolution;
+    uniform float time;
+    uniform float alpha;
+
+    vec2 rand(vec2 pos) {
+      return fract(0.00005 * (pow(pos + 2.0, pos.yx + 1.0) * 22222.0));
+    }
+
+    vec2 rand2(vec2 pos) {
+      return rand(rand(pos));
+    }
+
+    float softnoise(vec2 pos, float scale) {
+      vec2 smplpos = pos * scale;
+      float c0 = rand2((floor(smplpos) + vec2(0.0, 0.0)) / scale).x;
+      float c1 = rand2((floor(smplpos) + vec2(1.0, 0.0)) / scale).x;
+      float c2 = rand2((floor(smplpos) + vec2(0.0, 1.0)) / scale).x;
+      float c3 = rand2((floor(smplpos) + vec2(1.0, 1.0)) / scale).x;
+
+      vec2 a = fract(smplpos);
+      return mix(
+        mix(c0, c1, smoothstep(0.0, 1.0, a.x)),
+        mix(c2, c3, smoothstep(0.0, 1.0, a.x)),
+        smoothstep(0.0, 1.0, a.y)
+      );
+    }
+
+    void main(void) {
+      vec2 pos = gl_FragCoord.xy / resolution.y;
+      pos.x += time * 0.1;
+
+      float color = 0.0;
+      float s = 1.0;
+
+      for (int i = 0; i < 8; i++) {
+        color += softnoise(pos + vec2(float(i)) * 0.02, s * 4.0) / s / 2.0;
+        s *= 2.0;
+      }
+
+      gl_FragColor = vec4(vec3(color), alpha);
+    }
+  </script>
+
+  <!-- ==========================================================
+       GLSL（フラグメントシェーダ 4）
+       - 元コードの softnoise の mix の第3引数が a.x になっており、
+         y方向の補間が壊れていたので a.y に修正しています（ありがちなコピペミス）
+  -->
+  <script id="fragment-shader-4" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform float time;
+    uniform vec2 resolution;
+    uniform float alpha;
+
+    vec2 rand(vec2 pos) {
+      return fract(pow(pos + 2.0, pos.yx + 2.0) * 555555.0);
+    }
+
+    vec2 rand2(vec2 pos) {
+      return rand(rand(pos));
+    }
+
+    float softnoise(vec2 pos, float scale) {
+      vec2 smplpos = pos * scale;
+      float c0 = rand2((floor(smplpos) + vec2(0.0, 0.0)) / scale).x;
+      float c1 = rand2((floor(smplpos) + vec2(1.0, 0.0)) / scale).x;
+      float c2 = rand2((floor(smplpos) + vec2(0.0, 1.0)) / scale).x;
+      float c3 = rand2((floor(smplpos) + vec2(1.0, 1.0)) / scale).x;
+
+      vec2 a = fract(smplpos);
+
+      // 元: smoothstep(..., a.x) が最後も a.x で、縦方向補間が効いていなかった
+      // 改: 最後は a.y
+      return mix(
+        mix(c0, c1, smoothstep(0.0, 1.0, a.x)),
+        mix(c2, c3, smoothstep(0.0, 1.0, a.x)),
+        smoothstep(0.0, 1.0, a.y)
+      );
+    }
+
+    void main(void) {
+      vec2 pos = gl_FragCoord.xy / resolution.y - time * 0.4;
+
+      float color = 0.0;
+      float s = 1.0;
+
+      for (int i = 0; i < 6; i++) {
+        color += softnoise(pos + vec2(0.01 * float(i)), s * 4.0) / s / 2.0;
+        s *= 2.0;
+      }
+
+      // 元の派手なチャンネルミックスを踏襲（見た目目的）
+      gl_FragColor = vec4(color, mix(color, cos(color), sin(color)), color, alpha);
+    }
+  </script>
+
+  <!-- ==========================================================
+       GLSL（フラグメントシェーダ 5）
+  -->
+  <script id="fragment-shader-5" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform float time;
+    uniform vec2 resolution;
+    uniform float alpha;
+
+    void main(void) {
+      vec2 pos = ((1.4 * gl_FragCoord.xy - resolution.xy) / resolution.xx) * 1.5;
+      float r = sqrt(pos.x * pos.x + pos.y * pos.y) / 15.0;
+
+      float size1 = 2.0 * cos(time / 60.0);
+      float size2 = 2.5 * sin(time / 12.1);
+
+      float rot1 = 13.00;
+      float rot2 = -50.00;
+
+      float a = (60.0) * sin(rot1 * atan(pos.x - size1 * pos.y / max(r, 0.0001), pos.y + size1 * pos.x / max(r, 0.0001)) + time);
+      a += 200.0 * acos(pos.x * 2.0 + cos(time / 2.0)) + asin(pos.y * 5.0 + sin(time / 2.0));
+      a = a * (r / 50.0);
+      a = 200.0 * sin(a * 5.0) * (r / 30.0);
+
+      if (a > 5.0) a = a / 200.0;
+      if (a < 0.5) a = a * 22.5;
+
+      gl_FragColor = vec4(cos(a / 20.0), a * cos(a / 200.0), sin(a / 8.0), alpha);
+    }
+  </script>
+
+  <!-- ==========================================================
+       GLSL（フラグメントシェーダ 6）
+  -->
+  <script id="fragment-shader-6" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform float time;
+    uniform vec2 resolution;
+    uniform float alpha;
+
+    void main(void) {
+      vec2 uPos = (gl_FragCoord.xy / resolution.xy);
+
+      uPos.x -= 1.0;
+      uPos.y -= 0.5;
+
+      vec3 color = vec3(0.0);
+      float vertColor = 2.0;
+
+      for (float i = 0.0; i < 15.0; i += 1.0) {
+        float t = time * 0.9;
+
+        uPos.y += sin(uPos.x * i + t + i / 2.0) * 0.1;
+        float fTemp = abs(1.0 / uPos.y / 100.0);
+        vertColor += fTemp;
+
+        color += vec3(fTemp * (10.0 - i) / 10.0, fTemp * i / 10.0, pow(fTemp, 1.5) * 1.5);
+      }
+
+      gl_FragColor = vec4(color, alpha);
+    }
+  </script>
+
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let cube;
+
+    // 6面ぶんの ShaderMaterial
+    let materials = [];
+
+    // 共通Uniform（全マテリアルで参照を共有して同期させる）
+    // - time: アニメーション時間
+    // - alpha: 透過度（各フラグメントで gl_FragColor.a に使う）
+    // - resolution: 画面サイズ（gl_FragCoord を使うシェーダで必須）
+    const commonUniforms = {
+      time: { value: 0.0 },
+      alpha: { value: 1.0 },
+      resolution: { value: new THREE.Vector2(1, 1) }
+    };
+
+    // アニメーション状態
+    let step = 0;
+
+    // ============================================================
+    // 初期化
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // Scene
+      scene = new THREE.Scene();
+
+      // Camera
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(30, 30, 30);
+      camera.lookAt(0, 0, 0);
+
+      // Renderer
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(0x000000, 1.0);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // resolution uniform 初期値
+      updateResolutionUniform();
+
+      // ==========================================================
+      // BoxGeometry + Material配列
+      // ==========================================================
+      // - 現行three.jsでは「mesh.material = [mat0..mat5]」で面ごとに割り当てられます。
+      // - BoxGeometry は各面ごとに group が定義済みなので、そのまま6つ渡せばOKです。
+      const cubeGeometry = new THREE.BoxGeometry(20, 20, 20);
+
+      // 頂点シェーダは全て同じものを使い、面ごとにフラグメントだけ差し替える
+      const vertexId = "vertex-shader";
+
+      const meshMaterial1 = createShaderMaterial(vertexId, "fragment-shader-1");
+      const meshMaterial2 = createShaderMaterial(vertexId, "fragment-shader-2");
+      const meshMaterial3 = createShaderMaterial(vertexId, "fragment-shader-3");
+      const meshMaterial4 = createShaderMaterial(vertexId, "fragment-shader-4");
+      const meshMaterial5 = createShaderMaterial(vertexId, "fragment-shader-5");
+      const meshMaterial6 = createShaderMaterial(vertexId, "fragment-shader-6");
+
+      materials = [
+        meshMaterial1,
+        meshMaterial2,
+        meshMaterial3,
+        meshMaterial4,
+        meshMaterial5,
+        meshMaterial6
+      ];
+
+      cube = new THREE.Mesh(cubeGeometry, materials);
+      scene.add(cube);
+
+      // ==========================================================
+      // GUI（lil-gui）
+      // ==========================================================
+      // ShaderMaterialは「material.opacity」を変えてもシェーダが使わない限り反映されません。
+      // なので今回は「alpha uniform」をGUIで操作します。
+      const controls = {
+        rotationSpeed: 0.02,
+        timeSpeed: 0.6,      // time の進み具合（エフェクト速度）
+        alpha: 1.0,          // 共通 alpha（0..1）
+        transparent: true,   // blendingを使うか（マテリアル側）
+        side: "front",       // 表裏描画
+        wireframe: false,    // ワイヤーフレーム（ShaderMaterialでも可）
+        pause: false
+      };
+
+      const gui = new GUI({ title: "Controls" });
+
+      const fAnim = gui.addFolder("Animation");
+      fAnim.add(controls, "pause");
+      fAnim.add(controls, "rotationSpeed", 0, 0.2, 0.001);
+      fAnim.add(controls, "timeSpeed", 0, 3.0, 0.01);
+
+      const fMat = gui.addFolder("ShaderMaterial (common)");
+      fMat.add(controls, "alpha", 0, 1, 0.01).onChange((v) => {
+        commonUniforms.alpha.value = v;
+      });
+
+      fMat.add(controls, "transparent").onChange((v) => {
+        // material.transparent は「ブレンド有効化」のスイッチ
+        // 透過表現をしたいなら true にする
+        materials.forEach((m) => {
+          m.transparent = v;
+          m.needsUpdate = true;
+        });
+      });
+
+      fMat.add(controls, "wireframe").onChange((v) => {
+        materials.forEach((m) => {
+          m.wireframe = v;
+        });
+      });
+
+      fMat.add(controls, "side", ["front", "back", "double"]).onChange((v) => {
+        const side =
+          v === "front" ? THREE.FrontSide :
+          v === "back"  ? THREE.BackSide  :
+                          THREE.DoubleSide;
+
+        materials.forEach((m) => {
+          m.side = side;
+          m.needsUpdate = true;
+        });
+      });
+
+      // リサイズ対応
+      window.addEventListener("resize", onResize);
+
+      // ループ開始
+      render(controls);
+    }
+
+    // ============================================================
+    // レンダーループ
+    // ============================================================
+    function render(controls) {
+      stats.update();
+
+      if (!controls.pause) {
+        // 立方体自体の回転（形状変形 + 面ごとの模様が動いて見えて楽しい）
+        step += controls.rotationSpeed;
+        cube.rotation.set(step, step, step);
+
+        // time uniform（全マテリアル共通）を進める
+        // - 旧コードは materials.forEach で time.value += 0.01 していたが、
+        //   今回は共通uniform参照なので 1回の更新で全マテリアルに反映される
+        commonUniforms.time.value += 0.01 * controls.timeSpeed;
+      }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(() => render(controls));
+    }
+
+    // ============================================================
+    // ShaderMaterial を作るヘルパ
+    // ============================================================
+    function createShaderMaterial(vertexShaderId, fragmentShaderId) {
+      // <script id="..."> の中身（GLSL文字列）を取り出す
+      const vertShader = document.getElementById(vertexShaderId).textContent;
+      const fragShader = document.getElementById(fragmentShaderId).textContent;
+
+      // ShaderMaterial の uniforms は { name: { value: ... } } 形式が基本
+      // 共通uniformの参照を直接渡すことで「全マテリアルが同じ time/resolution/alpha を共有」できる
+      const uniforms = {
+        time: commonUniforms.time,
+        alpha: commonUniforms.alpha,
+        resolution: commonUniforms.resolution
+      };
+
+      const mat = new THREE.ShaderMaterial({
+        uniforms,
+        vertexShader: vertShader,
+        fragmentShader: fragShader,
+
+        // 透明表現をしたいので true（GUIで切替可能）
+        transparent: true
+      });
+
+      return mat;
+    }
+
+    // ============================================================
+    // リサイズ対応
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      updateResolutionUniform();
+    }
+
+    function updateResolutionUniform() {
+      // gl_FragCoord を使うシェーダは resolution が重要
+      commonUniforms.resolution.value.set(window.innerWidth, window.innerHeight);
+    }
+
+    // ============================================================
+    // Stats（FPS）
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0);
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
