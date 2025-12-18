@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 04.07 - Mesh Phong material (rough surface via low segments + flat shading)</title>
+
+  <!--
+    【要望】面を荒くしたい
+    - “面が荒い” には2種類ある:
+      (1) ジオメトリを荒くする（ポリゴン数を減らしてカクカクにする）
+          → SphereGeometry の widthSegments / heightSegments を小さくする
+      (2) シェーディングを荒くする（フラットシェーディングにして面ごとに法線を使う）
+          → material.flatShading = true（GUI でも切替できる）
+
+    今回は (1)+(2) の両方を入れて、確実に「面が荒い」見た目にする。
+    さらに GUI に “geometryDetail(粗さ)” を追加し、実行中にポリゴン数を変えられるようにする。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（render / resize で参照するもの）
+    // ============================================================
+    let scene, camera, renderer, stats;
+
+    let groundMesh;
+    let sphere, cube, plane;
+    let meshMaterial;
+
+    // ライト
+    let ambientLight, hemiLight, keySpotLight, keyDirLight;
+
+    // デバッグヘルパ
+    let spotHelper, dirHelper;
+
+    // アニメーション用
+    let step = 0;
+
+    // ============================================================
+    // ジオメトリ生成ユーティリティ
+    // ============================================================
+    function makeSphereGeometry(detail) {
+      // detail は GUI で操作する「粗さ」
+      // 小さいほどポリゴンが少なくなり、面が荒く（カクカク）見える
+      // 例: 6/6 → かなり荒い、12/12 → やや荒い、32/32 → 滑らか
+      const seg = Math.max(3, Math.floor(detail));
+      return new THREE.SphereGeometry(14, seg, seg);
+    }
+
+    function makeCubeGeometry() {
+      return new THREE.BoxGeometry(15, 15, 15);
+    }
+
+    function makePlaneGeometry() {
+      // 比較用の平面はシンプルでOK（ここを細分化しても面粗さの理解にはあまり寄与しない）
+      return new THREE.PlaneGeometry(14, 14, 1, 1);
+    }
+
+    // ============================================================
+    // init
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // ------------------------------------------------------------
+      // Camera
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-20, 30, 40);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ------------------------------------------------------------
+      // Renderer
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Ground（床）
+      // ------------------------------------------------------------
+      const groundGeom = new THREE.PlaneGeometry(100, 100, 4, 4);
+      const groundMat  = new THREE.MeshLambertMaterial({ color: 0x555555 });
+      groundMesh = new THREE.Mesh(groundGeom, groundMat);
+      groundMesh.rotation.x = -Math.PI / 2;
+      groundMesh.position.y = -20;
+      groundMesh.receiveShadow = true;
+      scene.add(groundMesh);
+
+      // ------------------------------------------------------------
+      // MeshPhongMaterial（本題）
+      // ------------------------------------------------------------
+      meshMaterial = new THREE.MeshPhongMaterial({
+        color: 0x7777ff,
+        specular: 0x555555,
+        shininess: 60,
+        emissive: 0x000000,
+
+        // ★面を荒く見せる（フラットシェーディング）
+        // これにより「各ポリゴン面ごとに」陰影が付くので、カクカク感が増す
+        flatShading: true
+      });
+      // flatShading を ON にしたらシェーダ再コンパイルが入る可能性があるので安全に needsUpdate
+      meshMaterial.needsUpdate = true;
+
+      // ------------------------------------------------------------
+      // Geometry（ここで “荒い球” を作る）
+      // ------------------------------------------------------------
+      const initialDetail = 10; // ここを小さくすると最初から荒い（例: 6）
+      const sphereGeometry = makeSphereGeometry(initialDetail);
+      const cubeGeometry   = makeCubeGeometry();
+      const planeGeometry  = makePlaneGeometry();
+
+      sphere = new THREE.Mesh(sphereGeometry, meshMaterial);
+      cube   = new THREE.Mesh(cubeGeometry,   meshMaterial);
+      plane  = new THREE.Mesh(planeGeometry,  meshMaterial);
+
+      sphere.position.set(0, 3, 2);
+      cube.position.copy(sphere.position);
+      plane.position.copy(sphere.position);
+
+      sphere.castShadow = true;
+      cube.castShadow = true;
+      plane.castShadow = true;
+
+      scene.add(cube);
+
+      // ------------------------------------------------------------
+      // Lights
+      // ------------------------------------------------------------
+      ambientLight = new THREE.AmbientLight(0x404040, 0.6);
+      scene.add(ambientLight);
+
+      hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.35);
+      hemiLight.position.set(0, 100, 0);
+      scene.add(hemiLight);
+
+      keyDirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+      keyDirLight.position.set(20, 40, 30);
+      keyDirLight.target.position.set(0, 0, 0);
+      scene.add(keyDirLight);
+      scene.add(keyDirLight.target);
+
+      // ★あなたの方針：SpotLight の decay は 0
+      keySpotLight = new THREE.SpotLight(0xffffff, 2.0);
+      keySpotLight.position.set(0, 30, 60);
+      keySpotLight.decay = 0;
+      keySpotLight.distance = 0;
+      keySpotLight.angle = Math.PI / 5;
+      keySpotLight.penumbra = 0.25;
+
+      keySpotLight.castShadow = true;
+      keySpotLight.shadow.mapSize.set(2048, 2048);
+      keySpotLight.shadow.bias = -0.0001;
+      keySpotLight.shadow.normalBias = 0.02;
+
+      keySpotLight.target.position.set(0, 0, 0);
+      scene.add(keySpotLight);
+      scene.add(keySpotLight.target);
+
+      spotHelper = new THREE.SpotLightHelper(keySpotLight);
+      spotHelper.visible = false;
+      scene.add(spotHelper);
+
+      dirHelper = new THREE.DirectionalLightHelper(keyDirLight, 10);
+      dirHelper.visible = false;
+      scene.add(dirHelper);
+
+      // ------------------------------------------------------------
+      // GUI
+      // ------------------------------------------------------------
+      const controls = {
+        rotationSpeed: 0.02,
+
+        // Material
+        color: meshMaterial.color.getStyle(),
+        emissive: `#${meshMaterial.emissive.getHexString()}`,
+        specular: `#${meshMaterial.specular.getHexString()}`,
+        shininess: meshMaterial.shininess,
+
+        // ★面の荒さ（球の分割数）
+        // 小さいほど面が荒い（カクカク）
+        sphereDetail: initialDetail,
+
+        // ★フラット/スムーズ（面の荒さ＝陰影の荒さ）
+        shading: "flat",
+
+        visible: meshMaterial.visible,
+        transparent: meshMaterial.transparent,
+        opacity: meshMaterial.opacity,
+        side: "front",
+
+        // Light
+        ambientIntensity: ambientLight.intensity,
+        hemiIntensity: hemiLight.intensity,
+        dirIntensity: keyDirLight.intensity,
+        spotIntensity: keySpotLight.intensity,
+
+        // Debug
+        showHelpers: false,
+
+        selectedMesh: "cube"
+      };
+
+      const gui = new GUI({ title: "Controls" });
+
+      const fMat = gui.addFolder("MeshPhongMaterial");
+
+      fMat.addColor(controls, "color").onChange((v) => meshMaterial.color.setStyle(v));
+      fMat.addColor(controls, "emissive").onChange((v) => (meshMaterial.emissive = new THREE.Color(v)));
+      fMat.addColor(controls, "specular").onChange((v) => (meshMaterial.specular = new THREE.Color(v)));
+      fMat.add(controls, "shininess", 0, 200, 1).onChange((v) => (meshMaterial.shininess = v));
+
+      // ★面を荒くする: ジオメトリ分割を変更して “ポリゴン自体” を粗くする
+      // - three.js のジオメトリは作り直しが基本（既存頂点数を後から安全に増減するのは難しい）
+      // - そのため「sphere.geometry を差し替える」実装にする
+      fMat.add(controls, "sphereDetail", 3, 64, 1).name("geometryDetail").onChange((v) => {
+        // 古いジオメトリは破棄して GPU メモリリークを防ぐ
+        sphere.geometry.dispose();
+        sphere.geometry = makeSphereGeometry(v);
+
+        // flatShading を使う場合、法線が見た目に効くので「念のため」法線再計算しておく
+        // （SphereGeometry は通常 OK だが、教材コードとして安全側）
+        sphere.geometry.computeVertexNormals();
+      });
+
+      // ★面を荒くする: シェーディングを flat にして “面ごとに” 陰影を付ける
+      fMat.add(controls, "shading", ["flat", "smooth"]).onChange((v) => {
+        meshMaterial.flatShading = (v === "flat");
+        meshMaterial.needsUpdate = true;
+      });
+
+      fMat.add(controls, "visible").onChange((v) => (meshMaterial.visible = v));
+      fMat.add(controls, "transparent").onChange((v) => {
+        meshMaterial.transparent = v;
+        meshMaterial.needsUpdate = true;
+      });
+      fMat.add(controls, "opacity", 0, 1, 0.01).onChange((v) => {
+        meshMaterial.opacity = v;
+        if (v < 1.0 && !meshMaterial.transparent) {
+          meshMaterial.transparent = true;
+          controls.transparent = true;
+        }
+      });
+
+      fMat.add(controls, "side", ["front", "back", "double"]).onChange((v) => {
+        switch (v) {
+          case "front":  meshMaterial.side = THREE.FrontSide;  break;
+          case "back":   meshMaterial.side = THREE.BackSide;   break;
+          case "double": meshMaterial.side = THREE.DoubleSide; break;
+        }
+        meshMaterial.needsUpdate = true;
+      });
+
+      const fLight = gui.addFolder("Lights");
+      fLight.add(controls, "ambientIntensity", 0, 2, 0.01).onChange((v) => (ambientLight.intensity = v));
+      fLight.add(controls, "hemiIntensity", 0, 2, 0.01).onChange((v) => (hemiLight.intensity = v));
+      fLight.add(controls, "dirIntensity", 0, 5, 0.01).onChange((v) => (keyDirLight.intensity = v));
+      fLight.add(controls, "spotIntensity", 0, 10, 0.01).onChange((v) => {
+        keySpotLight.intensity = v;
+        if (spotHelper.visible) spotHelper.update();
+      });
+
+      const fDbg = gui.addFolder("Debug");
+      fDbg.add(controls, "showHelpers").onChange((v) => {
+        spotHelper.visible = v;
+        dirHelper.visible = v;
+        if (v) { spotHelper.update(); dirHelper.update(); }
+      });
+
+      const fScene = gui.addFolder("Scene");
+      fScene.add(controls, "rotationSpeed", 0, 0.2, 0.001);
+      fScene.add(controls, "selectedMesh", ["cube", "sphere", "plane"]).onChange((v) => {
+        scene.remove(cube);
+        scene.remove(sphere);
+        scene.remove(plane);
+
+        switch (v) {
+          case "cube":   scene.add(cube);   break;
+          case "sphere": scene.add(sphere); break;
+          case "plane":  scene.add(plane);  break;
+        }
+      });
+
+      // ------------------------------------------------------------
+      // Resize
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // Render loop
+      // ------------------------------------------------------------
+      render(controls);
+    }
+
+    // ============================================================
+    // render
+    // ============================================================
+    function render(controls) {
+      stats.update();
+
+      step += controls.rotationSpeed;
+
+      cube.rotation.y = step;
+      sphere.rotation.y = step;
+      plane.rotation.y = step;
+
+      if (spotHelper.visible) spotHelper.update();
+      if (dirHelper.visible) dirHelper.update();
+
+      requestAnimationFrame(() => render(controls));
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // resize
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // stats
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
