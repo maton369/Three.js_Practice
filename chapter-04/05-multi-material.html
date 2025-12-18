@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 04.05 - Mesh face material (ES Modules + detailed comments)</title>
+
+  <!--
+    【修正方針（旧 → 新）】
+    - 旧: <script src="../libs/three.js"> で window.THREE を使う構成
+    - 新: ES Modules + importmap で three を import する構成（現行 three.js に寄せる）
+    - 旧: THREE.MultiMaterial / SceneUtils など、現在は廃止・非推奨なAPIが混ざる
+    - 新: Mesh に「material配列」を渡す（BufferGeometryの groups が materialIndex を参照して面ごとに材質を切り替える）
+
+    【このサンプルの主題（アルゴリズム）】
+    1) “面ごとに色が違う材質配列(materials[])” を用意する
+    2) BoxGeometry が持つ groups（= 6面分の描画グループ）に対して materialIndex が割り当てられる
+       → Mesh(geometry, materialsArray) とするだけで、各面が materialsArray[0..5] を参照して描画される
+    3) それを 3×3×3 のループで複製し、Group に束ねて一括回転する
+    4) GUI で rotationSpeed を変え、render ループで group.rotation を更新する
+
+    【注意（重要）】
+    - MeshBasicMaterial は “ライトの影響を受けない” 材質である
+      → ルービックキューブの色はライト無しでも見える
+    - 一方、床は Lambert にしているのでライトが必要（床の陰影で立体感を少し出す）
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（resize / render で使う）
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let group;                 // 3×3×3 のキューブ群を束ねる親
+    let step = 0;              // 回転角の積算用
+
+    // ============================================================
+    // init：初期化（Scene構築 → GUI → ループ開始）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Camera
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      // 旧コードは position を二回代入していたので整理（最終値だけ残す）
+      camera.position.set(-30, 30, 30);
+      camera.lookAt(scene.position);
+
+      // ------------------------------------------------------------
+      // Renderer
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      renderer.setClearColor(new THREE.Color(0xeeeeee), 1.0);
+
+      // 色テクスチャを使っていなくても、表示の一貫性のために sRGB を明示
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      // このサンプルは影が主題ではないので OFF（旧コード踏襲）
+      renderer.shadowMap.enabled = false;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Ground（床）
+      // - 床は Lambert にして、ライトが当たっていることが分かるようにする
+      // - ルービックキューブ本体は Basic なのでライトに依存しない
+      // ------------------------------------------------------------
+      const planeGeometry = new THREE.PlaneGeometry(60, 40, 1, 1);
+      const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+      const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+      plane.rotation.x = -0.5 * Math.PI;
+      plane.position.set(0, -2, 0);
+      scene.add(plane);
+
+      // ------------------------------------------------------------
+      // Light
+      // - MeshBasicMaterial はライト不要だが、床が Lambert なのでライトは必要
+      // - ★方針：SpotLight/PointLight の decay は 0 をデフォルトにする
+      // ------------------------------------------------------------
+      const spotLight = new THREE.SpotLight(0xffffff, 1.0);
+      spotLight.position.set(-40, 60, -10);
+      spotLight.decay = 0;     // ★方針（距離減衰を無効化）
+      spotLight.distance = 0;  // 0 は無限（減衰なしのイメージ）
+      spotLight.target.position.set(0, 0, 0);
+      scene.add(spotLight);
+      scene.add(spotLight.target);
+
+      // ------------------------------------------------------------
+      // “面ごとの材質” を作る（ここが本題）
+      // ------------------------------------------------------------
+      // BoxGeometry は内部で「6面（+X,-X,+Y,-Y,+Z,-Z）」ぶんの groups を持ち、
+      // group.materialIndex が 0..5 を参照する。
+      //
+      // 旧コードは 12個（2三角形×6面）ぶん material を用意していたが、
+      // 現代の BoxGeometry は “面単位（= 6）” で materialIndex が振られているため、
+      // materials は 6個で十分である（= 各面の2三角形は同じ material を使う）。
+      const faceMaterials = [
+        new THREE.MeshBasicMaterial({ color: 0x009e60 }), // 0: green
+        new THREE.MeshBasicMaterial({ color: 0x0051ba }), // 1: blue
+        new THREE.MeshBasicMaterial({ color: 0xffd500 }), // 2: yellow
+        new THREE.MeshBasicMaterial({ color: 0xff5800 }), // 3: orange
+        new THREE.MeshBasicMaterial({ color: 0xc41e3a }), // 4: red
+        new THREE.MeshBasicMaterial({ color: 0xffffff })  // 5: white
+      ];
+
+      // ------------------------------------------------------------
+      // 3×3×3 の “小キューブ群” を作って Group にまとめる
+      // ------------------------------------------------------------
+      group = new THREE.Group();
+
+      // 同じジオメトリを 27個に使い回す（毎回 new しない）
+      const cubeGeom = new THREE.BoxGeometry(2.9, 2.9, 2.9);
+
+      // 配置アルゴリズム：
+      // - x,z は -3,0,3 に並べる（中心(0,*,0)を基準）
+      // - y は 0,3,6 に並べる（床より少し上）
+      // - 3 を掛けるのは、立方体サイズ(2.9)より少し大きい間隔を確保するため（隙間ができて分かりやすい）
+      for (let x = 0; x < 3; x++) {
+        for (let y = 0; y < 3; y++) {
+          for (let z = 0; z < 3; z++) {
+
+            // Mesh(geometry, materials[]) とすると、
+            // geometry.groups の materialIndex に応じて materials[i] が面ごとに適用される
+            const cube = new THREE.Mesh(cubeGeom, faceMaterials);
+
+            cube.position.set(
+              x * 3 - 3,
+              y * 3,
+              z * 3 - 3
+            );
+
+            group.add(cube);
+          }
+        }
+      }
+
+      scene.add(group);
+
+      // ------------------------------------------------------------
+      // GUI（lil-gui）
+      // ------------------------------------------------------------
+      const controls = {
+        rotationSpeed: 0.02
+      };
+
+      const gui = new GUI({ title: "Controls" });
+      gui.add(controls, "rotationSpeed", 0, 0.5, 0.001);
+
+      // ------------------------------------------------------------
+      // Resize
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // Render loop start
+      // ------------------------------------------------------------
+      render(controls);
+    }
+
+    // ============================================================
+    // render：毎フレーム更新
+    // - Group を回すことで 27個のキューブを一括で回転させる
+    //   → 個別に回すより「構造が分かりやすい」「操作が一貫する」
+    // ============================================================
+    function render(controls) {
+      stats.update();
+
+      step += controls.rotationSpeed;
+      group.rotation.y = step;
+
+      requestAnimationFrame(() => render(controls));
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // onResize：画面サイズ変更への追従
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // Stats：FPS 表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
