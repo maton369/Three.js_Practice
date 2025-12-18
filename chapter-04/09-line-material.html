@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 04.09 - Line material (ES Modules + fixed BufferGeometry + detailed comments)</title>
+
+  <!--
+    【修正方針】
+    - 旧: <script src="../libs/three.js"> で window.THREE を使う構成
+    - 新: ES Modules + importmap で three.js を import（現行threeに寄せる）
+    - 旧: THREE.Geometry（廃止） + lines.vertices / lines.colors（廃止）
+    - 新: BufferGeometry + position/color 属性（attribute）で線分を構築する
+
+    【このサンプルの狙い（アルゴリズムの骨格）】
+    1) Gosper曲線（フラクタル）を「タートルグラフィックス」で点列に展開する
+       - turtle = [x, y, angleDeg] を状態として持つ
+       - fd(dist) で前進して線分を生成（点を追加）
+       - rt/lt で角度を回す
+       - rg/gl という再帰ルールで曲線を増殖させる
+    2) 生成された点列を Line の BufferGeometry に変換する
+       - position: 各頂点の座標（Float32Array）
+       - color: 各頂点の色（Float32Array）
+       - LineBasicMaterial({ vertexColors: true }) で頂点カラーを有効化
+    3) 毎フレーム line を回転させて表示する（見栄えのため）
+
+    【重要：旧コードの不具合もついでに修正】
+    - 旧コードは z = sin(count)*5 だが count を増やしていないため常に sin(0)=0 になり、z変化が出ない。
+      → fd() を呼ぶたびに count++ して波打ちが出るように修正。
+
+    【注意：linewidthについて】
+    - WebGL1/多くの環境では LineBasicMaterial.linewidth はほぼ無視され、常に 1px 扱いになりがち。
+      太い線が必要なら three/examples の Line2（fat lines）系を使うのが定石。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+
+    // ============================================================
+    // グローバル（render / resize から触る）
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let line;
+    let step = 0;
+
+    // ============================================================
+    // init
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene
+      // 線（LineBasicMaterial）は「ライトの影響を受けない」ので、
+      // Ambient/SpotLight は教材として不要。シンプルにする。
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Camera
+      // 旧コードの雰囲気を踏襲しつつ、少し見やすい位置に置く
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+      camera.position.set(-30, 40, 30);
+      camera.lookAt(0, 0, 0);
+
+      // ------------------------------------------------------------
+      // Renderer
+      // - 背景は黒
+      // - 頂点カラーを“想定どおりの色”で見せるため、出力色空間を sRGB に
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(0x000000, 1.0);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // 1) Gosper曲線を点列として生成（フラクタルの“幾何”部分）
+      // ------------------------------------------------------------
+      // a: 再帰の深さ（大きいほど細かくなるが、点が爆増する）
+      // b: 初期の線分長（大きいほど全体スケールが大きい）
+      const points = gosper(4, 60);
+
+      // ------------------------------------------------------------
+      // 2) 点列 -> BufferGeometry（GPUに渡す形）
+      // ------------------------------------------------------------
+      const geometry = buildColoredLineGeometry(points);
+
+      // ------------------------------------------------------------
+      // 3) Material（LineBasicMaterial）
+      // - vertexColors: true で attribute.color を使用する
+      // - linewidth: 多くの環境で効かない（注意コメント参照）
+      // ------------------------------------------------------------
+      const material = new THREE.LineBasicMaterial({
+        vertexColors: true,
+        transparent: false,
+        opacity: 1.0,
+        linewidth: 1
+      });
+
+      line = new THREE.Line(geometry, material);
+
+      // 旧コードの配置を踏襲（生成点の座標系が2D寄りなので、位置で画面中央に寄せる）
+      line.position.set(25, -30, -60);
+
+      scene.add(line);
+
+      // ------------------------------------------------------------
+      // Resize
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // Render loop
+      // ------------------------------------------------------------
+      render();
+    }
+
+    // ============================================================
+    // buildColoredLineGeometry
+    // 点列を position/color attribute を持つ BufferGeometry に変換する
+    // ============================================================
+    function buildColoredLineGeometry(points) {
+      // points は THREE.Vector3 の配列（線の頂点列）
+      const n = points.length;
+
+      // position: [x0,y0,z0, x1,y1,z1, ...]
+      const positions = new Float32Array(n * 3);
+
+      // color: [r0,g0,b0, r1,g1,b1, ...]（0..1）
+      const colors = new Float32Array(n * 3);
+
+      const c = new THREE.Color();
+
+      for (let i = 0; i < n; i++) {
+        const p = points[i];
+
+        positions[i * 3 + 0] = p.x;
+        positions[i * 3 + 1] = p.y;
+        positions[i * 3 + 2] = p.z;
+
+        // 旧コードの「点ごとに色相を変える」ロジックを踏襲しつつ、値域を少し安定化
+        // - H: xに応じて変化（大域的なグラデ）
+        // - S: yに応じて変化（局所的な変化）
+        // - L: 固定気味（暗すぎ/明るすぎを避ける）
+        const h = (p.x / 100 + 0.5) % 1.0;
+        const s = THREE.MathUtils.clamp((p.y * 20) / 300, 0.0, 1.0);
+        const l = 0.8;
+
+        c.setHSL(h, s, l);
+
+        colors[i * 3 + 0] = c.r;
+        colors[i * 3 + 1] = c.g;
+        colors[i * 3 + 2] = c.b;
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+      // Line は法線不要だが、バウンディングはカメラ最適化に使われることがあるので計算しておく
+      geometry.computeBoundingSphere();
+
+      return geometry;
+    }
+
+    // ============================================================
+    // render
+    // ============================================================
+    function render() {
+      stats.update();
+
+      step += 0.01;
+      line.rotation.z = step;
+
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // resize
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // gosper
+    // Gosper曲線を「タートルグラフィックス」で生成して点列を返す
+    // ============================================================
+    function gosper(a, b) {
+      // turtle = [x, y, angleDeg]
+      const turtle = [0, 0, 0];
+      const points = [];
+
+      // 旧コードは count を増やしておらず、zが常に0になる不具合があった。
+      // ここでは fd() を呼ぶたびに count++ して、z方向に波打ちを付ける。
+      let count = 0;
+
+      // 再帰ルールを開始
+      rg(a, b);
+
+      return points;
+
+      // --------------------------
+      // タートル操作
+      // --------------------------
+      function rt(deg) { turtle[2] += deg; } // right turn
+      function lt(deg) { turtle[2] -= deg; } // left turn
+
+      function fd(dist) {
+        // 進む前の点
+        points.push(new THREE.Vector3(turtle[0], Math.sin(count) * 5, turtle[1]));
+
+        const dir = turtle[2] * (Math.PI / 180);
+        turtle[0] += Math.cos(dir) * dist;
+        turtle[1] += Math.sin(dir) * dist;
+
+        count++;
+
+        // 進んだ後の点
+        points.push(new THREE.Vector3(turtle[0], Math.sin(count) * 5, turtle[1]));
+      }
+
+      // --------------------------
+      // Gosperの再帰ルール（rg / gl）
+      // - st: 残りステップ（深さ）
+      // - ln: 線分長（再帰で縮む）
+      // --------------------------
+      function rg(st, ln) {
+        st--;
+        ln = ln / 2.6457; // Gosper曲線の縮尺係数（旧コード踏襲）
+
+        if (st > 0) {
+          rg(st, ln);
+          rt(60);
+          gl(st, ln);
+          rt(120);
+          gl(st, ln);
+          lt(60);
+          rg(st, ln);
+          lt(120);
+          rg(st, ln);
+          rg(st, ln);
+          lt(60);
+          gl(st, ln);
+          rt(60);
+        }
+
+        if (st === 0) {
+          fd(ln);
+          rt(60);
+          fd(ln);
+          rt(120);
+          fd(ln);
+          lt(60);
+          fd(ln);
+          lt(120);
+          fd(ln);
+          fd(ln);
+          lt(60);
+          fd(ln);
+          rt(60);
+        }
+      }
+
+      function gl(st, ln) {
+        st--;
+        ln = ln / 2.6457;
+
+        if (st > 0) {
+          lt(60);
+          rg(st, ln);
+          rt(60);
+          gl(st, ln);
+          gl(st, ln);
+          rt(120);
+          gl(st, ln);
+          rt(60);
+          rg(st, ln);
+          lt(120);
+          rg(st, ln);
+          lt(60);
+          gl(st, ln);
+        }
+
+        if (st === 0) {
+          lt(60);
+          fd(ln);
+          rt(60);
+          fd(ln);
+          fd(ln);
+          rt(120);
+          fd(ln);
+          rt(60);
+          fd(ln);
+          lt(120);
+          fd(ln);
+          lt(60);
+          fd(ln);
+        }
+      }
+    }
+
+    // ============================================================
+    // initStats
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
