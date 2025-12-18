@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 04.04 - MeshNormalMaterial (ES Modules + detailed comments)</title>
+
+  <!--
+    【修正方針（現行three.js向け）】
+    - 旧: <script src="../libs/three.js"> で window.THREE を使う構成
+    - 新: ES Modules + importmap で three を import する構成（現行three.jsに寄せる）
+    - 旧: CanvasRenderer / Projector は現行threeでは廃止済みなので削除
+      - 代わりに WebGLRenderer のみを使用する（現代の標準）
+    - 旧: Geometry.faces / vertices を参照して法線矢印を出す処理があるが、
+      - 現行は BufferGeometry が基本で faces/vertices が存在しない
+      - そのため「ArrowHelperを大量生成する手法」はやめて、
+        代替として VertexNormalsHelper（addons）で“法線可視化”を提供する
+
+    【このサンプルの狙い（アルゴリズム）】
+    - MeshNormalMaterial を使い、ライト無しでも“法線方向”が色として見えることを確認する
+      - 表示色は (normal.xyz) を 0..1 に再マップしたものに近い
+    - GUIで material の状態（opacity/transparent/side/wireframe）や、
+      表示対象メッシュ（cube/sphere/plane）を切り替える
+    - アニメーション（回転）で法線色の変化が直感的に分かるようにする
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+    import { VertexNormalsHelper } from "three/addons/helpers/VertexNormalsHelper.js";
+
+    // ============================================================
+    // グローバル（render / resize / GUI から参照するもの）
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let groundMesh;
+    let sphere, cube, plane;
+    let meshMaterial;
+    let normalsHelper; // “法線可視化”用の補助（旧: faces/vertices + ArrowHelper を置き換え）
+
+    // アニメーション用
+    let step = 0;
+
+    // ============================================================
+    // init：初期化（シーン構築 → GUI → render loop）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene：全オブジェクトの入れ物
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Camera：透視投影
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      // 旧コードの雰囲気を踏襲（斜め上から見下ろす）
+      camera.position.set(-20, 30, 40);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ------------------------------------------------------------
+      // Renderer：WebGLRenderer のみ使用（CanvasRenderer は廃止済み）
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      renderer.setClearColor(new THREE.Color(0xeeeeee), 1.0);
+
+      // 影はこのサンプルの主題ではないが、旧コードの意図を残すならONでもOK
+      // ※ただし MeshNormalMaterial 自体はライト影響を受けない（法線色表示）ので、
+      //   “影が見える/見えない”は主題とズレる点に注意。
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Ground：床（MeshBasicMaterial で固定色）
+      // - MeshNormalMaterial は法線色が派手なので、床は中立な灰色にする
+      // ------------------------------------------------------------
+      const groundGeom = new THREE.PlaneGeometry(100, 100, 4, 4);
+      const groundMat = new THREE.MeshBasicMaterial({ color: 0x777777 });
+      groundMesh = new THREE.Mesh(groundGeom, groundMat);
+
+      // PlaneGeometry はXYなので床にするためXZへ寝かす
+      groundMesh.rotation.x = -Math.PI / 2;
+      groundMesh.position.y = -20;
+
+      // 影の受けは設定してもよいが、主題は法線表示なので必須ではない
+      groundMesh.receiveShadow = true;
+
+      scene.add(groundMesh);
+
+      // ------------------------------------------------------------
+      // Geometry：表示対象（sphere / cube / plane）
+      // ------------------------------------------------------------
+      const sphereGeometry = new THREE.SphereGeometry(14, 20, 20);
+      const cubeGeometry = new THREE.BoxGeometry(15, 15, 15);
+      const planeGeometry = new THREE.PlaneGeometry(14, 14, 4, 4);
+
+      // ------------------------------------------------------------
+      // Material：MeshNormalMaterial
+      // - ライト不要（法線ベクトルが色になる）
+      // - object の向き/回転で色が変化して見える
+      // ------------------------------------------------------------
+      meshMaterial = new THREE.MeshNormalMaterial({
+        // flatShading を true にすると、面ごとにカクっとした法線色になる
+        // false（デフォルト）なら頂点法線補間で滑らかに見える
+        flatShading: false
+      });
+
+      // Mesh を作成（位置は共有してよいが、参照代入は避けて set で揃える）
+      sphere = new THREE.Mesh(sphereGeometry, meshMaterial);
+      cube   = new THREE.Mesh(cubeGeometry, meshMaterial);
+      plane  = new THREE.Mesh(planeGeometry, meshMaterial);
+
+      // 旧コードの位置を踏襲
+      const basePos = new THREE.Vector3(0, 3, 2);
+      sphere.position.copy(basePos);
+      cube.position.copy(basePos);
+      plane.position.copy(basePos);
+
+      // 影は MeshNormalMaterial の “色” とは別だが、見た目を合わせるなら castShadow もON
+      sphere.castShadow = true;
+      cube.castShadow = true;
+      plane.castShadow = true;
+
+      // 初期表示は cube（旧コード踏襲）
+      scene.add(cube);
+
+      // ------------------------------------------------------------
+      // Lights：MeshNormalMaterial はライト不要だが、旧コードの構成を残す
+      // - ただし「ライトで明るくする」効果は MeshNormalMaterial には効かない
+      // - 影のテスト等をしない限り、ライトは教育上“あってもなくても同じ”に見える
+      // ------------------------------------------------------------
+      const ambientLight = new THREE.AmbientLight(0x0c0c0c, 1.0);
+      scene.add(ambientLight);
+
+      const spotLight = new THREE.SpotLight(0xffffff, 1.0);
+      spotLight.position.set(-40, 60, -10);
+      spotLight.castShadow = true;
+      // ★方針：SpotLight/PointLight の decay は 0
+      spotLight.decay = 0;
+      spotLight.distance = 0;
+      scene.add(spotLight);
+
+      // ------------------------------------------------------------
+      // 法線可視化（旧 ArrowHelper 群の代替）
+      // - VertexNormalsHelper は BufferGeometry に対して頂点法線を線で表示する
+      // - GUIで ON/OFF できるようにする
+      // ------------------------------------------------------------
+      normalsHelper = new VertexNormalsHelper(cube, 2, 0x3333ff);
+      normalsHelper.visible = false;
+      scene.add(normalsHelper);
+
+      // ------------------------------------------------------------
+      // GUI：material と表示対象を操作
+      // ------------------------------------------------------------
+      const controls = {
+        rotationSpeed: 0.02,
+
+        // material parameters
+        opacity: meshMaterial.opacity,
+        transparent: meshMaterial.transparent,
+        visible: meshMaterial.visible,
+        side: "front",
+        wireframe: meshMaterial.wireframe,
+        wireframeLinewidth: meshMaterial.wireframeLinewidth,
+
+        // extras
+        flatShading: meshMaterial.flatShading,
+        showNormals: false,
+
+        // selection
+        selectedMesh: "cube"
+      };
+
+      const gui = new GUI({ title: "Controls" });
+
+      const fMesh = gui.addFolder("MeshNormalMaterial");
+      fMesh.add(controls, "opacity", 0, 1, 0.01).onChange((v) => {
+        meshMaterial.opacity = v;
+      });
+      fMesh.add(controls, "transparent").onChange((v) => {
+        meshMaterial.transparent = v;
+        meshMaterial.needsUpdate = true;
+      });
+      fMesh.add(controls, "visible").onChange((v) => {
+        meshMaterial.visible = v;
+      });
+      fMesh.add(controls, "wireframe").onChange((v) => {
+        meshMaterial.wireframe = v;
+        meshMaterial.needsUpdate = true;
+      });
+
+      // ※ wireframeLinewidth は WebGL の実装依存で効かないことが多い（多くの環境で1固定）
+      fMesh.add(controls, "wireframeLinewidth", 0, 20, 1).onChange((v) => {
+        meshMaterial.wireframeLinewidth = v;
+      });
+
+      fMesh.add(controls, "side", ["front", "back", "double"]).onChange((v) => {
+        switch (v) {
+          case "front":
+            meshMaterial.side = THREE.FrontSide;
+            break;
+          case "back":
+            meshMaterial.side = THREE.BackSide;
+            break;
+          case "double":
+            meshMaterial.side = THREE.DoubleSide;
+            break;
+        }
+        meshMaterial.needsUpdate = true;
+      });
+
+      fMesh.add(controls, "flatShading").onChange((v) => {
+        // flatShading を変えたら再コンパイルが走るため needsUpdate が必要
+        meshMaterial.flatShading = v;
+        meshMaterial.needsUpdate = true;
+      });
+
+      fMesh.add(controls, "showNormals").onChange((v) => {
+        normalsHelper.visible = v;
+      });
+
+      const fScene = gui.addFolder("Scene");
+      fScene.add(controls, "rotationSpeed", 0, 0.2, 0.001);
+
+      fScene.add(controls, "selectedMesh", ["cube", "sphere", "plane"]).onChange((v) => {
+        // まず全部外す（“表示対象は常に1つ”）
+        scene.remove(cube);
+        scene.remove(sphere);
+        scene.remove(plane);
+
+        // 表示対象を追加
+        switch (v) {
+          case "cube":
+            scene.add(cube);
+            // 法線ヘルパは表示対象に追従させる
+            normalsHelper.parent?.remove(normalsHelper);
+            normalsHelper = new VertexNormalsHelper(cube, 2, 0x3333ff);
+            normalsHelper.visible = controls.showNormals;
+            scene.add(normalsHelper);
+            break;
+
+          case "sphere":
+            scene.add(sphere);
+            normalsHelper.parent?.remove(normalsHelper);
+            normalsHelper = new VertexNormalsHelper(sphere, 2, 0x3333ff);
+            normalsHelper.visible = controls.showNormals;
+            scene.add(normalsHelper);
+            break;
+
+          case "plane":
+            scene.add(plane);
+            normalsHelper.parent?.remove(normalsHelper);
+            normalsHelper = new VertexNormalsHelper(plane, 2, 0x3333ff);
+            normalsHelper.visible = controls.showNormals;
+            scene.add(normalsHelper);
+            break;
+        }
+      });
+
+      // ------------------------------------------------------------
+      // resize
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // loop
+      // ------------------------------------------------------------
+      render(controls);
+    }
+
+    // ============================================================
+    // render：毎フレーム更新
+    // - 表示中オブジェクトを回転させる
+    // - MeshNormalMaterial は回転で色が変わるので教材として分かりやすい
+    // ============================================================
+    function render(controls) {
+      stats.update();
+
+      step += controls.rotationSpeed;
+
+      // “表示中”のメッシュだけ回転させたいので、scene.children を素直に探す
+      // - groundMesh / lights / helper もいるため Mesh だけ対象にする
+      scene.traverse((obj) => {
+        if (obj instanceof THREE.Mesh && obj !== groundMesh) {
+          obj.rotation.y = step;
+        }
+      });
+
+      // 法線ヘルパは対象メッシュの更新に追従させる必要がある
+      if (normalsHelper && normalsHelper.visible) normalsHelper.update();
+
+      requestAnimationFrame(() => render(controls));
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // resize：画面リサイズ対応
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // stats：FPS表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
