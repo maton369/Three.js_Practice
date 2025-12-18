@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 04.06 - MeshLambertMaterial (ES Modules + detailed comments)</title>
+
+  <!--
+    【修正方針（これまでの流れに合わせる）】
+    - 旧: ../libs/three.js / stats.js / dat.gui.js を <script> 直読みして window.THREE を使う
+    - 新: ES Modules + importmap で three を import（現行 three.js の作法に寄せる）
+    - 旧: CanvasRenderer / Projector（廃止系・現行threeでは基本使わない）→ 削除
+    - GUI: dat.gui 互換の lil-gui を three/addons から読む
+    - Stats: three/addons から読む
+
+    【このサンプルの狙い（アルゴリズムの中心）】
+    - MeshLambertMaterial（拡散反射）を使うと「ライトの当たり方」に応じて明るさが変わることを観察する
+    - GUIで material のプロパティ（opacity/transparent/visible/emissive/side/color）を変え、
+      “シェーダ設定の変更 → needsUpdate が必要な場合がある” という流れを理解する
+    - 表示メッシュ（cube/sphere/plane）を切り替えることで、同じMaterialでも形状により見え方が変わることを比較する
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（render / resize から参照するもの）
+    // ============================================================
+    let scene, camera, renderer, stats;
+
+    // 比較用メッシュ（同じ Material を貼り替えて見え方を比較する）
+    let sphere, cube, plane;
+
+    // 共有Material（GUIでいじる対象）
+    let meshMaterial;
+
+    // アニメーション用
+    let step = 0;
+
+    // ============================================================
+    // init：初期化（シーン構築 → GUI → ループ開始）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene：オブジェクトの入れ物
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+
+      // ------------------------------------------------------------
+      // Camera：Perspective（透視投影）
+      // near を小さくしすぎると深度精度が落ちるので 0.1 程度が無難
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      // 旧コード踏襲（少し上から斜めに見る）
+      camera.position.set(-20, 30, 40);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ------------------------------------------------------------
+      // Renderer：WebGLRenderer のみ使用（CanvasRendererは廃止系）
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xeeeeee), 1.0);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // 影を使う場合は enabled を true にする（この例では床の影が見える）
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      // DOMに差し込む
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Ground：床（影を受ける）
+      // - Material は Basic にして「床は常に一定色」でも良いが、
+      //   教材として “影やライトの影響” を見せたいので Lambert/Phong を選ぶのもアリ。
+      //   ここでは旧コードの雰囲気を残し、床は暗めの Basic にする。
+      // ------------------------------------------------------------
+      const groundGeom = new THREE.PlaneGeometry(100, 100, 4, 4);
+      const groundMat = new THREE.MeshBasicMaterial({ color: 0x555555 });
+      const groundMesh = new THREE.Mesh(groundGeom, groundMat);
+
+      // PlaneGeometry はXY平面なので、床にするためX軸回転でXZに寝かせる
+      groundMesh.rotation.x = -Math.PI / 2;
+      groundMesh.position.y = -20;
+
+      // 影を受けたいので receiveShadow = true（ただし Basic はライト影響を受けない）
+      // 影“だけ”は落ちるので、床に影を見せたいなら receiveShadow を有効化する価値がある
+      groundMesh.receiveShadow = true;
+
+      scene.add(groundMesh);
+
+      // ------------------------------------------------------------
+      // Geometry：比較用3形状
+      // ------------------------------------------------------------
+      const sphereGeometry = new THREE.SphereGeometry(14, 20, 20);
+      const cubeGeometry   = new THREE.BoxGeometry(15, 15, 15);
+      const planeGeometry  = new THREE.PlaneGeometry(14, 14, 4, 4);
+
+      // ------------------------------------------------------------
+      // Material：MeshLambertMaterial（拡散反射）
+      // - Lambert は “ライトが無いと黒い”
+      // - Specular（鏡面反射）は無い（Phong/Standard と違う）
+      // - emissive は「自己発光っぽい」足し込み（ライト無しでも少し見える）
+      // ------------------------------------------------------------
+      meshMaterial = new THREE.MeshLambertMaterial({
+        color: 0x7777ff,
+        transparent: false, // opacity を効かせるときは true にする（GUIで切り替える）
+        opacity: 1.0
+      });
+
+      // 3つのMeshで同じMaterialを共有する（GUI変更が全部に効く）
+      sphere = new THREE.Mesh(sphereGeometry, meshMaterial);
+      cube   = new THREE.Mesh(cubeGeometry, meshMaterial);
+      plane  = new THREE.Mesh(planeGeometry, meshMaterial);
+
+      // 位置は同じにして「形状差だけ」を見やすくする
+      sphere.position.set(0, 3, 2);
+      cube.position.copy(sphere.position);
+      plane.position.copy(sphere.position);
+
+      // 影の例なので castShadow を有効化（どの形状でも影を落とす）
+      sphere.castShadow = true;
+      cube.castShadow = true;
+      plane.castShadow = true;
+
+      // 初期表示は cube（旧コード踏襲）
+      scene.add(cube);
+
+      // ------------------------------------------------------------
+      // Lights：Lambert を見せるためのライト構成
+      // ------------------------------------------------------------
+
+      // (1) AmbientLight：暗部の底上げ（真っ黒潰れを防ぐ）
+      // Lambert はライトが無いと 0 になるので、最低限の環境光を入れる
+      const ambientLight = new THREE.AmbientLight(0x0c0c0c, 1.0);
+      scene.add(ambientLight);
+
+      // (2) SpotLight：影を落とすメイン光
+      // ★方針：SpotLight/PointLight の decay は 0 をデフォルトにする
+      const spotLight = new THREE.SpotLight(0xffffff, 1.0);
+      spotLight.position.set(-30, 60, 60);
+      spotLight.castShadow = true;
+
+      // decay=0（距離減衰なし）。threeのデフォは物理ベース寄りで距離減衰するので、
+      // 教材として「明るさを一定に保つ」ほうが観察しやすい場合がある。
+      spotLight.decay = 0;
+
+      // distance=0 は無限扱い（減衰無しのイメージを強める）
+      spotLight.distance = 0;
+
+      // 影の品質（デフォだと荒い場合があるので最低限調整）
+      spotLight.shadow.mapSize.set(1024, 1024);
+
+      scene.add(spotLight);
+
+      // ------------------------------------------------------------
+      // GUI：material を触る（見え方の変化を観察する）
+      // ------------------------------------------------------------
+      const controls = {
+        // 速度
+        rotationSpeed: 0.02,
+
+        // material（初期値をMaterialから引く）
+        opacity: meshMaterial.opacity,
+        transparent: meshMaterial.transparent,
+        visible: meshMaterial.visible,
+
+        // emissive は Color なので hex で扱う（UIで扱いやすい）
+        emissive: meshMaterial.emissive.getHex(),
+        color: meshMaterial.color.getStyle(),
+
+        // side：面の表/裏/両面（Planeで効果がわかりやすい）
+        side: "front",
+
+        // 表示対象（sceneに入れるmeshを切り替える）
+        selectedMesh: "cube"
+      };
+
+      const gui = new GUI({ title: "Controls" });
+
+      const fMat = gui.addFolder("MeshLambertMaterial");
+
+      // opacity は transparent=true のときに見た目に影響する
+      fMat.add(controls, "opacity", 0, 1, 0.01).onChange((v) => {
+        meshMaterial.opacity = v;
+      });
+
+      fMat.add(controls, "transparent").onChange((v) => {
+        // transparent を true にしないと opacity が効かない（=透けない）
+        meshMaterial.transparent = v;
+
+        // transparent は描画パイプラインに影響するので needsUpdate を立てるほうが安全
+        meshMaterial.needsUpdate = true;
+      });
+
+      fMat.add(controls, "visible").onChange((v) => {
+        meshMaterial.visible = v;
+      });
+
+      fMat.addColor(controls, "emissive").onChange((v) => {
+        // emissive は「自己発光成分」なのでライトに依存せず色が足される
+        meshMaterial.emissive = new THREE.Color(v);
+      });
+
+      fMat.add(controls, "side", ["front", "back", "double"]).onChange((v) => {
+        // side は “どちら向きの面を描くか” を決める（裏面カリングに関係）
+        switch (v) {
+          case "front":  meshMaterial.side = THREE.FrontSide; break;
+          case "back":   meshMaterial.side = THREE.BackSide; break;
+          case "double": meshMaterial.side = THREE.DoubleSide; break;
+        }
+        // side 変更はシェーダ設定に関わるので needsUpdate 必須
+        meshMaterial.needsUpdate = true;
+      });
+
+      fMat.addColor(controls, "color").onChange((v) => {
+        meshMaterial.color.setStyle(v);
+      });
+
+      const fMesh = gui.addFolder("Select Mesh");
+      fMesh.add(controls, "selectedMesh", ["cube", "sphere", "plane"]).onChange((v) => {
+        // まず全部外す（sceneには今1つだけ置く）
+        scene.remove(cube);
+        scene.remove(sphere);
+        scene.remove(plane);
+
+        // 選択したものだけ入れる
+        switch (v) {
+          case "cube": scene.add(cube); break;
+          case "sphere": scene.add(sphere); break;
+          case "plane": scene.add(plane); break;
+        }
+      });
+
+      // ------------------------------------------------------------
+      // resize
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // ループ開始
+      // ------------------------------------------------------------
+      render(controls);
+    }
+
+    // ============================================================
+    // render：毎フレーム更新
+    // - step を進めて Y回転させる（形状の比較がしやすい）
+    // ============================================================
+    function render(controls) {
+      stats.update();
+
+      step += controls.rotationSpeed;
+
+      // 3つとも回しておく（sceneに居ないmeshでも回転値は更新される）
+      cube.rotation.y = step;
+      sphere.rotation.y = step;
+      plane.rotation.y = step;
+
+      requestAnimationFrame(() => render(controls));
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // resize：カメラとレンダラーの追従
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // initStats：FPS表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
