@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 05.07 - Basic 3D geometries - Cylinder (ES Modules + detailed comments)</title>
+
+  <!--
+    ============================================================
+    このファイルの目的
+    ============================================================
+    - CylinderGeometry（円柱 / 円錐台）を GUI でパラメータ変更しながら再生成し、
+      ジオメトリがどう変わるかを観察する教材。
+
+    ============================================================
+    旧コード（教材本の古いThree.js）からの修正ポイント
+    ============================================================
+    1) THREE.SceneUtils.createMultiMaterialObject は現行Three.jsには無い
+       → Groupの中に「面Mesh」と「ワイヤLineSegments」を入れる構成へ変更。
+
+    2) dat.GUI / stats.js を three/examples 由来のES Modulesに置き換え
+       → dat.GUI : lil-gui
+       → stats.js: stats.module.js
+
+    3) リサイズ対応を追加
+       → window.onresize で renderer / camera を更新。
+
+    4) 再生成時に dispose を追加（重要）
+       → GUIで何度もジオメトリを作り直すと、disposeしないとGPUメモリが増え続ける。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（render / resize / redraw で参照する）
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let cylinderGroup;  // 面 + ワイヤをまとめた Group（現行Three.jsの安全な作り方）
+    let step = 0;
+
+    // ============================================================
+    // パラメータ（GUIの単一ソース）
+    // - ここを変えると redraw() で CylinderGeometry を作り直す
+    // ============================================================
+    const params = {
+      rotationSpeed: 0.01,
+
+      radiusTop: 20,
+      radiusBottom: 20,
+      height: 20,
+
+      radialSegments: 8,
+      heightSegments: 1,   // CylinderGeometryの既定値も1なので、教材的には1開始が分かりやすい
+
+      openEnded: false,
+
+      thetaStart: 0,
+      thetaLength: Math.PI * 2
+    };
+
+    // ============================================================
+    // init：初期化（Scene構築 → オブジェクト生成 → GUI → ループ開始）
+    // ============================================================
+    function init() {
+      // Stats（FPS表示）
+      stats = initStats();
+
+      // Scene
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // Camera（旧コードの雰囲気を維持）
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-30, 40, 50);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // Renderer
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true; // このサンプルは影を必須にはしないが、教材本の設定を踏襲
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // Cylinderを生成して追加
+      cylinderGroup = createCylinderGroup(params);
+      scene.add(cylinderGroup);
+
+      // （注意）MeshNormalMaterial はライト不要なので、ライトは無くても表示できる。
+      // ただし「教材として空っぽすぎる」のを避けたい場合は light を置いても良い。
+      // 今回は旧コードにライトが無かったので、ライトは入れない。
+
+      // GUI
+      initGUI();
+
+      // Resize
+      window.addEventListener("resize", onResize);
+
+      // Loop start
+      render();
+    }
+
+    // ============================================================
+    // createCylinderGroup：CylinderGeometry を「面+ワイヤ」の2層で作る
+    // ============================================================
+    function createCylinderGroup(p) {
+      // ------------------------------------------------------------
+      // ガード（入力の安全化）
+      // - radialSegments / heightSegments は 1未満だと成立しない
+      // - thetaLength が 0に近いと“ほぼ線”になって見えづらい
+      //   → ただし教材として「切り欠き」を見たい場合もあるので clamp は最小限
+      // ------------------------------------------------------------
+      const radialSegments = Math.max(1, Math.round(p.radialSegments));
+      const heightSegments = Math.max(1, Math.round(p.heightSegments));
+
+      const thetaStart = p.thetaStart;
+      const thetaLength = Math.max(0, p.thetaLength); // 0も許容（完全に切り欠くとほぼ見えなくなるが正常）
+
+      // ------------------------------------------------------------
+      // CylinderGeometry の意味
+      // - radiusTop / radiusBottom : 上面/下面の半径（円柱=同じ、円錐=片方が0）
+      // - height                  : 高さ
+      // - radialSegments          : 円周方向分割（多いほど丸い）
+      // - heightSegments          : 高さ方向分割
+      // - openEnded               : trueだと上下のフタを作らない（筒）
+      // - thetaStart / thetaLength: 角度範囲（切り欠きが作れる）
+      // ------------------------------------------------------------
+      const geom = new THREE.CylinderGeometry(
+        p.radiusTop,
+        p.radiusBottom,
+        p.height,
+        radialSegments,
+        heightSegments,
+        p.openEnded,
+        thetaStart,
+        thetaLength
+      );
+
+      // 面（法線で色が変わる＝形状の理解に向く）
+      const faceMat = new THREE.MeshNormalMaterial({
+        side: THREE.DoubleSide
+      });
+      const faceMesh = new THREE.Mesh(geom, faceMat);
+
+      // ワイヤ（面ジオメトリからワイヤ用ジオメトリを作る）
+      // WireframeGeometry は“線分用ジオメトリ”を生成するため、LineSegmentsと相性が良い。
+      const wireGeom = new THREE.WireframeGeometry(geom);
+      const wireMat = new THREE.LineBasicMaterial({ color: 0x000000 });
+      const wire = new THREE.LineSegments(wireGeom, wireMat);
+
+      // まとめて扱うために Group 化（旧：マルチマテリアルの代替）
+      const group = new THREE.Group();
+      group.add(faceMesh);
+      group.add(wire);
+
+      return group;
+    }
+
+    // ============================================================
+    // redraw：GUI操作時に「古いGroupを破棄→新しいGroupに差し替え」
+    // ============================================================
+    function redraw() {
+      // 1) sceneから外す
+      if (cylinderGroup) {
+        scene.remove(cylinderGroup);
+
+        // 2) GPUリソースを破棄（これが無いと再生成の度にメモリ増加）
+        disposeObject3D(cylinderGroup);
+      }
+
+      // 3) 新しいジオメトリで作り直す
+      cylinderGroup = createCylinderGroup(params);
+      scene.add(cylinderGroup);
+    }
+
+    // ============================================================
+    // disposeObject3D：Group配下のgeometry/materialを安全に破棄
+    // ============================================================
+    function disposeObject3D(obj) {
+      obj.traverse((child) => {
+        // Mesh / LineSegments の両方が対象
+        if (child.geometry) {
+          child.geometry.dispose();
+        }
+        if (child.material) {
+          // materialが配列の場合もあるのでケア
+          if (Array.isArray(child.material)) {
+            child.material.forEach((m) => m.dispose());
+          } else {
+            child.material.dispose();
+          }
+        }
+      });
+    }
+
+    // ============================================================
+    // GUI：パラメータ変更 → redraw
+    // - onFinishChange を使い、ドラッグ中の連打再生成を避ける（負荷低減）
+    // ============================================================
+    function initGUI() {
+      const gui = new GUI({ title: "CylinderGeometry" });
+
+      gui.add(params, "rotationSpeed", 0, 0.2, 0.001);
+
+      const f = gui.addFolder("Geometry params");
+
+      // radiusTop / radiusBottom はマイナスも許すと「裏返り」を観察できるが、
+      // 初学者向けには混乱を生むこともある。
+      // 旧コードは -40〜40 なので踏襲しつつ、教材として注意コメントを残す。
+      f.add(params, "radiusTop", -40, 40, 0.1).onFinishChange(redraw);
+      f.add(params, "radiusBottom", -40, 40, 0.1).onFinishChange(redraw);
+
+      f.add(params, "height", 0.1, 80, 0.1).onFinishChange(redraw);
+
+      f.add(params, "radialSegments", 1, 64, 1).onFinishChange(redraw);
+      f.add(params, "heightSegments", 1, 32, 1).onFinishChange(redraw);
+
+      f.add(params, "openEnded").onFinishChange(redraw);
+
+      f.add(params, "thetaStart", 0, Math.PI * 2, 0.001).onFinishChange(redraw);
+      f.add(params, "thetaLength", 0, Math.PI * 2, 0.001).onFinishChange(redraw);
+
+      f.open();
+    }
+
+    // ============================================================
+    // render：毎フレーム回す
+    // - cylinderGroup を回転させることで、分割や切り欠きが観察しやすくなる
+    // ============================================================
+    function render() {
+      stats.update();
+
+      step += params.rotationSpeed;
+      if (cylinderGroup) {
+        cylinderGroup.rotation.y = step;
+      }
+
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // resize：ウィンドウサイズに追従
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // Stats：FPS表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    // 起動
+    window.addEventListener("load", init);
+  </script>
+</body>
+</html>
