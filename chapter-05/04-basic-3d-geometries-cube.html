@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 05.04 - Basic 3D geometry - Box (ES Modules + lil-gui + detailed comments)</title>
+
+  <!--
+    【修正内容（旧コード → 現行three.js）】
+    - 旧: <script src="../libs/three.js">（window.THREE 前提）, dat.gui, stats.js, SceneUtils.createMultiMaterialObject
+    - 新: ES Modules + importmap で three.js を import
+    - GUI: dat.GUI → lil-gui（three/addons）
+    - Stats: stats.js → three/addons の stats.module.js
+    - SceneUtils.createMultiMaterialObject は廃止されているので、
+      「Mesh + Wireframe を Group にまとめる」方式に変更する（現行の定石）
+
+    【このサンプルの狙い】
+    - BoxGeometry の各パラメータ（width/height/depth とセグメント数）を GUI で変更し、
+      “ジオメトリがどう再生成され、ワイヤがどう細分化されるか” を観察する。
+    - GUI操作で何度も作り直すため、「古い geometry/material を dispose する」ことが重要。
+      これを入れておかないと、GPUメモリが増え続けて重くなる典型事故が起きる。
+
+    【注意】
+    - MeshNormalMaterial はライト不要（法線方向を色で可視化）なので、SpotLight は必須ではない。
+      ただし教材の流れを壊さないために残している。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（render / resize で参照するため保持）
+    // ============================================================
+    let scene, camera, renderer, stats;
+
+    // 表示する「箱オブジェクト」（Mesh + Wire をまとめた Group）
+    let cubeGroup;
+
+    // 回転アニメーション用
+    let step = 0;
+
+    // ============================================================
+    // init：初期化
+    // ============================================================
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene：全オブジェクトの入れ物
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // ------------------------------------------------------------
+      // Camera：視点
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-20, 30, 40);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ------------------------------------------------------------
+      // Renderer：WebGL描画
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // 影はこのサンプルでは必須ではないが、教材の流れに合わせてON
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Light：MeshNormalMaterial には不要だが、旧サンプルの構成を踏襲
+      // - NormalMaterial はライト無視（法線→色変換）なので、見た目は変わらない
+      // - ただし将来 Lambert/Phong 等に差し替えた時にも動く構成になる
+      // ------------------------------------------------------------
+      const spotLight = new THREE.SpotLight(0xffffff, 1.0);
+      spotLight.position.set(-40, 60, -10);
+      scene.add(spotLight);
+
+      // ------------------------------------------------------------
+      // 初期ジオメトリ（BoxGeometry）
+      // - width/height/depth と、各軸のセグメント数を持つ
+      // - セグメント数を増やすと、各面が格子状に細分化される（頂点・三角形が増える）
+      // ------------------------------------------------------------
+      cubeGroup = createCubeGroup({
+        width: 10,
+        height: 10,
+        depth: 10,
+        widthSegments: 1,
+        heightSegments: 1,
+        depthSegments: 1
+      });
+      scene.add(cubeGroup);
+
+      // ------------------------------------------------------------
+      // GUI（lil-gui）
+      // - 旧コードでは cube.children[0].geometry.parameters... を参照していたが、
+      //   現行実装では Group 内構造が変わるため、パラメータは “状態” として保持する。
+      // ------------------------------------------------------------
+      const params = {
+        width: 10,
+        height: 10,
+        depth: 10,
+        widthSegments: 1,
+        heightSegments: 1,
+        depthSegments: 1
+      };
+
+      // redraw：GUI変更時に呼び、ジオメトリを作り直す
+      function redraw() {
+        // (1) scene から古いGroupを外す
+        scene.remove(cubeGroup);
+
+        // (2) GPUリソースの破棄（重要）
+        // GUIで何度も作り直すとき dispose しないとメモリリークする
+        disposeObject3D(cubeGroup);
+
+        // (3) 新しいGroupを作成して追加
+        cubeGroup = createCubeGroup({
+          width: params.width,
+          height: params.height,
+          depth: params.depth,
+          widthSegments: Math.round(params.widthSegments),
+          heightSegments: Math.round(params.heightSegments),
+          depthSegments: Math.round(params.depthSegments)
+        });
+        scene.add(cubeGroup);
+      }
+
+      const gui = new GUI({ title: "BoxGeometry Controls" });
+
+      // ここは “連続値” で動かしやすいが、segments は整数であるべきなので step(1) を付ける
+      gui.add(params, "width", 0.1, 40, 0.1).onChange(redraw);
+      gui.add(params, "height", 0.1, 40, 0.1).onChange(redraw);
+      gui.add(params, "depth", 0.1, 40, 0.1).onChange(redraw);
+
+      gui.add(params, "widthSegments", 1, 20, 1).onChange(redraw);
+      gui.add(params, "heightSegments", 1, 20, 1).onChange(redraw);
+      gui.add(params, "depthSegments", 1, 20, 1).onChange(redraw);
+
+      // ------------------------------------------------------------
+      // Resize
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // Render loop start
+      // ------------------------------------------------------------
+      render();
+    }
+
+    // ============================================================
+    // createCubeGroup：箱の「面 + ワイヤ」をまとめた Group を作る
+    // ============================================================
+    function createCubeGroup({
+      width,
+      height,
+      depth,
+      widthSegments,
+      heightSegments,
+      depthSegments
+    }) {
+      // ------------------------------------------------------------
+      // 1) ジオメトリ生成（BoxGeometry）
+      // - ここで面が細分化される（segments が大きいほど分割が増える）
+      // ------------------------------------------------------------
+      const geom = new THREE.BoxGeometry(
+        width,
+        height,
+        depth,
+        widthSegments,
+        heightSegments,
+        depthSegments
+      );
+
+      // ------------------------------------------------------------
+      // 2) “面” のマテリアル
+      // - MeshNormalMaterial は、法線方向をRGBにマッピングして色を出す
+      // - DoubleSide は両面描画（箱の内側も見えるようになる）
+      // ------------------------------------------------------------
+      const surfaceMat = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
+
+      const surfaceMesh = new THREE.Mesh(geom, surfaceMat);
+
+      // ------------------------------------------------------------
+      // 3) “ワイヤ” の生成
+      // - WireframeGeometry は、ジオメトリのエッジを線分集合として取り出す
+      // - LineSegments で “線分の集合” として描画する
+      // ------------------------------------------------------------
+      const wireGeom = new THREE.WireframeGeometry(geom);
+      const wireMat = new THREE.LineBasicMaterial({ color: 0x000000 });
+      const wire = new THREE.LineSegments(wireGeom, wireMat);
+
+      // ------------------------------------------------------------
+      // 4) Group 化
+      // - SceneUtils.createMultiMaterialObject の代替として、Groupにまとめる
+      // ------------------------------------------------------------
+      const group = new THREE.Group();
+      group.add(surfaceMesh);
+      group.add(wire);
+
+      return group;
+    }
+
+    // ============================================================
+    // disposeObject3D：Object3D配下の geometry/material を安全に破棄
+    // ============================================================
+    function disposeObject3D(root) {
+      root.traverse((obj) => {
+        // Mesh / LineSegments など、geometry を持つもの
+        if (obj.geometry) {
+          obj.geometry.dispose();
+        }
+
+        // material は単体 or 配列の可能性がある
+        if (obj.material) {
+          if (Array.isArray(obj.material)) {
+            obj.material.forEach((m) => m.dispose());
+          } else {
+            obj.material.dispose();
+          }
+        }
+      });
+    }
+
+    // ============================================================
+    // render：毎フレーム更新
+    // ============================================================
+    function render() {
+      stats.update();
+
+      // ぐるぐる回して形状を観察しやすくする
+      step += 0.01;
+      if (cubeGroup) {
+        cubeGroup.rotation.y = step;
+      }
+
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // onResize：画面リサイズ対応
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // initStats：FPS表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
