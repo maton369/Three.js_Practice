@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 05.01 - Basic 2D geometries - Plane (ES Modules + detailed comments)</title>
+
+  <!--
+    【このファイルの修正ポイント（旧コード → 現行three.js）】
+    - 旧: <script src="../libs/three.js">（window.THREE 前提）/ dat.gui / stats.js / SceneUtils
+    - 新: ES Modules + importmap で three.js を import
+    - GUI: dat.gui → lil-gui（three/addons）
+    - Stats: stats.js → stats.module.js（three/addons）
+    - THREE.SceneUtils.createMultiMaterialObject は廃止されているため、
+      「Group を作って、同じGeometryを共有する2つのMesh（通常表示 + wireframe表示）を入れる」方式に変更
+
+    【このサンプルのアルゴリズム（何をしているか）】
+    1) PlaneGeometry(width, height, widthSegments, heightSegments) を生成
+    2) 同じGeometryを使って
+       - MeshNormalMaterial（面の向き＝法線に応じた色付け）で“面”を表示
+       - MeshBasicMaterial(wireframe=true) で“ワイヤ”を重ねて表示
+    3) GUIから width/height/segments を変えるたびに Geometry を作り直し、古いリソースを dispose する
+    4) requestAnimationFrame で毎フレーム回転させて表示（形状変化が分かりやすい）
+
+    【注意】
+    - MeshNormalMaterial / MeshBasicMaterial はライトの影響を受けない。
+      （＝このサンプルではライト無しでも見える）
+    - “影” も今回のマテリアルでは教材として恩恵が薄いので、影はOFFにしてある。
+      影を学びたい場合は Lambert/Phong/Standard に変えると良い。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（render / resize で参照する）
+    // ============================================================
+    let scene, camera, renderer, stats;
+
+    // Planeは「Group（面Mesh + WireMesh）」として保持する
+    let planeGroup = null;
+
+    // アニメーション用
+    let step = 0;
+
+    // GUIから再生成するときに参照するため、現在のGeometryを保持
+    let currentGeometry = null;
+
+    // ============================================================
+    // init：初期化（Scene構築 → GUI → ループ開始）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------
+      // Scene
+      // ------------------------------
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // ------------------------------
+      // Camera
+      // ------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-20, 30, 40);
+
+      // 旧コードは (10,0,0) を見ていたので踏襲
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ------------------------------
+      // Renderer
+      // ------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // 今回はライト無しで見えるマテリアルなので影はOFF
+      renderer.shadowMap.enabled = false;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------
+      // 初期Plane生成
+      // ------------------------------
+      const initialGeom = new THREE.PlaneGeometry(10, 14, 4, 4);
+      planeGroup = createPlaneGroup(initialGeom);
+      scene.add(planeGroup);
+
+      // ------------------------------
+      // GUI（lil-gui）
+      // - 旧コードは multi-material の子meshから geometry.parameters を引いていた
+      // - 今回も Group の children[0]（面Mesh）から geometry.parameters を参照する
+      // ------------------------------
+      const controls = {
+        width:  planeGroup.children[0].geometry.parameters.width,
+        height: planeGroup.children[0].geometry.parameters.height,
+        widthSegments:  planeGroup.children[0].geometry.parameters.widthSegments,
+        heightSegments: planeGroup.children[0].geometry.parameters.heightSegments,
+
+        // 形状作り直し（GUIの値変更で呼ばれる）
+        redraw: () => {
+          // 1) 古いGroupをSceneから外す
+          scene.remove(planeGroup);
+
+          // 2) 古いGPUリソースを確実に解放（重要：GUIで何度も作り直すのでリークしやすい）
+          disposePlaneGroup(planeGroup);
+
+          // 3) 新しいGeometryを作る
+          //    segmentsは整数が期待値なので丸めておく（GUIスライダーがfloatを返す場合に備える）
+          const w  = controls.width;
+          const h  = controls.height;
+          const ws = Math.max(1, Math.round(controls.widthSegments));
+          const hs = Math.max(1, Math.round(controls.heightSegments));
+
+          const newGeom = new THREE.PlaneGeometry(w, h, ws, hs);
+
+          // 4) 新しいGroupを作ってSceneに追加
+          planeGroup = createPlaneGroup(newGeom);
+          scene.add(planeGroup);
+        }
+      };
+
+      const gui = new GUI({ title: "Plane Controls" });
+      gui.add(controls, "width",  0, 40, 0.1).onChange(controls.redraw);
+      gui.add(controls, "height", 0, 40, 0.1).onChange(controls.redraw);
+      gui.add(controls, "widthSegments",  1, 50, 1).onChange(controls.redraw);
+      gui.add(controls, "heightSegments", 1, 50, 1).onChange(controls.redraw);
+
+      // ------------------------------
+      // Resize
+      // ------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------
+      // Render loop start
+      // ------------------------------
+      render();
+    }
+
+    // ============================================================
+    // createPlaneGroup：Planeを「面 + wireframe」の2枚重ねで作る
+    // ============================================================
+    function createPlaneGroup(geom) {
+      // 既存Geometryがある場合は参照を更新（必要ならデバッグ用途で使える）
+      currentGeometry = geom;
+
+      // Groupは「複数のオブジェクトをまとめて一括回転/移動」するためのコンテナ
+      const group = new THREE.Group();
+
+      // (1) 面表示：MeshNormalMaterial
+      // - 法線方向に応じてRGBを割り当てる
+      // - ライト不要で形状の“凹凸/向き”が分かりやすい
+      const faceMat = new THREE.MeshNormalMaterial({
+        side: THREE.DoubleSide // Planeは片面だと裏から見たとき消えるので両面に
+      });
+      const faceMesh = new THREE.Mesh(geom, faceMat);
+
+      // (2) ワイヤ表示：MeshBasicMaterial(wireframe=true)
+      // - 同じGeometryを共有して「格子（segments）」が見えるようにする
+      const wireMat = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        wireframe: true
+      });
+      const wireMesh = new THREE.Mesh(geom, wireMat);
+
+      // “面”と“線”を同じ位置に置く
+      // 深度競合（z-fighting）が気になる場合は polygonOffset を使う方法もあるが、
+      // 今回はワイヤ表示が目的なのでそのままにしている。
+      group.add(faceMesh);
+      group.add(wireMesh);
+
+      return group;
+    }
+
+    // ============================================================
+    // disposePlaneGroup：GPUリソースを解放（Geometry/Material）
+    // - GUIで作り直すタイプのサンプルはここが抜けるとメモリリークしやすい
+    // ============================================================
+    function disposePlaneGroup(group) {
+      if (!group) return;
+
+      // 2つのMeshは同じGeometryを共有しているので、geometryは1回だけdisposeする
+      const geom = group.children?.[0]?.geometry || null;
+      if (geom && geom.dispose) geom.dispose();
+
+      // Materialはそれぞれ別インスタンスなので個別dispose
+      group.traverse((obj) => {
+        if (obj.isMesh && obj.material) {
+          if (Array.isArray(obj.material)) {
+            obj.material.forEach((m) => m?.dispose?.());
+          } else {
+            obj.material.dispose?.();
+          }
+        }
+      });
+    }
+
+    // ============================================================
+    // render：毎フレーム更新
+    // - PlaneGroupを回転させて、segmentsや面の向きが変わる様子を見る
+    // ============================================================
+    function render() {
+      stats.update();
+
+      step += 0.01;
+      if (planeGroup) {
+        // 旧コードの plane.rotation.y と同じ動き
+        planeGroup.rotation.y = step;
+      }
+
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // onResize：リサイズ対応
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // initStats：FPS表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
