@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 05.02 - Basic 2D geometries - Circle (ES Modules + detailed comments)</title>
+
+  <!--
+    【このファイルの修正ポイント（旧コード → 現行 three.js）】
+    - 旧: <script src="../libs/three.js">（window.THREE前提）, dat.gui, stats.js
+    - 新: ES Modules + importmap で three.js を import
+    - GUI: dat.GUI → lil-gui（three/examples）
+    - Stats: stats.js → stats.module.js（three/examples）
+    - 旧: THREE.SceneUtils.createMultiMaterialObject は削除済みAPI
+         → 現行は Group + 2つの Mesh（面 + ワイヤ）で置き換える
+
+    【このサンプルの狙い（アルゴリズム）】
+    - CircleGeometry(radius, segments, thetaStart, thetaLength) をパラメータで生成
+    - GUI操作でパラメータが変わるたびにジオメトリを「作り直す（redraw）」ことで、
+      形状の変化を即時に観察できるようにする
+    - 表示は「面（MeshNormalMaterial）」と「ワイヤ（MeshBasicMaterial wireframe）」を重ねて、
+      分割数(segments)や角度範囲(thetaStart/thetaLength)が直感的に分かるようにする
+
+    【注意（実装上の落とし穴）】
+    - segments が小さすぎる（0,1,2）と円にならない／破綻しやすい
+      → 最低 3 にクランプする
+    - 面とワイヤを同一平面に描くと z-fighting（ちらつき）が起きることがある
+      → wireframe側に polygonOffset を入れて安定化する
+    - 再生成を繰り返すので、古い geometry/material を dispose してメモリリークを防ぐ
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（resize / render で参照する）
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let circleGroup = null; // 「面Mesh」と「ワイヤMesh」をまとめたGroup
+    let step = 0;
+
+    // ============================================================
+    // init：初期化（Scene構築 → GUI → ループ開始）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ----------------------------
+      // Scene
+      // ----------------------------
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // ----------------------------
+      // Camera
+      // ----------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-20, 30, 40);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ----------------------------
+      // Renderer
+      // ----------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = false; // このサンプルはNormal/Basicなので影は必須ではない
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ----------------------------
+      // Light（このサンプルでは実質不要）
+      // MeshNormalMaterial / MeshBasicMaterial はライトを使わないため、
+      // ここにライトがあっても見た目に影響しにくい。
+      // ただし教材の流れ（他サンプルと統一）で置くなら「置いても害はない」ので残す。
+      // ----------------------------
+      const spotLight = new THREE.SpotLight(0xffffff, 1.0);
+      spotLight.position.set(-40, 60, -10);
+      scene.add(spotLight);
+
+      // ----------------------------
+      // 初期 CircleGeometry を生成して表示
+      // ----------------------------
+      const initial = {
+        radius: 4,
+        segments: 10,
+        thetaStart: 0.3 * Math.PI * 2,
+        thetaLength: 0.3 * Math.PI * 2
+      };
+      circleGroup = createCircleGroup(
+        initial.radius,
+        initial.segments,
+        initial.thetaStart,
+        initial.thetaLength
+      );
+      scene.add(circleGroup);
+
+      // ----------------------------
+      // GUI（lil-gui）
+      // 「値を変えたらジオメトリを作り直す」という再生成ループがこの教材のコア。
+      // ----------------------------
+      const controls = {
+        radius: initial.radius,
+        segments: initial.segments,
+        thetaStart: initial.thetaStart,
+        thetaLength: initial.thetaLength,
+
+        redraw: () => {
+          // GUI値の整合性を最低限保証する（破綻防止）
+          const radius = Math.max(0.01, controls.radius);
+
+          // CircleGeometry の segments は最低3が安全（3未満は「円」にならない）
+          const segments = Math.max(3, Math.round(controls.segments));
+
+          // 角度は 0..2π の範囲に入れておく（GUI上でも制限しているが念のため）
+          const thetaStart  = THREE.MathUtils.clamp(controls.thetaStart,  0, Math.PI * 2);
+          const thetaLength = THREE.MathUtils.clamp(controls.thetaLength, 0, Math.PI * 2);
+
+          // 古いオブジェクトを Scene から外し、GPUリソースを破棄する
+          if (circleGroup) {
+            scene.remove(circleGroup);
+            disposeGroup(circleGroup);
+          }
+
+          // 新しいジオメトリで再生成して Scene に戻す
+          circleGroup = createCircleGroup(radius, segments, thetaStart, thetaLength);
+          scene.add(circleGroup);
+        }
+      };
+
+      const gui = new GUI({ title: "Controls" });
+      gui.add(controls, "radius", 0.01, 40, 0.01).onChange(controls.redraw);
+      gui.add(controls, "segments", 3, 80, 1).onChange(controls.redraw);
+      gui.add(controls, "thetaStart", 0, Math.PI * 2, 0.001).onChange(controls.redraw);
+      gui.add(controls, "thetaLength", 0, Math.PI * 2, 0.001).onChange(controls.redraw);
+
+      // ----------------------------
+      // Resize
+      // ----------------------------
+      window.addEventListener("resize", onResize);
+
+      // ----------------------------
+      // Render loop
+      // ----------------------------
+      render();
+    }
+
+    // ============================================================
+    // createCircleGroup：CircleGeometry を「面 + ワイヤ」で可視化する
+    //
+    // 【アルゴリズム的な意味】
+    // - 同じ Geometry を 2つの Mesh が共有する
+    //   → 面の分割（segments）とワイヤの分割が必ず一致し、比較が直感的になる
+    // - 面：MeshNormalMaterial（法線方向の色で、回転すると色が変化）
+    // - ワイヤ：MeshBasicMaterial(wireframe=true)（格子の見え方で分割数が分かる）
+    // ============================================================
+    function createCircleGroup(radius, segments, thetaStart, thetaLength) {
+      const geom = new THREE.CircleGeometry(radius, segments, thetaStart, thetaLength);
+
+      // --- 面（ライト不要で形状が分かりやすい） ---
+      const faceMat = new THREE.MeshNormalMaterial({
+        side: THREE.DoubleSide
+      });
+
+      // --- ワイヤ（格子でセグメントが分かる） ---
+      const wireMat = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        wireframe: true,
+
+        // z-fighting対策：
+        // 面とワイヤが同一深度にあるとちらつくことがあるので、
+        // polygonOffset でワイヤを少し手前に出す（= 深度をずらす）。
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1
+      });
+
+      const faceMesh = new THREE.Mesh(geom, faceMat);
+      const wireMesh = new THREE.Mesh(geom, wireMat);
+
+      // グループ化して Scene へ
+      const group = new THREE.Group();
+      group.add(faceMesh);
+      group.add(wireMesh);
+
+      return group;
+    }
+
+    // ============================================================
+    // disposeGroup：再生成で不要になったGPUリソースを解放
+    //
+    // 【なぜ必要か】
+    // - geometry/material は GPU に確保されることがある
+    // - GUI操作で何度も作り直すと「古いものが残り続ける」＝メモリリークの原因
+    // ============================================================
+    function disposeGroup(group) {
+      // このサンプルでは faceMesh と wireMesh が同一 geometry を共有している前提
+      // なので geometry は 1回だけ dispose する。
+      const faceMesh = group.children[0];
+      const wireMesh = group.children[1];
+
+      if (faceMesh && faceMesh.geometry) faceMesh.geometry.dispose();
+
+      if (faceMesh && faceMesh.material) faceMesh.material.dispose();
+      if (wireMesh && wireMesh.material) wireMesh.material.dispose();
+    }
+
+    // ============================================================
+    // render：毎フレームの更新
+    // ============================================================
+    function render() {
+      stats.update();
+
+      // 回転させて「角度範囲の切れ目」や「分割の見え」を把握しやすくする
+      step += 0.01;
+      if (circleGroup) circleGroup.rotation.y = step;
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(render);
+    }
+
+    // ============================================================
+    // resize：ウィンドウサイズ変更への追従
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // Stats：FPS表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
