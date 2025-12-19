@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 04.10 - LineMaterial Dashed (ES Modules + BufferGeometry + detailed comments)</title>
+
+  <!--
+    【修正方針】
+    - 旧: <script src="../libs/three.js"> の window.THREE 前提、THREE.Geometry を使用（現行 three.js では廃止）
+    - 新: ES Modules + importmap で three を import
+    - ジオメトリ: THREE.Geometry → THREE.BufferGeometry へ置換
+    - 破線: LineDashedMaterial が参照する lineDistance を、geometry.computeLineDistances() or line.computeLineDistances() で計算
+      ※現行 three.js では Line / LineSegments 側の computeLineDistances() を使うのが一般的
+
+    【このサンプルの狙い（アルゴリズム）】
+    1) Gosper曲線（フラクタル）をタートルで点列に展開する（CPU）
+    2) 点列 → BufferGeometry の position 属性に詰める（CPU）
+    3) 各頂点に color 属性（RGB）を詰める（CPU）
+    4) “線に沿った距離” lineDistance を計算する（CPU）
+       → これを元に GPU 側で dash/gap のパターンを生成して破線描画する
+    5) 毎フレーム line を回転して見せる（GPUは同じバッファを再利用）
+
+    【重要】
+    - LineDashedMaterial は “頂点ごとの累積距離” が無いと、破線パターンを作れない。
+      そのため computeLineDistances() を必ず呼ぶ必要がある。
+    - 線はライティング不要（ライトの影響を受けない）なので、Ambient/Spot は教材としては不要。
+      ただし「他サンプルの雰囲気」に合わせるなら残しても害はない（ここでは最小構成で削る）。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+
+    // ============================================================
+    // グローバル（render / resize で参照するもの）
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let line;
+
+    // アニメーション
+    let step = 0;
+
+    // ============================================================
+    // init
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x000000); // 旧コード踏襲（黒背景）
+
+      // ------------------------------------------------------------
+      // Camera
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-30, 40, 30);
+      camera.lookAt(scene.position);
+
+      // ------------------------------------------------------------
+      // Renderer
+      // - 線描画なので shadowMap は不要（旧コードは enabled=true だが効果が無い）
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // 1) Gosper曲線を点列にする（タートル）
+      // ------------------------------------------------------------
+      const points = gosper(4, 60);
+
+      // ------------------------------------------------------------
+      // 2) 点列 → BufferGeometry の position / color 属性へ
+      // ------------------------------------------------------------
+      // position: [x, y, z, x, y, z, ...]
+      // color   : [r, g, b, r, g, b, ...]  (0..1)
+      //
+      // 旧コードは Vector3(e.x, e.z, e.y) と入れ替えていたので踏襲する。
+      // - 元の2D(x,y)を水平面に置きたい意図があり、
+      //   (x, z, y) にすると「yが奥行き」「zが上下」っぽくなる（好みの問題）
+      const positions = new Float32Array(points.length * 3);
+      const colors = new Float32Array(points.length * 3);
+
+      // HSL を使って “座標に応じて色が変化する” 旧挙動を再現
+      // - setHSL(h, s, l)
+      // - h は 0..1 で色相が回る
+      // - s は彩度、l は明度
+      const tmpColor = new THREE.Color();
+
+      for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+
+        // position
+        // 旧: lines.vertices.push(new Vector3(e.x, e.z, e.y))
+        positions[i * 3 + 0] = p.x;
+        positions[i * 3 + 1] = p.z;
+        positions[i * 3 + 2] = p.y;
+
+        // color（旧式: new Color().setHSL(...) を頂点ごとに保持）
+        tmpColor.setHSL(p.x / 100 + 0.5, (p.y * 20) / 300, 0.8);
+        colors[i * 3 + 0] = tmpColor.r;
+        colors[i * 3 + 1] = tmpColor.g;
+        colors[i * 3 + 2] = tmpColor.b;
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+      // ------------------------------------------------------------
+      // 3) LineDashedMaterial
+      // - vertexColors: true で color attribute を使う
+      // - dashSize / gapSize: 破線の「描く長さ」と「空白の長さ」
+      // - scale: ダッシュパターン全体のスケール
+      //
+      // 注意:
+      // - dash/gap は「lineDistance（線に沿った累積距離）」を元に決まる。
+      // - そのため次の computeLineDistances() が必須。
+      // ------------------------------------------------------------
+      const material = new THREE.LineDashedMaterial({
+        vertexColors: true,
+        color: 0xffffff,   // vertexColors を使うので実質“保険”。色が無い場合の基準色。
+        dashSize: 2,
+        gapSize: 2,
+        scale: 0.1
+      });
+
+      // ------------------------------------------------------------
+      // 4) Line を作る
+      // ------------------------------------------------------------
+      line = new THREE.Line(geometry, material);
+      line.position.set(25, -30, -60);
+      scene.add(line);
+
+      // ------------------------------------------------------------
+      // 5) 破線のための距離計算（最重要）
+      // ------------------------------------------------------------
+      // 旧: geometry.computeLineDistances() を呼んでいたが、
+      // 現行 three.js では “Line 側” の computeLineDistances() を使うのが一般的。
+      // 内部で geometry に lineDistance attribute を追加/更新する。
+      line.computeLineDistances();
+
+      // ------------------------------------------------------------
+      // Resize
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // Render loop
+      // ------------------------------------------------------------
+      render();
+    }
+
+    // ============================================================
+    // render
+    // ============================================================
+    function render() {
+      stats.update();
+
+      // line を回転させるだけ（点列やジオメトリを作り直さないのが重要）
+      step += 0.01;
+      line.rotation.z = step;
+
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // Gosper curve generator（タートル + 相互再帰）
+    //
+    // a: 再帰の深さ（大きいほど点が増える）
+    // b: 初期の前進距離（最終的に ln を縮小しながら描く）
+    //
+    // 戻り値: {x, y, z} の配列
+    // - x,y: タートルの平面座標
+    // - z  : 波打ち表現（count を進めて sin 波を作る）
+    // ============================================================
+    function gosper(a, b) {
+      // turtle = [x, y, angleDeg]
+      const turtle = [0, 0, 0];
+
+      // 返す点列
+      const points = [];
+
+      // “進行度” のようなもの。旧コードでは増えておらず z が常に 0 になるバグがあった。
+      // → fd() ごとに増やして、z が変化するように修正する。
+      let count = 0;
+
+      rg(a, b);
+      return points;
+
+      // ----------------------------------------------------------
+      // 右回転 / 左回転（角度は度数法）
+      // ----------------------------------------------------------
+      function rt(deg) { turtle[2] += deg; }
+      function lt(deg) { turtle[2] -= deg; }
+
+      // ----------------------------------------------------------
+      // 前進（線分を 2 点で表現）
+      //
+      // 注意:
+      // - Line は “頂点列を順に結ぶ” ので、
+      //   1回の前進で「始点→終点」の2点を push するのが分かりやすい。
+      // - 旧コードの z は Math.sin(count)*5 だが count が固定で意味が無かった。
+      //   ここでは fd のたびに count を進めて波打ちを復活させる。
+      // ----------------------------------------------------------
+      function fd(dist) {
+        const z1 = Math.sin(count) * 5;
+
+        // 始点
+        points.push({ x: turtle[0], y: turtle[1], z: z1 });
+
+        // 方向（角度→ラジアン）
+        const dir = turtle[2] * (Math.PI / 180);
+
+        // 座標更新
+        turtle[0] += Math.cos(dir) * dist;
+        turtle[1] += Math.sin(dir) * dist;
+
+        // count を進める（dist ベースにすると速度が自然）
+        count += dist * 0.05;
+
+        const z2 = Math.sin(count) * 5;
+
+        // 終点
+        points.push({ x: turtle[0], y: turtle[1], z: z2 });
+      }
+
+      // ----------------------------------------------------------
+      // rg / gl：相互再帰で Gosper 曲線を生成する
+      //
+      // st: 残り深さ
+      // ln: 今回のステップでの前進距離
+      //
+      // ln を 2.6457 で割るのは、Gosper曲線の縮小比としてよく使われる定数の一つで、
+      // 深さが増えても全体サイズが発散しないようにするため。
+      // ----------------------------------------------------------
+      function rg(st, ln) {
+        st--;
+        ln = ln / 2.6457;
+
+        if (st > 0) {
+          rg(st, ln);
+          rt(60);
+          gl(st, ln);
+          rt(120);
+          gl(st, ln);
+          lt(60);
+          rg(st, ln);
+          lt(120);
+          rg(st, ln);
+          rg(st, ln);
+          lt(60);
+          gl(st, ln);
+          rt(60);
+          return;
+        }
+
+        // st == 0（末端）：具体的なタートル命令列に展開
+        fd(ln); rt(60);
+        fd(ln); rt(120);
+        fd(ln); lt(60);
+        fd(ln); lt(120);
+        fd(ln);
+        fd(ln); lt(60);
+        fd(ln); rt(60);
+      }
+
+      function gl(st, ln) {
+        st--;
+        ln = ln / 2.6457;
+
+        if (st > 0) {
+          lt(60);
+          rg(st, ln);
+          rt(60);
+          gl(st, ln);
+          gl(st, ln);
+          rt(120);
+          gl(st, ln);
+          rt(60);
+          rg(st, ln);
+          lt(120);
+          rg(st, ln);
+          lt(60);
+          gl(st, ln);
+          return;
+        }
+
+        // st == 0
+        lt(60);
+        fd(ln); rt(60);
+        fd(ln);
+        fd(ln); rt(120);
+        fd(ln); rt(60);
+        fd(ln); lt(120);
+        fd(ln); lt(60);
+        fd(ln);
+      }
+    }
+
+    // ============================================================
+    // resize
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // stats
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
