@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 05.05 - Basic 3D geometries - Sphere (ES Modules + lil-gui + detailed comments)</title>
+
+  <!--
+    【修正ポイント（旧コード → 現行Three.jsの正攻法へ）】
+    1) THREE.SceneUtils.createMultiMaterialObject は廃止ルート（examples依存・古い書き方）
+       → Group を自前で作り、(面Mesh + ワイヤLineSegments) を追加する構成に変更する。
+    2) dat.GUI / stats.js を外部の古い libs から読む方式
+       → ES Modules + importmap + three/addons の lil-gui / stats.module.js に置き換える。
+    3) GUI で SphereGeometry を作り直すたびに、古い geometry/material を dispose しないとメモリリークする
+       → redraw 時に必ず dispose する。
+    4) パラメータは sphere.children[0].geometry.parameters から読む方式だと実装に強依存になる
+       → 自前の params（状態）を単一のソース・オブ・トゥルースとして持つ。
+
+    【このサンプルのアルゴリズム（教材の核）】
+    - 初期化: Scene/Camera/Renderer/Stats を構築し、Sphere(面+ワイヤ)を生成して追加
+    - GUI操作: パラメータ変更 → redraw() → SphereGeometry を再生成して差し替え
+    - 描画ループ: 毎フレーム回転させて「分割数や切り出し（phi/theta）が見えやすい」状態で描画
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // 共有状態（render/resize/redraw から参照）
+    // ============================================================
+    let scene, camera, renderer, stats;
+
+    // 「球」は (面Mesh + ワイヤLineSegments) を入れた Group として扱う
+    // → 旧 SceneUtils.createMultiMaterialObject の代替
+    let sphereGroup = null;
+
+    // アニメーション用
+    let step = 0;
+
+    // ============================================================
+    // params: GUIの値 = 形状生成の入力（単一のソース・オブ・トゥルース）
+    // ============================================================
+    const params = {
+      // SphereGeometry(radius, widthSegments, heightSegments, phiStart, phiLength, thetaStart, thetaLength)
+      radius: 4,
+      widthSegments: 10,
+      heightSegments: 10,
+
+      // 球の「横方向」切り出し（経度方向）
+      // phi: 0〜2π（デフォルトは全周）
+      phiStart: 0,
+      phiLength: Math.PI * 2,
+
+      // 球の「縦方向」切り出し（緯度方向）
+      // theta: 0〜π（デフォルトは上から下まで）
+      thetaStart: 0,
+      thetaLength: Math.PI,
+
+      // 表示補助
+      rotationSpeed: 0.01,
+
+      // ワイヤ表示のON/OFF（教材として便利）
+      showWireframe: true
+    };
+
+    // ============================================================
+    // init: 初期化
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ---------------------------
+      // Scene
+      // ---------------------------
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // ---------------------------
+      // Camera
+      // ---------------------------
+      camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(-20, 30, 40);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ---------------------------
+      // Renderer
+      // ---------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true; // 今回は影を使わないが、教材シリーズの統一感でONのままにしておく
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ---------------------------
+      // Light（注意）
+      // ---------------------------
+      // 今回の面材は MeshNormalMaterial（ライト不要）なのでライトは必須ではない。
+      // ただ、将来 Lambert/Phong/Standard に切り替えたときの拡張を意識して弱いライトを置いておく。
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.3);
+      hemi.position.set(0, 100, 0);
+      scene.add(hemi);
+
+      // ---------------------------
+      // 初期Sphere生成
+      // ---------------------------
+      sphereGroup = createSphereGroup(params);
+      scene.add(sphereGroup);
+
+      // ---------------------------
+      // GUI
+      // ---------------------------
+      const gui = new GUI({ title: "Sphere Geometry Controls" });
+
+      // “連続でredrawが走る”と負荷が出るので、基本は onFinishChange を使う
+      // （ドラッグ中は更新せず、離した瞬間だけ再生成）
+      const fGeom = gui.addFolder("Geometry (rebuild)");
+
+      fGeom.add(params, "radius", 0.1, 40, 0.1).onFinishChange(redraw);
+
+      // SphereGeometry では segments は 3以上が無難（2以下は形状が破綻しやすい）
+      fGeom.add(params, "widthSegments", 3, 64, 1).onFinishChange(redraw);
+      fGeom.add(params, "heightSegments", 2, 64, 1).onFinishChange(redraw);
+
+      // phi/theta の “開始” と “長さ” は足し算で範囲が決まるので、
+      // 長さが0に近いと「ほぼ線」になって見えなくなるのは正常挙動。
+      fGeom.add(params, "phiStart", 0, Math.PI * 2, 0.001).onFinishChange(redraw);
+      fGeom.add(params, "phiLength", 0, Math.PI * 2, 0.001).onFinishChange(redraw);
+      fGeom.add(params, "thetaStart", 0, Math.PI, 0.001).onFinishChange(redraw);
+      fGeom.add(params, "thetaLength", 0, Math.PI, 0.001).onFinishChange(redraw);
+
+      const fView = gui.addFolder("View");
+      fView.add(params, "rotationSpeed", 0, 0.1, 0.001);
+      fView.add(params, "showWireframe").onChange((v) => {
+        // wireframe の LineSegments を探して visible を切り替える
+        if (!sphereGroup) return;
+        const wire = sphereGroup.getObjectByName("wireframe");
+        if (wire) wire.visible = v;
+      });
+
+      // ---------------------------
+      // Resize
+      // ---------------------------
+      window.addEventListener("resize", onResize);
+
+      // ---------------------------
+      // Loop start
+      // ---------------------------
+      render();
+    }
+
+    // ============================================================
+    // createSphereGroup: SphereGeometry を (面 + ワイヤ) で可視化するGroupを作る
+    // ============================================================
+    function createSphereGroup(p) {
+      // --- 入力パラメータの安全化 ---
+      // GUI の値は人間がいじるので、最小限のガードを入れておくと教材が壊れにくい
+      const radius = Math.max(0.0001, p.radius);
+
+      // segments が 0 だと例外/不可視になりやすいので下限を設定
+      const widthSeg = Math.max(3, Math.round(p.widthSegments));
+      const heightSeg = Math.max(2, Math.round(p.heightSegments));
+
+      // phi/theta は 0 でもOK（ただしほぼ見えなくなる）が、範囲外は wrap/clamp する
+      // phi: 0..2π, theta: 0..π
+      const phiStart   = THREE.MathUtils.euclideanModulo(p.phiStart, Math.PI * 2);
+      const phiLength  = THREE.MathUtils.clamp(p.phiLength, 0, Math.PI * 2);
+      const thetaStart = THREE.MathUtils.clamp(p.thetaStart, 0, Math.PI);
+      const thetaLength= THREE.MathUtils.clamp(p.thetaLength, 0, Math.PI);
+
+      // --- SphereGeometry を生成 ---
+      // ここが “再生成アルゴリズム” の中心:
+      // GUIの値 → new SphereGeometry(...) → scene に差し替える
+      const geom = new THREE.SphereGeometry(
+        radius,
+        widthSeg,
+        heightSeg,
+        phiStart,
+        phiLength,
+        thetaStart,
+        thetaLength
+      );
+
+      // --- 面（surface） ---
+      // MeshNormalMaterial は法線ベクトルを色に変換するため、ライト不要で形状が分かりやすい。
+      const surfaceMat = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
+      const surfaceMesh = new THREE.Mesh(geom, surfaceMat);
+      surfaceMesh.name = "surface";
+
+      // --- ワイヤ（wireframe） ---
+      // WireframeGeometry は「三角形ポリゴンの辺」を抽出して線にする。
+      // segments を増やすほど線が増えるのはこの処理によるもの。
+      const wireGeom = new THREE.WireframeGeometry(geom);
+      const wireMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.9 });
+      const wire = new THREE.LineSegments(wireGeom, wireMat);
+      wire.name = "wireframe";
+      wire.visible = p.showWireframe;
+
+      // 見やすさのため、ワイヤを少しだけ大きくして z-fighting を避ける
+      wire.scale.setScalar(1.001);
+
+      // --- Group 化 ---
+      const group = new THREE.Group();
+      group.add(surfaceMesh);
+      group.add(wire);
+
+      // 旧コードの見た目に合わせて、やや右を向かせておく（任意）
+      group.rotation.y = step;
+
+      return group;
+    }
+
+    // ============================================================
+    // redraw: 形状を作り直して差し替える
+    // ============================================================
+    function redraw() {
+      // 1) scene から外す
+      if (sphereGroup) {
+        scene.remove(sphereGroup);
+
+        // 2) GPUリソースを明示破棄（重要）
+        // GUIで何度も作り直す教材では、dispose しないと VRAM/メモリが増えていく。
+        disposeObject3D(sphereGroup);
+        sphereGroup = null;
+      }
+
+      // 3) 新しいパラメータで再生成
+      sphereGroup = createSphereGroup(params);
+
+      // 4) scene に追加
+      scene.add(sphereGroup);
+    }
+
+    // ============================================================
+    // disposeObject3D: Group配下の geometry/material をまとめて破棄
+    // ============================================================
+    function disposeObject3D(obj) {
+      obj.traverse((child) => {
+        // Mesh / LineSegments などは geometry を持つ
+        if (child.geometry) {
+          child.geometry.dispose();
+        }
+        // material は単体 or 配列の可能性がある
+        if (child.material) {
+          if (Array.isArray(child.material)) {
+            child.material.forEach((m) => m.dispose());
+          } else {
+            child.material.dispose();
+          }
+        }
+      });
+    }
+
+    // ============================================================
+    // render: 毎フレームの更新
+    // ============================================================
+    function render() {
+      stats.update();
+
+      step += params.rotationSpeed;
+
+      // 回転させることで「segments の粗さ」「phi/theta の切り出し」が見えやすくなる
+      if (sphereGroup) sphereGroup.rotation.y = step;
+
+      requestAnimationFrame(render);
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // resize: 画面リサイズ対応
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // stats
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
