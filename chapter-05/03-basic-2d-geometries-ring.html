@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 05.03 - Basic 2D geometries - Ring (ES Modules + detailed comments)</title>
+
+  <!--
+    【修正方針】
+    - 旧: <script src="../libs/three.js"> による window.THREE 前提 + dat.gui + stats.js + SceneUtils.createMultiMaterialObject
+    - 新: ES Modules + importmap で three.js を import
+          GUI は lil-gui（three/addons）
+          Stats は stats.module.js（three/addons）
+    - SceneUtils / MultiMaterial は現行three.jsで非推奨・削除傾向
+      → 「面Mesh + ワイヤMesh」を自前で Group にまとめる方式に置換
+
+    【このサンプルの狙い（アルゴリズム）】
+    - RingGeometry(innerRadius, outerRadius, thetaSegments, phiSegments, thetaStart, thetaLength)
+      のパラメータを GUI から変更し、毎回ジオメトリを作り直して観察する。
+    - 面（MeshNormalMaterial）とワイヤ（MeshBasicMaterial wireframe）を重ねて
+      「分割数」「開始角」「角度範囲」「内外半径」がどう見えるかを理解する。
+
+    【重要な注意点】
+    - “面＋ワイヤの重ね描き”は深度が同じで z-fighting（チラつき）が起きやすい。
+      → wireframe 側に polygonOffset を入れて、少しだけ手前に出す。
+    - GUI操作で再生成を繰り返すため、古い geometry/material を dispose しないと
+      GPUメモリが増え続ける（リークに見える）。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（render / resize / redraw で参照）
+    // ============================================================
+    let scene, camera, renderer, stats;
+
+    // “面＋ワイヤ”をまとめた Group（旧: MultiMaterialObject の代替）
+    let ringGroup = null;
+
+    // アニメーション用（回転）
+    let step = 0;
+
+    // ============================================================
+    // init：初期化（Scene構築 → GUI → ループ開始）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // --------------------------
+      // Scene
+      // --------------------------
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // --------------------------
+      // Camera
+      // --------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-30, 40, 50);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // --------------------------
+      // Renderer
+      // --------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true; // このサンプル自体は影が主役ではないが、旧コード踏襲でON
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // --------------------------
+      // GUI パラメータ（RingGeometry の引数をそのまま持つ）
+      // --------------------------
+      const controls = {
+        innerRadius: 0,
+        outerRadius: 50,
+        thetaSegments: 8,
+        phiSegments: 8,
+        thetaStart: 0,
+        thetaLength: Math.PI * 2,
+
+        rotationSpeed: 0.01,
+
+        // 再生成（redraw）は「remove → dispose → create → add」まで責任を持つ
+        redraw: () => redraw(controls)
+      };
+
+      // 初回生成（旧コード: new THREE.RingGeometry() の代替）
+      redraw(controls);
+
+      // --------------------------
+      // GUI（lil-gui）
+      // - segments 系は整数にする（step(1)）
+      // --------------------------
+      const gui = new GUI({ title: "Controls" });
+      gui.add(controls, "innerRadius", 0, 40, 0.01).onChange(controls.redraw);
+      gui.add(controls, "outerRadius", 0, 100, 0.01).onChange(controls.redraw);
+      gui.add(controls, "thetaSegments", 1, 40, 1).onChange(controls.redraw);
+      gui.add(controls, "phiSegments", 1, 20, 1).onChange(controls.redraw);
+      gui.add(controls, "thetaStart", 0, Math.PI * 2, 0.001).onChange(controls.redraw);
+      gui.add(controls, "thetaLength", 0, Math.PI * 2, 0.001).onChange(controls.redraw);
+
+      gui.add(controls, "rotationSpeed", 0, 0.1, 0.001);
+
+      // --------------------------
+      // Resize
+      // --------------------------
+      window.addEventListener("resize", onResize);
+
+      // --------------------------
+      // Render loop
+      // --------------------------
+      render(controls);
+    }
+
+    // ============================================================
+    // redraw：リングを作り直す（GUI操作のたびに呼ばれる）
+    // ============================================================
+    function redraw(controls) {
+      // --------------------------------------------
+      // 1) 入力の整形（壊れやすい条件をガードする）
+      // --------------------------------------------
+      // - outerRadius <= innerRadius だとリングが“潰れる”（面が無くなる）ので最小差を確保
+      // - segments は最低 3 以上推奨だが、GUIで 1 を許可しているので内部で丸める
+      const inner = Math.max(0, controls.innerRadius);
+      const outer = Math.max(inner + 0.001, controls.outerRadius);
+
+      const thetaSeg = Math.max(1, Math.round(controls.thetaSegments));
+      const phiSeg   = Math.max(1, Math.round(controls.phiSegments));
+
+      const tStart = controls.thetaStart;
+      const tLen   = controls.thetaLength;
+
+      // --------------------------------------------
+      // 2) 旧オブジェクトを remove + dispose
+      // --------------------------------------------
+      if (ringGroup) {
+        scene.remove(ringGroup);
+
+        // Group内のMeshを走査して geometry/material を破棄する
+        ringGroup.traverse((obj) => {
+          if (!obj.isMesh) return;
+
+          if (obj.geometry) obj.geometry.dispose();
+
+          // material は単体/配列の両方があり得るので両対応
+          const mat = obj.material;
+          if (Array.isArray(mat)) {
+            mat.forEach((m) => m && m.dispose && m.dispose());
+          } else if (mat && mat.dispose) {
+            mat.dispose();
+          }
+        });
+
+        ringGroup = null;
+      }
+
+      // --------------------------------------------
+      // 3) 新ジオメトリを作成
+      // --------------------------------------------
+      const geom = new THREE.RingGeometry(
+        inner,
+        outer,
+        thetaSeg,
+        phiSeg,
+        tStart,
+        tLen
+      );
+
+      // --------------------------------------------
+      // 4) 面（Normal）とワイヤ（Wireframe）を別Meshで作る
+      //    - 旧: SceneUtils.createMultiMaterialObject を置換
+      // --------------------------------------------
+
+      // 面：法線方向を色として表示（ライト不要で形状が分かりやすい）
+      const faceMat = new THREE.MeshNormalMaterial({
+        side: THREE.DoubleSide
+      });
+
+      // ワイヤ：線だけ表示（分割が見える）
+      // - z-fighting 対策で polygonOffset を利用して少しだけ“手前”に寄せる
+      const wireMat = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        wireframe: true,
+        polygonOffset: true,
+        polygonOffsetFactor: -1, // 手前へ
+        polygonOffsetUnits: -1
+      });
+
+      // 同じ geometry を共有して “面と線の一致” を担保する
+      const faceMesh = new THREE.Mesh(geom, faceMat);
+      const wireMesh = new THREE.Mesh(geom, wireMat);
+
+      // Group にまとめる（旧 MultiMaterialObject 相当）
+      ringGroup = new THREE.Group();
+      ringGroup.add(faceMesh);
+      ringGroup.add(wireMesh);
+
+      scene.add(ringGroup);
+    }
+
+    // ============================================================
+    // render：毎フレーム回す
+    // ============================================================
+    function render(controls) {
+      stats.update();
+
+      step += controls.rotationSpeed;
+
+      if (ringGroup) {
+        ringGroup.rotation.y = step;
+      }
+
+      requestAnimationFrame(() => render(controls));
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // resize
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // stats
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
