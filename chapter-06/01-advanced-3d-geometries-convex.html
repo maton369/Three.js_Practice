@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 06.01 - Advanced 3D geometries - Convex Hull (ES Modules + detailed comments)</title>
+
+  <!--
+    【修正ポイント（旧 three.js サンプル → 現行 three.js）】
+    - 旧: <script src="../libs/three.js"> のグローバル THREE 前提
+      新: ES Modules + importmap で three.js を import
+    - 旧: ../libs/geometries/ConvexGeometry.js（古いアドオン）
+      新: three/addons/geometries/ConvexGeometry.js（examples/jsm）
+    - 旧: dat.gui / stats.js（レガシー）
+      新: lil-gui / stats.module.js（addons）
+    - 旧: THREE.SceneUtils.createMultiMaterialObject（廃止）
+      新: Group を自前で作って Mesh（面）+ LineSegments（ワイヤ）を重ねる
+
+    【このサンプルの狙い（アルゴリズムの観察）】
+    - ランダムに生成した 3D 点集合 P = {p_i} を可視化する（赤い点）。
+    - その点集合をすべて包含する「最小の凸多面体（凸包: Convex Hull）」を計算し可視化する（緑の半透明面 + ワイヤ）。
+    - ボタンを押すたびに点を再生成し、凸包の形がどう変わるかを観察する。
+
+    【凸包（Convex Hull）とは】
+    - 直感的には「点を全部包み込む、ピンと張った輪ゴム（3Dならラップフィルム）みたいな外側の形」。
+    - 数学的には「点集合を含む最小の凸集合の境界」。
+    - three.js の ConvexGeometry は内部で QuickHull 系の手法を使って凸包ポリゴン（面の集合）を構築する。
+      ※実装詳細は three.js の ConvexHull / ConvexGeometry のコード参照。
+
+    【重要（メモリリーク対策）】
+    - GUI で “redraw” を何回も押すとジオメトリが作り直される。
+    - 旧コードのままだと GPU 側のバッファが解放されず、メモリが増え続ける可能性がある。
+    - ここでは「古いオブジェクトを remove してから dispose する」手順を入れて安全にする。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+    import { ConvexGeometry } from "three/addons/geometries/ConvexGeometry.js";
+
+    // ============================================================
+    // グローバル（resize / render で参照するもの）
+    // ============================================================
+    let scene, camera, renderer, stats;
+
+    // 点の可視化（赤い点群）と凸包（緑の面 + ワイヤ）
+    let pointsObject = null; // InstancedMesh を想定
+    let hullObject = null;   // Group（面Mesh + ワイヤLineSegments）
+
+    // アニメーション
+    let step = 0;
+
+    // 点の数（GUIで増減したくなったらここを controls に出すと良い）
+    const POINT_COUNT = 20;
+
+    // ============================================================
+    // init：初期化
+    // ============================================================
+    function init() {
+      // ---- stats（FPS）
+      stats = initStats();
+
+      // ---- scene
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // ---- camera
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-30, 40, 50);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // ---- renderer
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ---- 初回生成（点 → 凸包）
+      regenerate();
+
+      // ---- GUI
+      const controls = {
+        redraw: () => regenerate()
+      };
+
+      const gui = new GUI({ title: "Controls" });
+      gui.add(controls, "redraw").name("redraw (new points)");
+
+      // ---- resize
+      window.addEventListener("resize", onResize);
+
+      // ---- loop
+      render();
+    }
+
+    // ============================================================
+    // regenerate：点群と凸包を作り直す（重要：dispose込み）
+    // ============================================================
+    function regenerate() {
+      // 1) 既存オブジェクトを scene から外す
+      if (pointsObject) scene.remove(pointsObject);
+      if (hullObject) scene.remove(hullObject);
+
+      // 2) GPU リソースを解放（作り直しでリークしないため）
+      disposePoints(pointsObject);
+      disposeHull(hullObject);
+
+      pointsObject = null;
+      hullObject = null;
+
+      // 3) 新しい点群を生成
+      //    - ここで作る points[] が「凸包計算の入力」になる
+      const points = generateRandomPoints(POINT_COUNT);
+
+      // 4) 点群を可視化（赤い点）
+      pointsObject = createPointsInstancedMesh(points);
+      scene.add(pointsObject);
+
+      // 5) 凸包を計算して可視化（緑の面 + ワイヤ）
+      //    - ConvexGeometry(points) が “凸包の面メッシュ” を作る
+      const hullGeometry = new ConvexGeometry(points);
+      hullObject = createHullObject(hullGeometry);
+      scene.add(hullObject);
+    }
+
+    // ============================================================
+    // generateRandomPoints：ランダム点群を作る
+    // ============================================================
+    function generateRandomPoints(count) {
+      const pts = [];
+      for (let i = 0; i < count; i++) {
+        // 旧コードの雰囲気：[-15, 15] の整数格子上の点
+        const x = -15 + Math.round(Math.random() * 30);
+        const y = -15 + Math.round(Math.random() * 30);
+        const z = -15 + Math.round(Math.random() * 30);
+        pts.push(new THREE.Vector3(x, y, z));
+      }
+      return pts;
+    }
+
+    // ============================================================
+    // createPointsInstancedMesh：点群を InstancedMesh で描画
+    // - 点ごとに Mesh を作るより軽い（同じ geometry/material を共有できる）
+    // ============================================================
+    function createPointsInstancedMesh(points) {
+      const pointGeom = new THREE.SphereGeometry(0.25, 10, 10);
+      const pointMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+
+      const inst = new THREE.InstancedMesh(pointGeom, pointMat, points.length);
+
+      // インスタンスごとの変換行列を設定する
+      // - 各点の位置に小球を置くだけなので、回転/スケールは単位でOK
+      const dummy = new THREE.Object3D();
+      for (let i = 0; i < points.length; i++) {
+        dummy.position.copy(points[i]);
+        dummy.updateMatrix();
+        inst.setMatrixAt(i, dummy.matrix);
+      }
+
+      // InstancedMesh は setMatrixAt 後に更新フラグを立てる
+      inst.instanceMatrix.needsUpdate = true;
+
+      return inst;
+    }
+
+    // ============================================================
+    // createHullObject：凸包の “面 + ワイヤ” をまとめた Group を作る
+    // - 旧 SceneUtils.createMultiMaterialObject の代替
+    // ============================================================
+    function createHullObject(geometry) {
+      const group = new THREE.Group();
+
+      // ---- 面（半透明）
+      // MeshBasicMaterial はライト不要で、凸包の形だけを見たい教材に向いている
+      const faceMat = new THREE.MeshBasicMaterial({
+        color: 0x00ff00,
+        transparent: true,
+        opacity: 0.22,
+        side: THREE.DoubleSide,
+        depthWrite: false // 半透明の描画で “奥の面が潰れる” のを少し軽減
+      });
+      const faceMesh = new THREE.Mesh(geometry, faceMat);
+      faceMesh.renderOrder = 0;
+
+      // ---- ワイヤ（辺）
+      // ワイヤは WireframeGeometry から LineSegments を作るのが定石
+      const wireGeom = new THREE.WireframeGeometry(geometry);
+      const wireMat = new THREE.LineBasicMaterial({ color: 0x006600 });
+      const wire = new THREE.LineSegments(wireGeom, wireMat);
+      wire.renderOrder = 1;
+
+      // ---- Group 化（同じ回転を適用できる）
+      group.add(faceMesh);
+      group.add(wire);
+
+      // dispose 用に参照を保持（あとで安全に解放するため）
+      group.userData.faceMesh = faceMesh;
+      group.userData.wire = wire;
+
+      return group;
+    }
+
+    // ============================================================
+    // disposePoints：点群オブジェクトの GPU リソースを解放
+    // ============================================================
+    function disposePoints(obj) {
+      if (!obj) return;
+
+      // InstancedMesh は geometry/material を持つ
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material) obj.material.dispose();
+    }
+
+    // ============================================================
+    // disposeHull：凸包オブジェクト（Group）の GPU リソースを解放
+    // ============================================================
+    function disposeHull(group) {
+      if (!group) return;
+
+      // createHullObject で保持している参照から確実に dispose する
+      const faceMesh = group.userData.faceMesh;
+      const wire = group.userData.wire;
+
+      if (faceMesh) {
+        if (faceMesh.geometry) faceMesh.geometry.dispose(); // ConvexGeometry 本体
+        if (faceMesh.material) faceMesh.material.dispose();
+      }
+
+      if (wire) {
+        if (wire.geometry) wire.geometry.dispose(); // WireframeGeometry
+        if (wire.material) wire.material.dispose();
+      }
+    }
+
+    // ============================================================
+    // render：アニメーションループ
+    // - 点群と凸包を同じ角度で回して “包み込み関係” を観察しやすくする
+    // ============================================================
+    function render() {
+      stats.update();
+
+      step += 0.01;
+
+      // pointsObject / hullObject が存在するときだけ回転
+      if (pointsObject) pointsObject.rotation.y = step;
+      if (hullObject) hullObject.rotation.y = step;
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(render);
+    }
+
+    // ============================================================
+    // resize
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // stats
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
