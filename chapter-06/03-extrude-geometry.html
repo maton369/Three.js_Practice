@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 06.03 - Extrude Geometry (compat fix)</title>
+
+  <!--
+    真っ黒になる原因のほとんどは「実行時エラーで render() まで到達していない」ことです。
+    今回のコードは、学習用の古い three.js（Learning Three.js 系）に合わせて、
+    “存在しないクラス/関数を使わない or 使う前に存在確認する” 方向で互換性を上げています。
+
+    典型的に古い three.js だと以下が無くて落ちます：
+    - THREE.Group / THREE.AxesHelper / THREE.GridHelper
+    - THREE.EdgesGeometry / THREE.LineSegments
+    - BufferGeometry 系のメソッド差分
+
+    修正方針：
+    - 補助表示は feature detection（あれば使う）にする
+    - ワイヤ表示は EdgesGeometry ではなく「wireframe material」を重ねる（古い版でも確実）
+    - shapeObject は Object3D を使う（Group が無い版でも動く）
+    - もし落ちても画面にエラーを出す（真っ黒回避）
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+    #Error-overlay {
+      position: absolute;
+      left: 0; top: 0;
+      padding: 10px 12px;
+      background: rgba(0,0,0,0.75);
+      color: #fff;
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      z-index: 9999;
+      display: none;
+      max-width: 90vw;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+  <div id="Error-overlay"></div>
+
+  <script type="text/javascript">
+    // どこで落ちても「真っ黒」にならないよう、エラーを画面に表示する
+    (function setupErrorOverlay() {
+      var overlay = document.getElementById("Error-overlay");
+      window.onerror = function (msg, url, line, col, err) {
+        overlay.style.display = "block";
+        overlay.textContent =
+          "[Runtime Error]\n" +
+          String(msg) + "\n" +
+          "at " + String(url || "") + ":" + String(line || "") + ":" + String(col || "") + "\n\n" +
+          (err && err.stack ? String(err.stack) : "");
+      };
+    })();
+
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // 補助表示（古い three.js では存在しない場合があるので「存在確認してから」）
+      // ------------------------------------------------------------
+      // Axes: 新 THREE.AxesHelper / 旧 THREE.AxisHelper などの差分を吸収
+      if (typeof THREE.AxesHelper === "function") {
+        scene.add(new THREE.AxesHelper(60));
+      } else if (typeof THREE.AxisHelper === "function") {
+        scene.add(new THREE.AxisHelper(60));
+      }
+
+      // Grid: 無い版もあるのでガード
+      if (typeof THREE.GridHelper === "function") {
+        var grid = new THREE.GridHelper(200, 20);
+        grid.position.y = -20;
+        scene.add(grid);
+      }
+
+      // ライト（MeshNormalMaterialは不要だが、ワイヤや別材質に変えることを考えて薄く入れる）
+      var ambient = new THREE.AmbientLight(0xffffff, 0.3);
+      scene.add(ambient);
+
+      var dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      dirLight.position.set(40, 80, 50);
+      scene.add(dirLight);
+
+      // ------------------------------------------------------------
+      // 表示対象（Extrude したオブジェクト）
+      // ------------------------------------------------------------
+      var shapeObject = null;
+
+      // カメラ配置：原点付近を見下ろす
+      camera.position.set(-20, 60, 90);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      // ------------------------------------------------------------
+      // GUI（Extrude パラメータ）
+      // ------------------------------------------------------------
+      var controls = new function () {
+        // depth / amount の互換吸収：内部では両方セット
+        this.depth = 8;
+
+        this.steps = 1;
+        this.curveSegments = 12;
+
+        this.bevelEnabled = true;
+        this.bevelThickness = 2;
+        this.bevelSize = 0.8;
+        this.bevelSegments = 3;
+
+        this.rebuild = function () { rebuildExtrude(); };
+      };
+
+      var gui = new dat.GUI();
+      gui.add(controls, "depth", 0, 40).onChange(controls.rebuild);
+      gui.add(controls, "steps", 1, 10).step(1).onChange(controls.rebuild);
+      gui.add(controls, "curveSegments", 1, 60).step(1).onChange(controls.rebuild);
+      gui.add(controls, "bevelEnabled").onChange(controls.rebuild);
+      gui.add(controls, "bevelThickness", 0, 20).onChange(controls.rebuild);
+      gui.add(controls, "bevelSize", 0, 20).onChange(controls.rebuild);
+      gui.add(controls, "bevelSegments", 0, 20).step(1).onChange(controls.rebuild);
+
+      // 最初の生成
+      rebuildExtrude();
+
+      // ------------------------------------------------------------
+      // アニメーション
+      // ------------------------------------------------------------
+      var step = 0;
+      render();
+
+      function render() {
+        stats.update();
+
+        step += 0.01;
+        if (shapeObject) shapeObject.rotation.y = step;
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // Extrude 再構築（GUI変更のたびに呼ぶ）
+      // ------------------------------------------------------------
+      function rebuildExtrude() {
+        // 以前のオブジェクトを撤去
+        if (shapeObject) {
+          scene.remove(shapeObject);
+          // 古い版向けに dispose は最低限だけ（無い場合もあるのでガード）
+          safeDisposeObject(shapeObject);
+          shapeObject = null;
+        }
+
+        // 1) 2D shape を作る
+        var shape2D = buildFaceShape();
+
+        // 2) Extrude のオプション（新旧を同時に満たす）
+        var options = {
+          // 新: depth / 旧: amount
+          depth: controls.depth,
+          amount: controls.depth,
+
+          steps: Math.max(1, Math.floor(controls.steps)),
+          curveSegments: Math.max(1, Math.floor(controls.curveSegments)),
+
+          bevelEnabled: !!controls.bevelEnabled,
+          bevelThickness: Math.max(0, controls.bevelThickness),
+          bevelSize: Math.max(0, controls.bevelSize),
+          bevelSegments: Math.max(0, Math.floor(controls.bevelSegments))
+        };
+
+        // 3) 押し出し（ここがアルゴリズムの中心）
+        //    - 2D輪郭をサンプリング → 三角形分割 → 側面生成 → bevel生成
+        var geom3D = new THREE.ExtrudeGeometry(shape2D, options);
+
+        // 4) 中心寄せ（回転の支点を安定）
+        centerGeometryCompat(geom3D);
+
+        // 5) 表示用オブジェクト（面 + wireframe）を作成
+        //    ※ EdgesGeometry 等は古い版に無いので「wireframe material」を重ねる
+        shapeObject = createDisplayObjectCompat(geom3D);
+
+        scene.add(shapeObject);
+
+        // 6) カメラが必ず捉えるよう、原点を見る
+        camera.lookAt(new THREE.Vector3(0, 0, 0));
+      }
+
+      // ------------------------------------------------------------
+      // 2D Shape（押し出し元断面）
+      // ------------------------------------------------------------
+      function buildFaceShape() {
+        var shape = new THREE.Shape();
+
+        shape.moveTo(10, 10);
+        shape.lineTo(10, 40);
+        shape.bezierCurveTo(15, 25, 25, 25, 30, 40);
+        shape.splineThru([
+          new THREE.Vector2(32, 30),
+          new THREE.Vector2(28, 20),
+          new THREE.Vector2(30, 10)
+        ]);
+        shape.quadraticCurveTo(20, 15, 10, 10);
+
+        // holes（穴）も押し出し時に側面が生成される
+        var hole1 = new THREE.Path();
+        hole1.absellipse(16, 24, 2, 3, 0, Math.PI * 2, true);
+        shape.holes.push(hole1);
+
+        var hole2 = new THREE.Path();
+        hole2.absellipse(23, 24, 2, 3, 0, Math.PI * 2, true);
+        shape.holes.push(hole2);
+
+        var hole3 = new THREE.Path();
+        hole3.absarc(20, 16, 2, 0, Math.PI, true);
+        shape.holes.push(hole3);
+
+        return shape;
+      }
+
+      // ------------------------------------------------------------
+      // 表示用オブジェクト（互換重視）
+      // - THREE.Group が無い版があるので Object3D を使う
+      // - wireframe は MeshBasicMaterial(wireframe=true) を重ねる
+      // ------------------------------------------------------------
+      function createDisplayObjectCompat(geom) {
+        var root = new THREE.Object3D();
+
+        // 面：法線色（ライト不要）
+        var surfaceMat = new THREE.MeshNormalMaterial({
+          transparent: true,
+          opacity: 0.85,
+          side: (typeof THREE.DoubleSide !== "undefined") ? THREE.DoubleSide : undefined
+        });
+        var surface = new THREE.Mesh(geom, surfaceMat);
+        root.add(surface);
+
+        // ワイヤ：wireframe material（古い版でも確実）
+        var wireMat = new THREE.MeshBasicMaterial({
+          color: 0x000000,
+          wireframe: true,
+          transparent: true,
+          opacity: 0.35
+        });
+        var wire = new THREE.Mesh(geom, wireMat);
+        root.add(wire);
+
+        return root;
+      }
+
+      // ------------------------------------------------------------
+      // ジオメトリ中心寄せ（古い版にも対応）
+      // ------------------------------------------------------------
+      function centerGeometryCompat(geom) {
+        if (!geom) return;
+        if (typeof geom.computeBoundingBox === "function") geom.computeBoundingBox();
+        if (!geom.boundingBox) return;
+
+        var bb = geom.boundingBox;
+        var center = new THREE.Vector3();
+        center.addVectors(bb.min, bb.max).multiplyScalar(0.5);
+
+        // translate が無い可能性があるので applyMatrix / applyMatrix4 を使う
+        var m = new THREE.Matrix4().makeTranslation(-center.x, -center.y, -center.z);
+        if (typeof geom.applyMatrix4 === "function") {
+          geom.applyMatrix4(m);
+        } else if (typeof geom.applyMatrix === "function") {
+          geom.applyMatrix(m);
+        } else if (typeof geom.translate === "function") {
+          geom.translate(-center.x, -center.y, -center.z);
+        }
+      }
+
+      // ------------------------------------------------------------
+      // dispose（古い版でも落ちないようにガード多め）
+      // ------------------------------------------------------------
+      function safeDisposeObject(obj) {
+        if (!obj || typeof obj.traverse !== "function") return;
+
+        obj.traverse(function (child) {
+          if (!child) return;
+
+          if (child.geometry && typeof child.geometry.dispose === "function") {
+            child.geometry.dispose();
+          }
+
+          if (child.material) {
+            if (Array.isArray(child.material)) {
+              child.material.forEach(function (m) {
+                if (m && typeof m.dispose === "function") m.dispose();
+              });
+            } else if (typeof child.material.dispose === "function") {
+              child.material.dispose();
+            }
+          }
+        });
+      }
+
+      // ------------------------------------------------------------
+      // Resize
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        var w = window.innerWidth;
+        var h = window.innerHeight;
+
+        renderer.setSize(w, h);
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      });
+
+      // ------------------------------------------------------------
+      // Stats 初期化（Learning Three.js の stats.js 互換）
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        if (typeof stats.setMode === "function") stats.setMode(0);
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
