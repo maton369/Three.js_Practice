@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 05.08 - Basic 3D geometries - TorusKnot (ES Modules + detailed comments)</title>
+
+  <!--
+    【このファイルの目的】
+    - TorusKnotGeometry（結び目形状）を GUI でパラメータ変更しながら観察するサンプル。
+    - “曲線に沿ってチューブ（管）を押し出す” という発想（= sweep / tube geometry）を体感できる。
+
+    【旧コードからの主な修正点（重要）】
+    1) ES Modules + importmap に変更
+       - 旧: ../libs/three.js（グローバル THREE） / dat.gui / stats.js
+       - 新: three.module.js / lil-gui / stats.module.js
+
+    2) THREE.SceneUtils.createMultiMaterialObject の廃止対応
+       - 現行 three.js では SceneUtils は examples 側に移ったり、構成が変わったりで使いにくい。
+       - 代わりに Group + Mesh を自前で作って “マルチマテリアル風” を実現する。
+
+    3) TorusKnotGeometry の引数順が旧版と違う点に注意
+       - 旧版（書籍サンプルでよくある）:
+         TorusKnotGeometry(radius, tube, radialSegments, tubularSegments, p, q, heightScale)
+       - 現行（例: r182付近）:
+         TorusKnotGeometry(radius, tube, tubularSegments, radialSegments, p, q)
+       - つまり「沿い方向の分割数」と「断面の分割数」の順番が入れ替わっている。
+       - このサンプルでは GUI 表記を現行APIに合わせている（tubularSegments → 曲線沿い、radialSegments → 断面輪）。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+    #Stats-output { position: absolute; left: 0; top: 0; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル：描画ループ・リサイズで使う
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let knotGroup = null; // 現在表示中の TorusKnot（Meshたちを束ねたGroup）
+    let step = 0;
+
+    // ============================================================
+    // 入口
+    // ============================================================
+    window.addEventListener("load", init);
+
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // 形状の回転が見やすいように、軽い補助を入れる（ライト不要）
+      const axes = new THREE.AxesHelper(20);
+      scene.add(axes);
+
+      const grid = new THREE.GridHelper(100, 20, 0x999999, 0xcccccc);
+      grid.position.y = -15;
+      scene.add(grid);
+
+      // ------------------------------------------------------------
+      // Camera
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-30, 40, 50);
+      camera.lookAt(0, 0, 0);
+
+      // ------------------------------------------------------------
+      // Renderer
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // GUIで動かす “状態（パラメータ）”
+      // ------------------------------------------------------------
+      const params = {
+        // 結び目の大きさ（中心線が載る “仮想トーラス” の半径のイメージ）
+        radius: 10,
+
+        // チューブの太さ（中心線の周りに巻く管の半径）
+        tube: 1,
+
+        // 【沿い方向】中心線を何分割してサンプルするか（大きいほど滑らか）
+        // ※現行APIでは第3引数
+        tubularSegments: 128,
+
+        // 【断面輪】チューブ断面（円周）を何分割するか（大きいほど丸い）
+        // ※現行APIでは第4引数
+        radialSegments: 16,
+
+        // p, q：結び目の“巻き数”に相当するパラメータ
+        // 直感：p と q が互いに素（gcd=1）だと1本の結び目になりやすい
+        //       gcd>1 だと複数ループに分かれるような見え方になりやすい（パラメータ次第）
+        p: 2,
+        q: 3,
+
+        // 表示・見た目
+        showWireframe: true,     // 分割の粗さを見たい時に便利
+        wireOpacity: 0.35,       // ワイヤの濃さ
+        flatShading: false,      // 法線の補間を切ると “面の荒さ” がより見える（教材用）
+
+        // アニメーション
+        autoRotate: true,
+        rotationSpeed: 0.01
+      };
+
+      // ------------------------------------------------------------
+      // 初回生成 → シーンに配置
+      // ------------------------------------------------------------
+      knotGroup = createKnotGroup(params);
+      scene.add(knotGroup);
+
+      // ------------------------------------------------------------
+      // GUI構築：パラメータ変更 → 再生成（redraw）
+      // ------------------------------------------------------------
+      const gui = new GUI({ title: "TorusKnot Controls" });
+
+      const fGeom = gui.addFolder("Geometry (rebuild)");
+      // 形状再生成は重いので、onFinishChange（ドラッグ終了時）で反映するのがコツ
+      fGeom.add(params, "radius", 0.1, 40, 0.1).onFinishChange(redraw);
+      fGeom.add(params, "tube",   0.05, 20, 0.05).onFinishChange(redraw);
+      fGeom.add(params, "tubularSegments", 8, 400, 1).onFinishChange(redraw);
+      fGeom.add(params, "radialSegments",  3,  64, 1).onFinishChange(redraw);
+      fGeom.add(params, "p", 1, 10, 1).onFinishChange(redraw);
+      fGeom.add(params, "q", 1, 15, 1).onFinishChange(redraw);
+      fGeom.open();
+
+      const fMat = gui.addFolder("View");
+      fMat.add(params, "showWireframe").onChange(() => {
+        // ワイヤ表示は再生成しなくても切替できる
+        setWireframeVisible(knotGroup, params.showWireframe);
+      });
+      fMat.add(params, "wireOpacity", 0.0, 1.0, 0.01).onChange(() => {
+        setWireOpacity(knotGroup, params.wireOpacity);
+      });
+      fMat.add(params, "flatShading").onChange(() => {
+        // flatShading はシェーダ再コンパイルが絡むので needsUpdate が必要
+        setFlatShading(knotGroup, params.flatShading);
+      });
+      fMat.open();
+
+      const fAnim = gui.addFolder("Animation");
+      fAnim.add(params, "autoRotate");
+      fAnim.add(params, "rotationSpeed", 0.0, 0.1, 0.001);
+      fAnim.open();
+
+      // ------------------------------------------------------------
+      // リサイズ対応
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // 描画ループ開始
+      // ------------------------------------------------------------
+      render(params);
+    }
+
+    // ============================================================
+    // redraw：形状パラメータが変わったら “作り直す”
+    //
+    // アルゴリズム的ポイント：
+    // - TorusKnotGeometry は「パラメータ→頂点配列」が大きく変わるため
+    //   パラメータ変更時は “既存Geometryの更新” より “再生成” が素直。
+    // - ただし再生成を繰り返すと GPU メモリが増え続けるので dispose が必須。
+    // ============================================================
+    function redraw(params) {
+      // 1) Sceneから外す
+      scene.remove(knotGroup);
+
+      // 2) GPUリソース解放（重要）
+      disposeObject3D(knotGroup);
+
+      // 3) 新規作成して追加
+      knotGroup = createKnotGroup(params);
+      scene.add(knotGroup);
+    }
+
+    // ============================================================
+    // createKnotGroup：TorusKnot を “面Mesh + ワイヤMesh” のGroupとして作る
+    //
+    // TorusKnotGeometry が内部でやっている概念（ざっくり）：
+    // - 結び目の中心線をパラメトリック曲線として定義（p,qで巻き方が変わる）
+    // - t を 0..2π でサンプル（= tubularSegments）
+    // - 各サンプル点で Frenet frame（接線/法線/従法線）を推定し、
+    //   その局所座標で “円断面（= radialSegments）” を回してチューブ頂点を作る
+    // - 最後に三角形インデックスを張ってメッシュ化
+    // ============================================================
+    function createKnotGroup(params) {
+      const group = new THREE.Group();
+
+      // ---- 入力の安全化（壊れやすいパラメータをガード） ----
+      // 分割数が小さすぎると面が崩れるので下限を持つ
+      const radius = Math.max(0.01, params.radius);
+      const tube = Math.max(0.001, params.tube);
+      const tubularSegments = clampInt(params.tubularSegments, 8, 400);
+      const radialSegments  = clampInt(params.radialSegments, 3,  128);
+
+      const p = clampInt(params.p, 1, 50);
+      const q = clampInt(params.q, 1, 50);
+
+      // ---- Geometry（現行APIの順番に合わせる） ----
+      const geometry = new THREE.TorusKnotGeometry(
+        radius,
+        tube,
+        tubularSegments, // 曲線沿い
+        radialSegments,  // 断面輪
+        p,
+        q
+      );
+
+      // ---- Material：ライト不要で形状が把握しやすい NormalMaterial ----
+      const solidMat = new THREE.MeshNormalMaterial({
+        flatShading: !!params.flatShading, // trueで “面の荒さ” がより分かる
+        side: THREE.DoubleSide
+      });
+
+      const solidMesh = new THREE.Mesh(geometry, solidMat);
+      group.add(solidMesh);
+
+      // ---- ワイヤ（分割数の見え確認用） ----
+      // ワイヤは “面と同じ位置” に描くため、Z-fighting（ちらつき）が出やすい。
+      // polygonOffset で面を少し奥に押して、ワイヤを手前に見せる。
+      const wireMat = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        wireframe: true,
+        transparent: true,
+        opacity: params.wireOpacity,
+        depthTest: true,
+        depthWrite: false, // ワイヤは深度を書かない方が視認性が安定しやすい
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1
+      });
+
+      const wireMesh = new THREE.Mesh(geometry, wireMat);
+      wireMesh.visible = !!params.showWireframe;
+      group.add(wireMesh);
+
+      // dispose時に “共有geometryを1回だけ解放” できるように参照を保持
+      group.userData.sharedGeometry = geometry;
+      group.userData.solidMat = solidMat;
+      group.userData.wireMat = wireMat;
+
+      // 初期姿勢（見やすさのため）
+      group.position.set(0, 0, 0);
+
+      return group;
+    }
+
+    // ============================================================
+    // render：毎フレーム更新
+    // ============================================================
+    function render(params) {
+      stats.update();
+
+      if (params.autoRotate && knotGroup) {
+        step += params.rotationSpeed;
+        knotGroup.rotation.y = step;
+        knotGroup.rotation.x = step * 0.35; // 少し傾けると結び目の3D感が分かりやすい
+      }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(() => render(params));
+    }
+
+    // ============================================================
+    // ユーティリティ：ワイヤ表示切替 / 透明度 / flatShading
+    // ============================================================
+    function setWireframeVisible(group, visible) {
+      if (!group) return;
+      // groupの2番目（wireMesh）を想定。より安全に traverse で探す。
+      group.traverse((obj) => {
+        if (obj.isMesh && obj.material && obj.material.wireframe === true) {
+          obj.visible = visible;
+        }
+      });
+    }
+
+    function setWireOpacity(group, opacity) {
+      if (!group) return;
+      const o = Math.max(0, Math.min(1, opacity));
+      group.traverse((obj) => {
+        if (obj.isMesh && obj.material && obj.material.wireframe === true) {
+          obj.material.opacity = o;
+          obj.material.transparent = (o < 1);
+          obj.material.needsUpdate = true;
+        }
+      });
+    }
+
+    function setFlatShading(group, enabled) {
+      if (!group) return;
+      group.traverse((obj) => {
+        if (obj.isMesh && obj.material && obj.material.isMeshNormalMaterial) {
+          obj.material.flatShading = !!enabled;
+          obj.material.needsUpdate = true;
+        }
+      });
+    }
+
+    // ============================================================
+    // disposeObject3D：再生成時のリーク防止（超重要）
+    //
+    // 注意点：
+    // - 今回は solidMesh と wireMesh が “同じ geometry を共有” している。
+    // - traverseで両方から geometry.dispose() すると二重解放の形になるので、
+    //   group.userData.sharedGeometry を 1回だけ dispose する。
+    // ============================================================
+    function disposeObject3D(root) {
+      if (!root) return;
+
+      // 1) 共有geometryは1回だけ解放
+      const g = root.userData.sharedGeometry;
+      if (g && g.dispose) {
+        g.dispose();
+      }
+
+      // 2) material は各Meshが別インスタンスなので通常通り dispose
+      root.traverse((obj) => {
+        if (!obj.isMesh) return;
+        const mat = obj.material;
+        if (Array.isArray(mat)) {
+          mat.forEach((m) => m && m.dispose && m.dispose());
+        } else if (mat && mat.dispose) {
+          mat.dispose();
+        }
+      });
+    }
+
+    // ============================================================
+    // resize
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // Stats
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0);
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    // ============================================================
+    // 小物：整数クランプ
+    // ============================================================
+    function clampInt(v, min, max) {
+      const n = Math.round(Number(v));
+      if (Number.isNaN(n)) return min;
+      return Math.max(min, Math.min(max, n));
+    }
+  </script>
+</body>
+</html>
