@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 05.09 - Basic 3D geometries - Polyhedron (ES Modules + detailed comments)</title>
+
+  <!--
+    【このサンプルの目的】
+    - “正多面体系ジオメトリ” (Icosahedron / Tetrahedron / Octahedron / Dodecahedron) と
+      “ユーザー定義 PolyhedronGeometry” を GUI で切り替えて観察する。
+    - radius（大きさ）と detail（細分化）の変更が「面の荒さ / 滑らかさ」にどう効くかを理解する。
+
+    【旧コードの問題点（現行 three.js での非互換）】
+    1) THREE.SceneUtils.createMultiMaterialObject は削除済み
+       -> 現行では自分で Group を作り、Mesh を複数（面＋ワイヤ）追加する。
+    2) 古い window.THREE 前提（script src="../libs/three.js"）はプロジェクト間移植が面倒
+       -> ES Modules + importmap に移植する。
+    3) redraw でジオメトリを作り直しているのに dispose をしていない
+       -> 何度も変更すると GPU メモリが増え続ける（典型的なリーク）ので、必ず破棄する。
+    4) resize 対応がない
+       -> ウィンドウサイズ変更時にアスペクトが崩れるので、camera と renderer を更新する。
+
+    【ワイヤ重ね表示について】
+    - 面（MeshNormalMaterial）＋ ワイヤ（wireframe=true）を同じジオメトリで重ねると、
+      深度バッファの都合で Z-fighting（チラつき）が起きやすい。
+    - 対策として renderOrder を分け、wire 側に polygonOffset を入れて“ほんの少し前に出す”。
+      ※教材目的（分割数・面の荒さの観察）なら、このやり方が実装も理解もシンプル。
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル参照（render / resize / redraw で使う）
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let polyGroup = null; // “面 + ワイヤ” をまとめた Group（切り替え時に丸ごと置換する）
+    let step = 0;
+
+    // ============================================================
+    // 初期化
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // Scene
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // Camera
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-30, 40, 50);
+      camera.lookAt(0, 0, 0);
+
+      // Renderer
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // GUI（パラメータ）
+      // ------------------------------------------------------------
+      const controls = {
+        radius: 10,
+        detail: 0,
+        type: "Icosahedron",
+
+        // redraw は「ジオメトリを作り直す」＝最も重要な処理
+        redraw: () => {
+          // 1) 旧オブジェクトを scene から外す
+          if (polyGroup) {
+            scene.remove(polyGroup);
+            disposePolyGroup(polyGroup);
+            polyGroup = null;
+          }
+
+          // 2) 新しい geometry を構築（type によって分岐）
+          const geom = createPolyGeometry(controls.type, controls.radius, controls.detail);
+
+          // 3) 面 + ワイヤの Group を作成（SceneUtils の代替）
+          polyGroup = createFaceAndWireGroup(geom);
+
+          // 4) scene に追加
+          scene.add(polyGroup);
+        }
+      };
+
+      const gui = new GUI({ title: "Polyhedron Controls" });
+
+      // radius / detail の変更はドラッグ中に何度も走ると重い場合がある
+      // -> onFinishChange を使うと「操作完了時に 1 回だけ再生成」になる
+      gui.add(controls, "radius", 1, 40, 1).name("radius").onFinishChange(controls.redraw);
+      gui.add(controls, "detail", 0, 5, 1).name("detail").onFinishChange(controls.redraw);
+      gui.add(controls, "type", ["Icosahedron", "Tetrahedron", "Octahedron", "Dodecahedron", "Custom"])
+         .name("type")
+         .onChange(controls.redraw);
+
+      // 最初の生成
+      controls.redraw();
+
+      // resize
+      window.addEventListener("resize", onResize);
+
+      // render loop
+      render();
+    }
+
+    // ============================================================
+    // createPolyGeometry：タイプ別に “多面体ジオメトリ” を作る
+    // ============================================================
+    function createPolyGeometry(type, radius, detail) {
+      // detail は「三角形分割による細分化」
+      // - 0 : もっとも荒い（面がハッキリ見える）
+      // - 1,2.. : 細分化され、見た目が滑らかに近づく（ただし頂点数が増える）
+      //   -> パフォーマンスにも直結するため、教材では 0〜2 あたりが観察しやすい
+      switch (type) {
+        case "Icosahedron":
+          return new THREE.IcosahedronGeometry(radius, detail);
+        case "Tetrahedron":
+          return new THREE.TetrahedronGeometry(radius, detail);
+        case "Octahedron":
+          return new THREE.OctahedronGeometry(radius, detail);
+        case "Dodecahedron":
+          return new THREE.DodecahedronGeometry(radius, detail);
+        case "Custom":
+          // --------------------------------------------------------
+          // Custom（PolyhedronGeometry）
+          //
+          // PolyhedronGeometry は
+          // - vertices: 頂点座標の配列（x,y,z が連続で並ぶ）
+          // - indices : 三角形の頂点インデックス（3つで1面）
+          // から「任意多面体」を構築する。
+          //
+          // ここでは最小の例として “正四面体” の骨格を与える。
+          // ただし、radius / detail は PolyhedronGeometry の内部で
+          // - 半径方向のスケーリング
+          // - 三角形の細分化
+          // に使われるため、GUI と相性が良い。
+          //
+          // 注意:
+          // - indices は三角形面なので、(a,b,c) の順序で面の表裏（法線向き）が決まる。
+          //   このサンプルは両面表示（DoubleSide）なので致命的ではないが、
+          //   ライティング教材では winding（右手系/左手系）の理解が重要になる。
+          // --------------------------------------------------------
+          const vertices = [
+             1,  1,  1,
+            -1, -1,  1,
+            -1,  1, -1,
+             1, -1, -1
+          ];
+
+          const indices = [
+            2, 1, 0,
+            0, 3, 2,
+            1, 3, 0,
+            2, 3, 1
+          ];
+
+          return new THREE.PolyhedronGeometry(vertices, indices, radius, detail);
+        default:
+          return new THREE.IcosahedronGeometry(radius, detail);
+      }
+    }
+
+    // ============================================================
+    // createFaceAndWireGroup：面メッシュ + ワイヤメッシュを同一ジオメトリで作る
+    // ============================================================
+    function createFaceAndWireGroup(geometry) {
+      // Group は「複数 Mesh をまとめるコンテナ」
+      // 旧 SceneUtils.createMultiMaterialObject の置き換えとして最も素直
+      const group = new THREE.Group();
+
+      // 面：MeshNormalMaterial
+      // - ライト不要で “面の向き” が色として見える（教材向き）
+      // - flatShading=true にすると面がより “カクカク” 見えて、detail の差が分かりやすい
+      const faceMat = new THREE.MeshNormalMaterial({
+        side: THREE.DoubleSide,
+        flatShading: true
+      });
+
+      const faceMesh = new THREE.Mesh(geometry, faceMat);
+      faceMesh.renderOrder = 0;
+
+      // ワイヤ：wireframe 表示
+      // - MeshBasicMaterial はライト不要
+      // - polygonOffset を入れて Z-fighting を軽減
+      const wireMat = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        wireframe: true
+      });
+
+      wireMat.polygonOffset = true;
+      wireMat.polygonOffsetFactor = -1;
+      wireMat.polygonOffsetUnits = -1;
+
+      const wireMesh = new THREE.Mesh(geometry, wireMat);
+      wireMesh.renderOrder = 1;
+
+      group.add(faceMesh);
+      group.add(wireMesh);
+
+      // dispose のために「この Group が所有している共有 geometry」を保持する
+      // （faceMesh と wireMesh が同じ geometry を参照するので、破棄は 1 回だけ行う）
+      group.userData.sharedGeometry = geometry;
+
+      return group;
+    }
+
+    // ============================================================
+    // disposePolyGroup：再生成時に GPU リソースを確実に破棄する
+    // ============================================================
+    function disposePolyGroup(group) {
+      // ジオメトリ（共有なので1回だけ）
+      const geom = group.userData.sharedGeometry;
+      if (geom) geom.dispose();
+
+      // マテリアルは各 Mesh が所有するので traverse で破棄する
+      group.traverse((obj) => {
+        if (obj.isMesh) {
+          const mat = obj.material;
+          if (Array.isArray(mat)) {
+            mat.forEach((m) => m && m.dispose && m.dispose());
+          } else if (mat && mat.dispose) {
+            mat.dispose();
+          }
+        }
+      });
+    }
+
+    // ============================================================
+    // render：アニメーション（回転）
+    // ============================================================
+    function render() {
+      stats.update();
+
+      step += 0.01;
+      if (polyGroup) {
+        polyGroup.rotation.y = step;
+      }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(render);
+    }
+
+    // ============================================================
+    // resize：画面サイズ変更対応
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // stats：FPS 表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0);
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
