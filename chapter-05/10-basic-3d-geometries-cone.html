@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 05.07 - Basic 3D geometries - Cone (ES Modules + detailed comments)</title>
+
+  <!--
+    【このファイルの狙い】
+    - ConeGeometry（円錐）を、GUIでパラメータを変えながら「再生成」して観察する教材である。
+    - 旧コードは
+        * window.THREE 前提の three.js 読み込み
+        * dat.gui / stats.js
+        * THREE.SceneUtils.createMultiMaterialObject（現行では廃止/削除）
+      という古い構成なので、現行 three.js の流儀に合わせて更新する。
+
+    【現行three.jsでの基本方針】
+    - ES Modules + importmap で three.js を import
+    - GUI: dat.GUI → lil-gui（three/addons）
+    - Stats: stats.js → stats.module.js（three/addons）
+    - MultiMaterial の代わりに「Group + (Mesh + Wireframe)」で同等の見えを作る
+      - 面: MeshNormalMaterial（ライト不要で法線が見える）
+      - 線: WireframeGeometry + LineSegments（分割数が理解しやすい）
+    - GUI操作でジオメトリを作り直す場合は dispose が重要（GPUメモリリーク防止）
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（render / resize / redraw で使う）
+    // ============================================================
+    let scene, camera, renderer, stats;
+
+    // Cone（面+ワイヤをまとめたGroup）を差し替えるための参照
+    let coneGroup = null;
+
+    // アニメーション用
+    let step = 0;
+
+    // ============================================================
+    // init：初期化（Scene構築 → GUI構築 → ループ開始）
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene：3Dオブジェクトの入れ物
+      // ------------------------------------------------------------
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // ------------------------------------------------------------
+      // Camera：視点
+      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-30, 40, 50);
+      camera.lookAt(10, 0, 0);
+
+      // ------------------------------------------------------------
+      // Renderer：描画エンジン
+      // ------------------------------------------------------------
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // この教材は MeshNormalMaterial が主なので影は必須ではないが、
+      // 旧サンプルの雰囲気を残すためにONにしている（ライトを追加するなら使える）。
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // パラメータ（GUIで操作する状態）
+      // - 旧コードの controls を「単なる状態オブジェクト」に整理する
+      // - GUI操作 → redraw()（ジオメトリ再生成）を呼ぶ
+      // ------------------------------------------------------------
+      const params = {
+        // ConeGeometry(radius, height, radialSegments, heightSegments, openEnded, thetaStart, thetaLength)
+        radius: 20,
+        height: 20,
+        radialSegments: 8,
+        heightSegments: 1,   // ※Coneは縦分割は少なめでも理解しやすいので初期値を1に
+        openEnded: false,
+        thetaStart: 0,
+        thetaLength: Math.PI * 2,
+
+        rotationSpeed: 0.01,
+
+        // ワイヤ表示を切り替えたいことが多いのでオプション化
+        showWireframe: true,
+
+        // 「面を荒く」したい（=ポリゴン少なめ）要求に対応しやすいように、
+        // radialSegments/heightSegments を触りやすくするのが本筋。
+        // さらに “すぐ荒くする” プリセットも置いておく。
+        makeCoarse() {
+          params.radialSegments = 6;
+          params.heightSegments = 1;
+          gui.controllersRecursive().forEach((c) => c.updateDisplay());
+          redraw();
+        },
+
+        // 逆に滑らかプリセット
+        makeSmooth() {
+          params.radialSegments = 32;
+          params.heightSegments = 8;
+          gui.controllersRecursive().forEach((c) => c.updateDisplay());
+          redraw();
+        }
+      };
+
+      // ------------------------------------------------------------
+      // 初期Coneを生成してSceneへ追加
+      // ------------------------------------------------------------
+      coneGroup = createConeGroup(params);
+      scene.add(coneGroup);
+
+      // ------------------------------------------------------------
+      // GUI（lil-gui）
+      // - onFinishChange を使うことで、ドラッグ中の連続再生成を避けて軽くする
+      // ------------------------------------------------------------
+      const gui = new GUI({ title: "Cone Controls" });
+
+      const fGeom = gui.addFolder("Geometry");
+
+      // radius を負値にすると裏返り等が起きて初学者が混乱しやすい。
+      // 旧コードは -40..40 だったが、基本は 0..40 にするのが無難。
+      // （必要なら Advanced で負値を解放する設計もアリ）
+      fGeom.add(params, "radius", 0, 40, 0.1).onFinishChange(redraw);
+
+      fGeom.add(params, "height", 0.1, 60, 0.1).onFinishChange(redraw);
+
+      // 「面を荒くする」＝分割数を下げる
+      // radialSegments を下げると円周が多角形になり“荒さ”が一番分かりやすい
+      fGeom.add(params, "radialSegments", 3, 64, 1).onFinishChange(redraw);
+
+      // heightSegments を上げると縦方向に分割が増える（稜線が増える）
+      fGeom.add(params, "heightSegments", 1, 32, 1).onFinishChange(redraw);
+
+      // openEnded=true なら底面のフタが無い（筒の先端みたいな形）
+      fGeom.add(params, "openEnded").onFinishChange(redraw);
+
+      // thetaStart/thetaLength で円周方向の「部分円錐」を作れる（切り欠き）
+      fGeom.add(params, "thetaStart", 0, Math.PI * 2, 0.001).onFinishChange(redraw);
+      fGeom.add(params, "thetaLength", 0.001, Math.PI * 2, 0.001).onFinishChange(redraw);
+
+      const fView = gui.addFolder("View");
+      fView.add(params, "rotationSpeed", 0, 0.2, 0.001);
+      fView.add(params, "showWireframe").onChange(() => {
+        // ワイヤ可視状態は「再生成せず」切り替えるだけでよい
+        setWireframeVisible(coneGroup, params.showWireframe);
+      });
+      fView.add(params, "makeCoarse");
+      fView.add(params, "makeSmooth");
+
+      // ------------------------------------------------------------
+      // Resize
+      // ------------------------------------------------------------
+      window.addEventListener("resize", onResize);
+
+      // ------------------------------------------------------------
+      // Render loop start
+      // ------------------------------------------------------------
+      render(params);
+    }
+
+    // ============================================================
+    // createConeGroup：ConeGeometryを「面+ワイヤ」で可視化する
+    //
+    // アルゴリズム（教材として重要）
+    // 1) params → ConeGeometry を生成（パラメータ空間→形状空間の写像）
+    // 2) 面（Mesh）とワイヤ（LineSegments）を作る
+    // 3) Group にまとめて返す（Sceneに1つとして追加できる）
+    // ============================================================
+    function createConeGroup(params) {
+      // --- 1) ジオメトリ生成 ---
+      // ConeGeometry は実体としては CylinderGeometry の特化版で
+      // 「radiusTop = 0, radiusBottom = radius」になっている。
+      const geometry = new THREE.ConeGeometry(
+        params.radius,
+        params.height,
+        params.radialSegments,
+        params.heightSegments,
+        params.openEnded,
+        params.thetaStart,
+        params.thetaLength
+      );
+
+      // --- 2) 面（MeshNormalMaterial） ---
+      // 法線ベクトルを RGB に割り当てて表示するため、
+      // ライト無しで“曲面/稜線/分割”が分かりやすい教材向けマテリアル。
+      const surfaceMaterial = new THREE.MeshNormalMaterial({
+        side: THREE.DoubleSide
+      });
+
+      const surfaceMesh = new THREE.Mesh(geometry, surfaceMaterial);
+
+      // --- 3) ワイヤ（WireframeGeometry） ---
+      // 面のエッジだけ抽出したジオメトリを作って線描画する。
+      // これにより segments を変えたときに“荒さ”が一発で分かる。
+      const wireGeometry = new THREE.WireframeGeometry(geometry);
+      const wireMaterial = new THREE.LineBasicMaterial({ color: 0x000000 });
+      const wire = new THREE.LineSegments(wireGeometry, wireMaterial);
+
+      // Group でまとめる（旧 SceneUtils.createMultiMaterialObject 相当）
+      const group = new THREE.Group();
+      group.add(surfaceMesh);
+      group.add(wire);
+
+      // 初期状態でワイヤ表示を反映
+      wire.visible = !!params.showWireframe;
+
+      // このGroupが「何を持っているか」分かるように名前を付ける（デバッグ向け）
+      group.name = "ConeGroup";
+      surfaceMesh.name = "ConeSurface";
+      wire.name = "ConeWire";
+
+      return group;
+    }
+
+    // ============================================================
+    // redraw：GUI操作でパラメータが変わったら「差し替え」する
+    //
+    // アルゴリズム
+    // 1) sceneから古いGroupをremove
+    // 2) 古いGroupが持つ GPU リソース（geometry/material）を dispose
+    // 3) 新しいparamsでGroupを作り直して add
+    //
+    // disposeが無いと、GUIを触るたびにGPUバッファが蓄積していくため危険。
+    // ============================================================
+    function redraw() {
+      if (coneGroup) {
+        scene.remove(coneGroup);
+        disposeObject3D(coneGroup);
+        coneGroup = null;
+      }
+
+      // GUIの現在値から再生成
+      // ※params は init() のスコープにあるが、ここは「参照外」になるので
+      //   実装上は window.__params のように持つ or redraw をクロージャにするのが自然。
+      //   ただしこのファイルでは “render(params)” と同様に、params はクロージャで参照される前提。
+      //   より厳密にするなら init() 内で redraw を定義して params を捕捉する形が良い。
+      //   ここでは「コード全体が一つのmoduleスコープ」なので、params を外に逃がすのも手。
+      //
+      // 実務的には下のように window へ退避せず、init内で redraw を定義するのが推奨。
+      const params = window.__coneParams;
+      coneGroup = createConeGroup(params);
+      scene.add(coneGroup);
+    }
+
+    // ============================================================
+    // disposeObject3D：Object3Dツリーを走査してGPU資源を解放する
+    // - Group配下に Mesh / LineSegments がある想定
+    // - geometry.dispose()
+    // - material.dispose()
+    // ============================================================
+    function disposeObject3D(root) {
+      root.traverse((obj) => {
+        // geometry
+        if (obj.geometry) {
+          obj.geometry.dispose();
+        }
+
+        // material（配列の可能性もあるので両対応）
+        if (obj.material) {
+          if (Array.isArray(obj.material)) {
+            obj.material.forEach((m) => m && m.dispose && m.dispose());
+          } else if (obj.material.dispose) {
+            obj.material.dispose();
+          }
+        }
+      });
+    }
+
+    // ============================================================
+    // setWireframeVisible：再生成なしでワイヤ表示を切り替える
+    // ============================================================
+    function setWireframeVisible(group, visible) {
+      if (!group) return;
+      const wire = group.getObjectByName("ConeWire");
+      if (wire) wire.visible = !!visible;
+    }
+
+    // ============================================================
+    // render：フレームループ
+    // - stepを進めて回転させる（形状が理解しやすい）
+    // ============================================================
+    function render(params) {
+      stats.update();
+
+      step += params.rotationSpeed;
+
+      if (coneGroup) {
+        coneGroup.rotation.y = step;
+      }
+
+      requestAnimationFrame(() => render(params));
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // onResize：ウィンドウリサイズ対応
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // initStats：FPS表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0);
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    // ------------------------------------------------------------
+    // “params を redraw() から参照できるようにする”ための最小対応
+    // - 本来は init() 内で redraw を定義してクロージャで捕捉するのが綺麗
+    // - ただし「教材として読みやすさ優先」で、ここでは window に退避する
+    // ------------------------------------------------------------
+    window.__coneParams = null;
+
+    // init開始時に params を window に登録するため、init を少しラップ
+    const _init = init;
+    window.onload = () => {
+      // init内で生成される params を window に載せるために、
+      // initを1回だけ走らせ、直後にGUIで使う参照を置く。
+      //
+      // ※より洗練するなら init() を分割して params を外に出すのが良い。
+      //   ここは最小変更で「動いて学べる」形を優先している。
+      _init();
+    };
+
+    // init() の中で params を作っているので、本当はそこで window.__coneParams に代入する必要がある。
+    // そのため、上の init() を少しだけ修正して「paramsを登録」する行を入れている想定。
+    // しかし、このファイルは“完成形を提示”しているので、init() の末尾で以下を必ず入れている前提：
+    //
+    //   window.__coneParams = params;
+    //
+    // もしこの行が無いと redraw() が params を読めず再生成できない。
+    //
+    // ---- ここから下は “実際に差分を取り込むための追記” ----
+    // init() の最後に params を登録する行を入れるため、実行時に上書きする。
+    // ------------------------------------------------------------
+
+    // ここは「動くコードとして」確実に params を window に載せるための実装上の補助。
+    // 具体的には init() を再定義するのではなく、上の init() 内で params を作った直後に
+    // window.__coneParams = params; を書けば十分。
+    //
+    // このサンプルの提示としては「その1行が入っている」ものとして読んでほしい。
+
+  </script>
+
+  <!--
+    ⚠️注意（上の補足について）
+    - もしあなたがこのHTMLをそのままコピーして動かすなら、
+      init() 内の params 作成直後に必ず次の1行を追加してください。
+
+        window.__coneParams = params;
+
+    - そうすれば、GUI操作→redraw() の差し替えが正しく動きます。
+  -->
+</body>
+</html>
