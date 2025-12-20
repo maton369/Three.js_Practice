@@ -1,0 +1,274 @@
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 05.08 - Basic 3D geometries - Torus (ES Modules + detailed comments)</title>
+
+  <!--
+    【このサンプルの目的】
+    - THREE.TorusGeometry のパラメータ（radius / tube / radialSegments / tubularSegments / arc）を
+      GUIで変更し、その場でジオメトリを作り直して形状変化を観察する。
+    - “分割数を上げると滑らかになる / 下げると荒くなる” が直感的に分かるように
+      「面（MeshNormalMaterial）」＋「ワイヤ（wireframe）」を同時に表示する。
+
+    【旧コードからの主な修正点】
+    - 旧: window.THREE 前提の three.js / dat.gui / stats.js / SceneUtils.createMultiMaterialObject
+    - 新: ES Modules + importmap で three を import
+    - GUI: dat.GUI → lil-gui（three/addons）
+    - Stats: stats.js → stats.module.js（three/addons）
+    - SceneUtils.createMultiMaterialObject は現行three.jsでは推奨されないため
+      Group + (Mesh + wireframe Mesh) に置き換える
+    - redraw（ジオメトリ再生成）のたびに、古い geometry/material を dispose してGPUメモリリークを防ぐ
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import Stats from "three/addons/libs/stats.module.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+    // ============================================================
+    // グローバル（render/resizeで参照）
+    // ============================================================
+    let scene, camera, renderer, stats;
+    let torusGroup;           // Mesh(面) + Mesh(ワイヤ) をまとめた Group
+    let step = 0;
+
+    // ============================================================
+    // init：初期化
+    // ============================================================
+    function init() {
+      stats = initStats();
+
+      // Scene：全オブジェクトの入れ物
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xeeeeee);
+
+      // Camera：視点
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(-30, 40, 50);
+      camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+      // Renderer：WebGL描画
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = false; // 法線色 + ワイヤ観察が主目的なので影は不要
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Torus の初期パラメータ
+      // - radius: ドーナツ全体の半径（中心から管の中心まで）
+      // - tube:   管の半径（ドーナツの太さ）
+      // - radialSegments: 管の断面方向の分割数（少ないほど角ばる）
+      // - tubularSegments: ドーナツの輪っか方向の分割数（少ないほどカクカク）
+      // - arc:    何周分作るか（2πで一周、πで半周など）
+      // ------------------------------------------------------------
+      const params = {
+        radius: 10,
+        tube: 10,
+        radialSegments: 8,
+        tubularSegments: 6,
+        arc: Math.PI * 2,
+        rotationSpeed: 0.01
+      };
+
+      // 最初のトーラスを生成して追加
+      torusGroup = createTorusGroup(params);
+      scene.add(torusGroup);
+
+      // ------------------------------------------------------------
+      // GUI：パラメータ変更 → redraw（作り直し）
+      // 重要：
+      // - ジオメトリを作り直す場合、古い geometry/material を dispose しないと
+      //   GPUに積まれたバッファが残り続けてメモリリークになる。
+      // ------------------------------------------------------------
+      const gui = new GUI({ title: "Torus Controls" });
+
+      const fGeom = gui.addFolder("Geometry");
+
+      fGeom.add(params, "radius", 0.1, 40, 0.1).onChange(redraw);
+      fGeom.add(params, "tube", 0.1, 40, 0.1).onChange(redraw);
+
+      // 分割数は整数である必要がある（小さすぎる値は破綻する）ので安全に丸める
+      fGeom.add(params, "radialSegments", 3, 64, 1).onChange(redraw);
+      fGeom.add(params, "tubularSegments", 3, 128, 1).onChange(redraw);
+
+      fGeom.add(params, "arc", 0.01, Math.PI * 2, 0.01).onChange(redraw);
+
+      const fAnim = gui.addFolder("Animation");
+      fAnim.add(params, "rotationSpeed", 0, 0.1, 0.001);
+
+      // リサイズ対応
+      window.addEventListener("resize", onResize);
+
+      // ループ開始
+      render(params);
+
+      // ============================================================
+      // redraw：ジオメトリを作り直して差し替える
+      // ============================================================
+      function redraw() {
+        // (1) 旧オブジェクトをsceneから外す
+        scene.remove(torusGroup);
+
+        // (2) GPUリソース解放（重要）
+        // torusGroupの子要素（面Mesh / ワイヤMesh）のgeometry/materialをdisposeする
+        disposeObject3D(torusGroup);
+
+        // (3) 新しいパラメータで作り直してsceneへ追加
+        torusGroup = createTorusGroup(params);
+        scene.add(torusGroup);
+      }
+    }
+
+    // ============================================================
+    // createTorusGroup：
+    // - TorusGeometry を生成
+    // - “面”と“ワイヤ”を2つのMeshで重ねてGroupにまとめて返す
+    // ============================================================
+    function createTorusGroup(params) {
+      // パラメータはGUIで小数になる可能性があるので、分割数は確実に整数に丸める
+      const radialSegments = Math.max(3, Math.round(params.radialSegments));
+      const tubularSegments = Math.max(3, Math.round(params.tubularSegments));
+
+      // TorusGeometryの生成（ここが “パラメータ→ポリゴン” 変換の中心）
+      const geom = new THREE.TorusGeometry(
+        params.radius,
+        params.tube,
+        radialSegments,
+        tubularSegments,
+        params.arc
+      );
+
+      // 面：MeshNormalMaterial
+      // - ライト不要で、法線方向をRGBに割り当てた色で表示する
+      // - ジオメトリの曲面/分割の違いが分かりやすい教材向けマテリアル
+      const solidMat = new THREE.MeshNormalMaterial({
+        side: THREE.DoubleSide
+      });
+
+      const solidMesh = new THREE.Mesh(geom, solidMat);
+
+      // ワイヤ：MeshBasicMaterial の wireframe を使用
+      // - “線だけ”を描くことで、分割（segments）数の違いがはっきり見える
+      // - solidMeshと同じジオメトリを共有するため、表示が一致して比較しやすい
+      // - z-fighting（面と線が同じ深度でチラつく）を避けるため polygonOffset を使う
+      const wireMat = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        wireframe: true,
+        transparent: true,
+        opacity: 0.6,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1
+      });
+
+      const wireMesh = new THREE.Mesh(geom, wireMat);
+
+      // Groupにまとめる（旧SceneUtilsの“マルチマテリアルオブジェクト”相当）
+      const group = new THREE.Group();
+      group.add(solidMesh);
+      group.add(wireMesh);
+
+      // デバッグ/破棄時に追いやすいように名前を付けておく（任意）
+      group.name = "torusGroup";
+      solidMesh.name = "solid";
+      wireMesh.name = "wire";
+
+      return group;
+    }
+
+    // ============================================================
+    // disposeObject3D：
+    // - Object3D配下を走査して geometry/material をdisposeする
+    // - “redrawで作り直す”系のサンプルでは必須
+    // ============================================================
+    function disposeObject3D(root) {
+      if (!root) return;
+
+      root.traverse((obj) => {
+        if (obj.isMesh) {
+          if (obj.geometry) obj.geometry.dispose();
+
+          // materialが配列の場合もあり得るので両対応
+          const mat = obj.material;
+          if (Array.isArray(mat)) {
+            mat.forEach((m) => m && m.dispose && m.dispose());
+          } else if (mat && mat.dispose) {
+            mat.dispose();
+          }
+        }
+      });
+    }
+
+    // ============================================================
+    // render：毎フレーム描画
+    // - torusGroup を回転させ、形状が見やすいようにする
+    // ============================================================
+    function render(params) {
+      stats.update();
+
+      step += params.rotationSpeed;
+
+      if (torusGroup) {
+        torusGroup.rotation.y = step;
+      }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(() => render(params));
+    }
+
+    // ============================================================
+    // onResize：画面リサイズ対応
+    // ============================================================
+    function onResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // initStats：FPS表示
+    // ============================================================
+    function initStats() {
+      const s = new Stats();
+      s.showPanel(0); // 0: fps
+      s.dom.style.position = "absolute";
+      s.dom.style.left = "0px";
+      s.dom.style.top = "0px";
+      document.getElementById("Stats-output").appendChild(s.dom);
+      return s;
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
