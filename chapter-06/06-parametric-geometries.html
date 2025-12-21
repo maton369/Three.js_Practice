@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 06.06 - Parametric geometries (no local libs, fixed byteLength error)</title>
+
+  <!--
+    ✅ あなたのスクショのエラー：
+      Uncaught TypeError: Cannot read properties of undefined (reading 'byteLength')
+
+    原因（ほぼ確定）：
+      BufferGeometry.setIndex(...) に “TypedArray(Uint16Array/Uint32Array)” を直接渡すと、
+      three のバージョンによっては index 属性がセットされず（= geometry.index が undefined のまま）、
+      描画や WireframeGeometry 作成のタイミングで内部が geometry.index.array.byteLength を読みに行って落ちる。
+
+    修正：
+      setIndex( typedArray ) ではなく、
+      setIndex( new THREE.BufferAttribute(typedArray, 1) ) で渡す（これが堅い）。
+      Uint32 を使う時は Uint32BufferAttribute を使うと意図が明確。
+
+    ついでに：
+      - importmap は jsDelivr の three / three/addons を継続
+      - import / 例外は画面に表示（沈黙で灰色だけを避ける）
+      - “とりあえず見える” 初期カメラ配置 + bbox-fit を両方入れる
+  -->
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eaeaea; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 330px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.90);
+      box-shadow: 0 12px 30px rgba(0,0,0,0.16);
+      backdrop-filter: blur(8px);
+      user-select: none;
+      z-index: 10;
+    }
+    #ui h1 { font-size: 14px; margin: 0 0 10px; font-weight: 800; }
+    .row { display: grid; grid-template-columns: 120px 1fr; gap: 10px; align-items: center; margin: 8px 0; }
+    label { font-size: 12px; color: #333; }
+    select, input[type="range"] { width: 100%; }
+    .value { font-size: 12px; text-align: right; color: #333; margin-top: 4px; }
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+      z-index: 10;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255, 80, 80, 0.92);
+      color: #fff;
+      font-size: 12px;
+      max-width: calc(100vw - 24px);
+      display: none;
+      white-space: pre-wrap;
+      z-index: 10;
+    }
+    button {
+      width: 100%;
+      border: 0;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: #111;
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:active { transform: translateY(1px); }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Parametric Geometries（libs無し版）</h1>
+
+    <div class="row">
+      <label for="func">関数</label>
+      <select id="func">
+        <option value="klein">klein</option>
+        <option value="radialWave">radialWave</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label for="slices">slices（u分割）</label>
+      <div>
+        <input id="slices" type="range" min="10" max="240" step="5" value="120" />
+        <div class="value" id="slicesVal">120</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="stacks">stacks（v分割）</label>
+      <div>
+        <input id="stacks" type="range" min="10" max="240" step="5" value="120" />
+        <div class="value" id="stacksVal">120</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="rotSpeed">回転速度</label>
+      <div>
+        <input id="rotSpeed" type="range" min="0" max="0.08" step="0.001" value="0.01" />
+        <div class="value" id="rotSpeedVal">0.010</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="wire">ワイヤ表示</label>
+      <input id="wire" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label>操作</label>
+      <button id="rebuildBtn" type="button">Rebuild（再生成）</button>
+    </div>
+
+    <div class="row">
+      <label>カメラ操作</label>
+      <div style="font-size:12px;color:#333;line-height:1.35;">
+        左ドラッグ：回転 / ホイール：ズーム / 右ドラッグ：平行移動
+      </div>
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    // ------------------------------------------------------------
+    // エラー表示（沈黙しない）
+    // ------------------------------------------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+    window.addEventListener("error", (e) => showError("window.onerror:\n" + (e?.message || e)));
+    window.addEventListener("unhandledrejection", (e) => showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e)));
+
+    // ------------------------------------------------------------
+    // UI
+    // ------------------------------------------------------------
+    const uiFunc = document.getElementById("func");
+    const uiSlices = document.getElementById("slices");
+    const uiStacks = document.getElementById("stacks");
+    const uiRotSpeed = document.getElementById("rotSpeed");
+    const uiWire = document.getElementById("wire");
+    const uiRebuildBtn = document.getElementById("rebuildBtn");
+
+    const slicesVal = document.getElementById("slicesVal");
+    const stacksVal = document.getElementById("stacksVal");
+    const rotSpeedVal = document.getElementById("rotSpeedVal");
+
+    function syncLabels() {
+      slicesVal.textContent = String(uiSlices.value);
+      stacksVal.textContent = String(uiStacks.value);
+      rotSpeedVal.textContent = Number(uiRotSpeed.value).toFixed(3);
+    }
+    syncLabels();
+
+    // ------------------------------------------------------------
+    // Three.js 基本セット
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xeeeeee);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 2000);
+
+    // bbox-fit が失敗しても “何か” は見えるように保険
+    camera.position.set(60, 40, 60);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // 補助表示（これすら見えないなら描画が動いてない）
+    scene.add(new THREE.AxesHelper(40));
+    const grid = new THREE.GridHelper(200, 20);
+    grid.position.y = -40;
+    scene.add(grid);
+
+    // ライト（Phong）
+    scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(120, 220, 150);
+    scene.add(dir);
+
+    // OrbitControls
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+
+    // 表示対象
+    let surfaceMesh = null;
+    let wireMesh = null;
+
+    // ------------------------------------------------------------
+    // パラメトリック関数（u,v は 0..1）
+    // ------------------------------------------------------------
+    function klein(u01, v01) {
+      let u = u01 * Math.PI;
+      let v = v01 * 2 * Math.PI;
+      u = u * 2;
+
+      let x, y, z;
+      if (u < Math.PI) {
+        x = 3 * Math.cos(u) * (1 + Math.sin(u)) + (2 * (1 - Math.cos(u) / 2)) * Math.cos(u) * Math.cos(v);
+        z = -8 * Math.sin(u) - 2 * (1 - Math.cos(u) / 2) * Math.sin(u) * Math.cos(v);
+      } else {
+        x = 3 * Math.cos(u) * (1 + Math.sin(u)) + (2 * (1 - Math.cos(u) / 2)) * Math.cos(v + Math.PI);
+        z = -8 * Math.sin(u);
+      }
+      y = -2 * (1 - Math.cos(u) / 2) * Math.sin(v);
+      return new THREE.Vector3(x, y, z);
+    }
+
+    function radialWave(u01, v01) {
+      const u = u01 * 2 * Math.PI;
+      const v = v01 * 2 * Math.PI;
+
+      const r = 30;
+      const x = Math.sin(u) * r;
+      const z = Math.cos(u) * r;
+      const y = (Math.sin(u * 4) + Math.cos(v * 2)) * 4;
+
+      return new THREE.Vector3(x, y, z);
+    }
+
+    function getCurrentFunc() {
+      return uiFunc.value === "klein" ? klein : radialWave;
+    }
+
+    // ------------------------------------------------------------
+    // 重要：自前 ParametricGeometry（positions + indices）
+    // ------------------------------------------------------------
+    function buildParametricGeometry(f, slices, stacks) {
+      const vertU = slices + 1;
+      const vertV = stacks + 1;
+      const vertexCount = vertU * vertV;
+
+      const positions = new Float32Array(vertexCount * 3);
+
+      // (u,v) 格子をサンプリングして頂点配列を作る
+      let p = 0;
+      for (let i = 0; i <= slices; i++) {
+        const u = i / slices;
+        for (let j = 0; j <= stacks; j++) {
+          const v = j / stacks;
+          const v3 = f(u, v);
+          positions[p++] = v3.x;
+          positions[p++] = v3.y;
+          positions[p++] = v3.z;
+        }
+      }
+
+      // 四角セルを三角形2枚へ（index生成）
+      const indexCount = slices * stacks * 6;
+
+      // index は値が 65535 を超えると Uint16 が壊れるので、頂点数で切り替える
+      const indexArray = (vertexCount > 65535) ? new Uint32Array(indexCount) : new Uint16Array(indexCount);
+
+      let t = 0;
+      for (let i = 0; i < slices; i++) {
+        for (let j = 0; j < stacks; j++) {
+          const a = i * (stacks + 1) + j;
+          const b = (i + 1) * (stacks + 1) + j;
+          const c = (i + 1) * (stacks + 1) + (j + 1);
+          const d = i * (stacks + 1) + (j + 1);
+
+          indexArray[t++] = a; indexArray[t++] = b; indexArray[t++] = d;
+          indexArray[t++] = b; indexArray[t++] = c; indexArray[t++] = d;
+        }
+      }
+
+      const geom = new THREE.BufferGeometry();
+
+      // positions は BufferAttribute で登録
+      geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+
+      // ✅ ここが今回の本命修正：
+      //   setIndex に TypedArray を “直で渡さず”、必ず BufferAttribute で包む
+      //   （これをしないと geometry.index が undefined のままになり、内部で byteLength を読んで落ちることがある）
+      if (indexArray instanceof Uint32Array) {
+        geom.setIndex(new THREE.Uint32BufferAttribute(indexArray, 1));
+      } else {
+        geom.setIndex(new THREE.Uint16BufferAttribute(indexArray, 1));
+      }
+
+      // 陰影のための法線
+      geom.computeVertexNormals();
+
+      // bbox（中心寄せ & カメラfit）
+      geom.computeBoundingBox();
+
+      return geom;
+    }
+
+    function centerGeometry(geom) {
+      geom.computeBoundingBox();
+      const bb = geom.boundingBox;
+      if (!bb) return;
+
+      const c = new THREE.Vector3();
+      bb.getCenter(c);
+
+      geom.translate(-c.x, -c.y, -c.z);
+      geom.computeBoundingBox();
+    }
+
+    function fitCameraToGeometry(cam, geom, margin = 1.25) {
+      geom.computeBoundingBox();
+      const bb = geom.boundingBox;
+      if (!bb) return;
+
+      const size = new THREE.Vector3();
+      bb.getSize(size);
+
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const fov = cam.fov * (Math.PI / 180);
+
+      if (!Number.isFinite(maxDim) || maxDim <= 0) return;
+
+      let dist = (maxDim / 2) / Math.tan(fov / 2);
+      dist *= margin;
+
+      cam.position.set(dist, dist * 0.7, dist);
+      cam.near = Math.max(0.1, dist / 100);
+      cam.far = Math.max(2000, dist * 10);
+      cam.updateProjectionMatrix();
+
+      cam.lookAt(0, 0, 0);
+      orbit.target.set(0, 0, 0);
+      orbit.update();
+    }
+
+    function disposeMesh(m) {
+      if (!m) return;
+      if (m.geometry) m.geometry.dispose();
+      if (m.material) {
+        if (Array.isArray(m.material)) m.material.forEach(mat => mat.dispose());
+        else m.material.dispose();
+      }
+    }
+
+    function rebuild() {
+      clearError();
+
+      try {
+        if (surfaceMesh) scene.remove(surfaceMesh);
+        if (wireMesh) scene.remove(wireMesh);
+        disposeMesh(surfaceMesh);
+        disposeMesh(wireMesh);
+        surfaceMesh = null;
+        wireMesh = null;
+
+        const slices = Math.max(10, Math.floor(Number(uiSlices.value)));
+        const stacks = Math.max(10, Math.floor(Number(uiStacks.value)));
+        const f = getCurrentFunc();
+
+        const geom = buildParametricGeometry(f, slices, stacks);
+        centerGeometry(geom);
+        fitCameraToGeometry(camera, geom, 1.25);
+
+        // 立体が分かりやすい Phong
+        const mat = new THREE.MeshPhongMaterial({
+          color: 0x3399ff,
+          specular: 0x223355,
+          shininess: 60,
+          side: THREE.DoubleSide
+        });
+
+        surfaceMesh = new THREE.Mesh(geom, mat);
+        scene.add(surfaceMesh);
+
+        // ワイヤ（学習用）
+        if (uiWire.checked) {
+          // WireframeGeometry は内部で index/attribute を参照するので、indexが正しく入ってないとここで落ちやすい
+          const wGeom = new THREE.WireframeGeometry(geom);
+          const wMat = new THREE.LineBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.35 });
+          wireMesh = new THREE.LineSegments(wGeom, wMat);
+          scene.add(wireMesh);
+        }
+      } catch (e) {
+        showError("rebuild() 例外:\n" + (e?.stack || e));
+      }
+    }
+
+    // UI
+    uiFunc.addEventListener("change", () => { syncLabels(); rebuild(); });
+    uiSlices.addEventListener("input", () => syncLabels());
+    uiStacks.addEventListener("input", () => syncLabels());
+    uiRotSpeed.addEventListener("input", () => syncLabels());
+
+    uiSlices.addEventListener("change", rebuild);
+    uiStacks.addEventListener("change", rebuild);
+    uiWire.addEventListener("change", rebuild);
+    uiRebuildBtn.addEventListener("click", rebuild);
+
+    // FPS
+    const hud = document.getElementById("hud");
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    // ループ
+    let rot = 0;
+    rebuild();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const rs = Number(uiRotSpeed.value);
+      rot += rs;
+
+      if (surfaceMesh) {
+        surfaceMesh.rotation.y = rot;
+        surfaceMesh.rotation.x = rot * 0.9;
+      }
+      if (wireMesh && surfaceMesh) {
+        wireMesh.rotation.copy(surfaceMesh.rotation);
+      }
+
+      orbit.update();
+      renderer.render(scene, camera);
+
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "func: " + uiFunc.value + "\n" +
+          "slices/stacks: " + uiSlices.value + "/" + uiStacks.value;
+      }
+    }
+    animate();
+
+    // resize
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
