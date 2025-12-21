@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 07.03 - Particle PointsMaterial (no libs, fixed + detailed comments)</title>
+
+  <!--
+    このサンプルの主題：PointsMaterial を使った「粒子群（ポイントクラウド）」の描画
+
+    ✅ 元コードの問題点（現行Three.jsで“表示されない/動かない”原因になりやすい）
+    - THREE.Geometry が廃止（r125+で削除） → BufferGeometry に置き換える必要がある
+    - stats.js / dat.gui を ../libs から読んでいる → 「libs禁止」要件に反する
+    - OrbitControls 等は不要だが、カメラが視界外になると黒画面になる
+      → 生成範囲(range)に対してカメラ距離/farが足りない、などを防ぐ
+
+    ✅ 全体アルゴリズム（この教材の核）
+    1) 乱数で点群を生成（positions）
+    2) 点ごとの色を生成（colors） ※ vertexColors=true の時だけ有効
+    3) BufferGeometry に positions/colors を登録し、Points を生成して scene に追加
+    4) 毎フレーム、必要なら Points 全体（クラウド）を回転させて描画
+    5) UI変更時は Points を remove + dispose して再生成（GPUメモリリーク防止）
+
+    ✅ libsを使わない代替
+    - Three.js は CDN (module) で読み込み
+    - dat.gui → HTMLフォーム（スライダー/チェック/色）で代替
+    - stats.js → 簡易FPS表示で代替
+  -->
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 320px;
+      padding: 12px 12px 10px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.10);
+      border: 1px solid rgba(255,255,255,0.15);
+      color: #fff;
+      backdrop-filter: blur(10px);
+      user-select: none;
+    }
+    #ui h1 { font-size: 14px; margin: 0 0 10px; font-weight: 700; }
+    .row { display: grid; grid-template-columns: 140px 1fr; gap: 10px; align-items: center; margin: 8px 0; }
+    label { font-size: 12px; opacity: 0.9; }
+    input[type="range"], input[type="color"], button { width: 100%; }
+    input[type="checkbox"] { transform: scale(1.1); }
+    .value { font-size: 12px; text-align: right; opacity: 0.9; }
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.10);
+      border: 1px solid rgba(255,255,255,0.15);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255, 80, 80, 0.92);
+      color: #fff;
+      font-size: 12px;
+      max-width: calc(100vw - 24px);
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Particle PointsMaterial</h1>
+
+    <div class="row">
+      <label for="size">size</label>
+      <div>
+        <input id="size" type="range" min="1" max="20" step="0.5" value="4" />
+        <div class="value" id="sizeVal">4.0</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="transparent">transparent</label>
+      <input id="transparent" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label for="opacity">opacity</label>
+      <div>
+        <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.6" />
+        <div class="value" id="opacityVal">0.60</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="vertexColors">vertexColors</label>
+      <input id="vertexColors" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label for="color">color</label>
+      <input id="color" type="color" value="#ffffff" />
+    </div>
+
+    <div class="row">
+      <label for="sizeAttenuation">sizeAttenuation</label>
+      <input id="sizeAttenuation" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label for="rotateSystem">rotateSystem</label>
+      <input id="rotateSystem" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label for="count">particles</label>
+      <div>
+        <input id="count" type="range" min="1000" max="60000" step="1000" value="15000" />
+        <div class="value" id="countVal">15000</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="range">range</label>
+      <div>
+        <input id="range" type="range" min="50" max="1200" step="10" value="500" />
+        <div class="value" id="rangeVal">500</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="rebuild">再生成</label>
+      <button id="rebuild" type="button">Rebuild</button>
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+
+    // ------------------------------------------------------------
+    // エラーを画面に出す（黒画面で黙らないための保険）
+    // ------------------------------------------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+    window.addEventListener("error", (e) => showError(e.message || e.error || e));
+    window.addEventListener("unhandledrejection", (e) => showError(e.reason || e));
+
+    // ------------------------------------------------------------
+    // Three.js: Scene / Camera / Renderer
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    // カメラ：元コードのままでも良いが、rangeが大きいと視界外になりやすいので far を余裕ある値に
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      10000
+    );
+    camera.position.set(20, 0, 150);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // ------------------------------------------------------------
+    // UI参照
+    // ------------------------------------------------------------
+    const ui = {
+      size: document.getElementById("size"),
+      transparent: document.getElementById("transparent"),
+      opacity: document.getElementById("opacity"),
+      vertexColors: document.getElementById("vertexColors"),
+      color: document.getElementById("color"),
+      sizeAttenuation: document.getElementById("sizeAttenuation"),
+      rotateSystem: document.getElementById("rotateSystem"),
+      count: document.getElementById("count"),
+      range: document.getElementById("range"),
+      rebuild: document.getElementById("rebuild"),
+    };
+    const labels = {
+      sizeVal: document.getElementById("sizeVal"),
+      opacityVal: document.getElementById("opacityVal"),
+      countVal: document.getElementById("countVal"),
+      rangeVal: document.getElementById("rangeVal"),
+    };
+    function syncLabels() {
+      labels.sizeVal.textContent = Number(ui.size.value).toFixed(1);
+      labels.opacityVal.textContent = Number(ui.opacity.value).toFixed(2);
+      labels.countVal.textContent = String(ui.count.value);
+      labels.rangeVal.textContent = String(ui.range.value);
+    }
+    syncLabels();
+
+    // ------------------------------------------------------------
+    // 表示対象：Points（= 点群）
+    // 再生成時に remove + dispose できるよう参照を持つ
+    // ------------------------------------------------------------
+    let cloud = null;
+
+    // ------------------------------------------------------------
+    // HSLで「緑ベース + 輝度だけランダム」を再現するユーティリティ
+    // 元コードでは `new Color(0x00ff00)` の HSL を読み、Lだけ変えていた。
+    // 現行実装でも同じ意図を明確にして再現する。
+    // ------------------------------------------------------------
+    function makeGreenishColorWithRandomLightness() {
+      const c = new THREE.Color(0x00ff00);
+      const hsl = { h: 0, s: 0, l: 0 };
+      c.getHSL(hsl);
+      // vertexごとに明度をランダム化（0..1）
+      c.setHSL(hsl.h, hsl.s, Math.random());
+      return c;
+    }
+
+    // ------------------------------------------------------------
+    // 重要：Points を生成する（旧 THREE.Geometry を BufferGeometry に置き換え）
+    // 入力：size/transparent/opacity/vertexColors/sizeAttenuation/color/count/range
+    //
+    // 生成アルゴリズム：
+    // 1) positions (Float32Array) を count*3 で確保
+    // 2) colors (Float32Array) も count*3 で確保（vertexColors=true の時に使う）
+    // 3) i=0..count-1 を回し、乱数で (x,y,z) を range 内に生成
+    // 4) 色は「緑系 + 明度だけランダム」を各頂点に詰める
+    // 5) BufferGeometry に position/color を setAttribute
+    // 6) PointsMaterial を作って Points(geom, mat) を返す
+    // ------------------------------------------------------------
+    function createParticles({
+      size,
+      transparent,
+      opacity,
+      vertexColors,
+      sizeAttenuation,
+      colorHex,
+      count,
+      range,
+    }) {
+      // positions: (x,y,z) * count
+      const positions = new Float32Array(count * 3);
+
+      // colors: (r,g,b) * count
+      // vertexColors=false の場合でも属性を持っていて害はないが、
+      // 意図を明確にするため vertexColors=true のときだけ設定する
+      const colors = vertexColors ? new Float32Array(count * 3) : null;
+
+      // range は「立方体」の一辺の長さ（中心0で [-range/2, +range/2]）
+      const half = range / 2;
+
+      for (let i = 0; i < count; i++) {
+        const base = i * 3;
+
+        // 位置：立方体内の一様乱数
+        positions[base + 0] = Math.random() * range - half; // x
+        positions[base + 1] = Math.random() * range - half; // y
+        positions[base + 2] = Math.random() * range - half; // z
+
+        if (colors) {
+          const c = makeGreenishColorWithRandomLightness();
+          colors[base + 0] = c.r;
+          colors[base + 1] = c.g;
+          colors[base + 2] = c.b;
+        }
+      }
+
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      if (colors) geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+      // boundingSphere はカリング等に使われる。点群は巨大になりがちなので計算しておくと安全
+      geom.computeBoundingSphere();
+
+      // PointsMaterial: 点の見た目を決める
+      // vertexColors=true なら `color` 属性を参照して点ごとに色が変わる
+      const mat = new THREE.PointsMaterial({
+        size,
+        transparent,
+        opacity,
+        vertexColors: vertexColors, // trueで `color` attribute を使う
+        sizeAttenuation,            // trueだと距離で点サイズが変わり、遠方が自然に小さくなる
+        color: new THREE.Color(colorHex),
+        // 黒背景 + 粒子 は additive が見栄え良いことが多い（任意）
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+
+      const pts = new THREE.Points(geom, mat);
+      pts.name = "particles";
+      return pts;
+    }
+
+    // ------------------------------------------------------------
+    // 再生成（UI更新時）
+    // - 既存の cloud を scene から remove
+    // - geometry/material を dispose（GPUメモリリーク防止）
+    // - 新しい cloud を生成して add
+    // - rangeが大きい場合に視界外にならないよう、カメラ距離/far を軽く調整
+    // ------------------------------------------------------------
+    function rebuild() {
+      clearError();
+
+      // 既存を消す
+      if (cloud) {
+        scene.remove(cloud);
+        if (cloud.geometry) cloud.geometry.dispose();
+        if (cloud.material) cloud.material.dispose();
+        cloud = null;
+      }
+
+      // UI値を読み取り（型を揃える）
+      const params = {
+        size: Number(ui.size.value),
+        transparent: ui.transparent.checked,
+        opacity: Number(ui.opacity.value),
+        vertexColors: ui.vertexColors.checked,
+        sizeAttenuation: ui.sizeAttenuation.checked,
+        colorHex: ui.color.value,
+        count: Math.max(1, Math.floor(Number(ui.count.value))),
+        range: Math.max(1, Number(ui.range.value)),
+      };
+
+      cloud = createParticles(params);
+      scene.add(cloud);
+
+      // カメラ調整：rangeに応じて「ざっくり見える距離」に置く（黒画面防止）
+      // rangeの対角 ≒ range*sqrt(3)。そこが視界に入る程度の距離を確保する。
+      const approxRadius = (params.range * Math.sqrt(3)) / 2;
+      const fov = camera.fov * (Math.PI / 180);
+      const dist = (approxRadius / Math.tan(fov / 2)) * 0.9;
+
+      camera.position.set(20, 0, Math.max(150, dist));
+      camera.near = 0.1;
+      camera.far = Math.max(1000, dist * 5);
+      camera.updateProjectionMatrix();
+      camera.lookAt(0, 0, 0);
+    }
+
+    // UIイベント
+    const rebuildOnChange = () => { syncLabels(); rebuild(); };
+    ui.size.addEventListener("input", () => { syncLabels(); });
+    ui.opacity.addEventListener("input", () => { syncLabels(); });
+    ui.count.addEventListener("input", () => { syncLabels(); });
+    ui.range.addEventListener("input", () => { syncLabels(); });
+
+    ui.size.addEventListener("change", rebuildOnChange);
+    ui.transparent.addEventListener("change", rebuildOnChange);
+    ui.opacity.addEventListener("change", rebuildOnChange);
+    ui.vertexColors.addEventListener("change", rebuildOnChange);
+    ui.color.addEventListener("change", rebuildOnChange);
+    ui.sizeAttenuation.addEventListener("change", rebuildOnChange);
+    ui.count.addEventListener("change", rebuildOnChange);
+    ui.range.addEventListener("change", rebuildOnChange);
+    ui.rebuild.addEventListener("click", rebuild);
+
+    // ------------------------------------------------------------
+    // 簡易FPS（stats.jsの代替）
+    // ------------------------------------------------------------
+    const hud = document.getElementById("hud");
+    let lastT = performance.now();
+    let frames = 0;
+
+    // ------------------------------------------------------------
+    // ループ（回転アニメ）
+    // ------------------------------------------------------------
+    let step = 0;
+
+    rebuild(); // 初期生成
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // rotateSystem が true のときだけ回転
+      if (ui.rotateSystem.checked && cloud) {
+        step += 0.01;
+        cloud.rotation.x = step;
+        cloud.rotation.z = step;
+      }
+
+      renderer.render(scene, camera);
+
+      // FPS更新（1秒に1回）
+      frames++;
+      const now = performance.now();
+      if (now - lastT >= 1000) {
+        const fps = (frames * 1000) / (now - lastT);
+        frames = 0;
+        lastT = now;
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "particles: " + ui.count.value + "\n" +
+          "range: " + ui.range.value + "\n" +
+          "vertexColors: " + (ui.vertexColors.checked ? "on" : "off");
+      }
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // リサイズ対応
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
