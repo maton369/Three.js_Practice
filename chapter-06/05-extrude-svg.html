@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Extrude SVG (no local libs, fixed)</title>
+
+  <!--
+    ✅ 要件対応
+    - ../libs/ など「ローカルの libs」は一切使わない
+    - 外部ヘルパー（stats.js / dat.gui / d3-threeD / OrbitControls）も使わない
+    - “真っ暗” の原因になりがちな「視界外」「ライト不足」「座標系ズレ」を潰す
+
+    ----------------------------
+    全体アルゴリズム（今回の実装）
+    ----------------------------
+
+    1) SVG の path(d) 文字列を用意する（batman の d をそのまま文字列で埋め込む）
+    2) SVG path を “自前パーサ” で解析して THREE.Shape を生成する
+       - 対応コマンド：M/m, L/l, H/h, V/v, C/c, Q/q, Z/z
+       - 今回の batman は主に M と C と L のため、これで足りる
+       - SVG は通常「Y+ が下」なので、Three.js 空間に合わせて Y を反転する（y = -y）
+    3) ExtrudeGeometry(shape, options) で押し出して 3D メッシュ生成
+    4) Box3 でバウンディングボックスを計算し
+       - メッシュを原点に中心寄せ（見失い対策）
+       - カメラを “自動フィット” して必ず視界内に入れる（真っ暗対策の本丸）
+    5) 標準ライト（Hemisphere + Directional）＋ MeshStandardMaterial で確実に見えるようにする
+    6) requestAnimationFrame でゆっくり回転（操作なしでも立体だと分かる）
+
+    ----------------------------
+    “真っ暗” になる典型原因
+    ----------------------------
+    A) path→Shape 変換が失敗して geometry が空 → 何も描画されない
+       → 自前パーサでトークン化/解釈し、最低限のコマンドを対応
+
+    B) カメラが外を見ている（オブジェクトが視界外）
+       → fitCameraToObject() で bbox から距離を計算して必ず写す
+
+    C) ライトがない/弱い（Phong/Standard などはライトが必須）
+       → Hemisphere + Directional を入れて強度も十分にする
+
+    D) SVG座標が巨大でスケールが合っていない
+       → bbox からサイズを取って “自動スケール” して見やすい大きさに揃える
+  -->
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { overflow: hidden; background: #111; }
+    #info {
+      position: fixed; left: 12px; top: 12px;
+      padding: 10px 12px; border-radius: 10px;
+      background: rgba(0,0,0,0.55); color: #fff;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      max-width: 560px;
+      pointer-events: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="info"></div>
+
+  <script type="module">
+    // ============================================================
+    // three.js は “ローカル libs” を使わず、ES Modules で読み込む
+    // （three.js 自体を使わないと 3D 描画ができないので、ここだけは必須）
+    // ============================================================
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+
+    // ============================================================
+    // 1) SVG path(d) を埋め込み
+    //    ※ユーザーが提示した d をそのまま使用
+    // ============================================================
+    const BATMAN_D = `M 261.135 114.535 C 254.906 116.662 247.491 118.825 244.659 119.344 C 229.433 122.131 177.907 142.565 151.973 156.101 C 111.417 177.269 78.9808 203.399 49.2992 238.815 C 41.0479 248.66 26.5057 277.248 21.0148 294.418 C 14.873 313.624 15.3588 357.341 21.9304 376.806 C 29.244 398.469 39.6107 416.935 52.0865 430.524 C 58.2431 437.23 63.3085 443.321 63.3431 444.06 C 63.4748 446.883 102.278 479.707 120.51 492.418 C 131.003 499.734 148.168 509.93 158.654 515.075 C 169.139 520.22 179.431 525.34 181.524 526.454 C 187.725 529.754 187.304 527.547 179.472 515.713 C 164.806 493.553 158.448 464.659 164.322 446.861 C 169.457 431.303 192.013 421.501 214.324 425.132 C 234.042 428.341 252.142 439.186 270.958 459.064 C 286.677 475.67 292.133 482.967 295.31 491.634 C 297.466 497.514 298.948 495.91 304.862 481.293 C 313.673 459.519 329.808 445.735 346.35 445.851 C 367.654 446 399.679 478.239 412.801 512.745 C 414.093 516.144 416.593 522.632 418.355 527.163 C 420.118 531.695 423.604 542.319 426.103 550.773 C 430.848 566.832 432.355 566.851 434.872 550.88 C 436.395 541.215 451.403 502.522 455.655 497.298 C 457.038 495.599 460.63 489.896 463.636 484.625 C 471.696 470.498 492.318 452.688 505.387 448.568 C 514.602 445.663 517.533 445.549 525.51 447.782 C 539.676 451.749 553.43 467.773 560.706 488.788 L 563.242 496.114 L 567.096 490.012 C 577.709 473.208 593.665 453.899 602.47 447.206 C 607.884 443.09 613.378 438.825 614.679 437.729 C 615.98 436.632 622.927 433.259 630.118 430.233 C 655.159 419.693 681.195 423.407 693.273 439.241 C 697.957 445.382 698.932 448.971 699.538 462.294 C 700.174 476.284 699.51 479.864 693.686 493.854 C 690.073 502.533 684.912 512.883 682.217 516.854 C 679.523 520.825 678.172 524.074 679.215 524.074 C 681.932 524.074 718.787 504.481 732.525 495.734 C 760.018 478.228 788.909 452.599 803.9 432.418 C 807.266 427.886 810.569 423.715 811.239 423.149 C 814.498 420.395 828.253 393.099 833.17 379.627 C 838.223 365.782 838.713 361.822 838.741 334.582 C 838.776 300.425 836.431 291.124 820.154 260.873 C 810.649 243.207 807.498 239.005 788.417 218.543 C 751.511 178.968 688.147 142.549 621.582 122.654 C 581.7 110.734 580.388 110.465 580.388 114.195 C 580.388 115.328 581.302 116.255 582.418 116.255 C 584.279 116.255 587.705 122.106 603.399 152.085 C 613.977 172.29 618.077 189.427 618.264 214.21 C 618.42 234.928 617.88 238.368 612.285 252.269 C 604.327 272.04 590.066 286.889 572.829 293.352 C 558.526 298.714 549.193 297.86 535.704 289.955 C 526.777 284.723 512.304 267.644 509.816 259.404 C 509.132 257.138 507.129 251.358 505.366 246.558 C 503.602 241.759 501.646 231.564 501.018 223.902 C 500.39 216.24 498.491 198.402 496.797 184.261 C 495.104 170.121 493.307 152.047 492.803 144.097 C 492.299 136.147 491.292 125.625 490.565 120.715 L 489.242 111.787 L 483.323 118.267 C 480.067 121.832 477.404 125.618 477.404 126.681 C 477.404 127.744 476.603 128.613 475.624 128.613 C 474.645 128.613 471.275 132.321 468.135 136.852 L 462.426 145.091 L 431.038 145.091 L 399.65 145.091 L 386.811 128.494 C 379.749 119.365 373.509 112.36 372.943 112.926 C 372.377 113.491 371.57 118.875 371.15 124.888 C 370.73 130.902 368.94 147.744 367.172 162.315 C 365.405 176.887 363.523 195.424 362.99 203.509 C 360.283 244.622 352.784 266.044 335.323 282.544 C 326.456 290.923 312.488 297.497 303.508 297.518 C 294.864 297.539 278.732 290.063 269.473 281.748 C 246.952 261.521 238.846 229.614 245.481 187.314 C 247.894 171.928 266.562 131.612 275.927 121.56 C 277.987 119.348 279.673 116.786 279.673 115.867 C 279.673 114.947 279.905 113.593 280.188 112.856 C 281.28 110.017 271.977 110.837 261.136 114.536 L 261.135 114.535`;
+
+    // ============================================================
+    // 2) SVG path を自前で THREE.Shape に変換する
+    //    - ここが「libs(d3-threeD) を使わない」ための肝
+    // ============================================================
+
+    /**
+     * SVG path(d) をトークン化する
+     * 例: ["M", "261.135", "114.535", "C", ...]
+     *
+     * - コマンド（英字）と数値を分離する
+     * - 数値は -? 付き / 小数 / 指数表現 まで対応
+     */
+    function tokenizePath(d) {
+      const re = /[a-zA-Z]|-?\d*\.?\d+(?:e[-+]?\d+)?/g;
+      return d.match(re) ?? [];
+    }
+
+    /**
+     * SVG path(d) → THREE.Shape 変換
+     * 対応: M/m, L/l, H/h, V/v, C/c, Q/q, Z/z
+     *
+     * 注意:
+     * - SVG は Y+ が下方向なので、Three.js では見やすいように Y を反転する（y = -y）
+     */
+    function svgPathToShape(d) {
+      const tokens = tokenizePath(d);
+      let i = 0;
+
+      const shape = new THREE.Shape();
+
+      // “現在位置” と “開始点（Z閉じ用）”
+      let cx = 0, cy = 0;
+      let sx = 0, sy = 0;
+
+      // 最後に使ったコマンド（数字が続く場合の “暗黙コマンド” 用）
+      let cmd = null;
+
+      // SVG → Three で Y を反転する係数
+      const Y_FLIP = -1;
+
+      // 次の数値を読む（トークンが尽きたら例外）
+      const nextNumber = () => {
+        if (i >= tokens.length) throw new Error("Unexpected end of path tokens");
+        return parseFloat(tokens[i++]);
+      };
+
+      while (i < tokens.length) {
+        const t = tokens[i];
+
+        // コマンド（英字）なら cmd を更新して読み進める
+        if (/^[a-zA-Z]$/.test(t)) {
+          cmd = t;
+          i++;
+        } else if (cmd === null) {
+          // コマンド無しで数値が来るのは不正
+          throw new Error("Path command is missing");
+        }
+
+        switch (cmd) {
+          case "M":
+          case "m": {
+            // moveTo: (x,y)
+            const x = nextNumber();
+            const y = nextNumber() * Y_FLIP;
+
+            if (cmd === "m") {
+              cx += x; cy += y;
+            } else {
+              cx = x; cy = y;
+            }
+
+            shape.moveTo(cx, cy);
+
+            // 開始点を保存（Z の closePath 用）
+            sx = cx; sy = cy;
+
+            // M の後に座標が続く場合、それらは暗黙的に L として扱われる
+            cmd = (cmd === "m") ? "l" : "L";
+            break;
+          }
+
+          case "L":
+          case "l": {
+            const x = nextNumber();
+            const y = nextNumber() * Y_FLIP;
+
+            if (cmd === "l") {
+              cx += x; cy += y;
+            } else {
+              cx = x; cy = y;
+            }
+            shape.lineTo(cx, cy);
+            break;
+          }
+
+          case "H":
+          case "h": {
+            const x = nextNumber();
+            if (cmd === "h") cx += x; else cx = x;
+            shape.lineTo(cx, cy);
+            break;
+          }
+
+          case "V":
+          case "v": {
+            const y = nextNumber() * Y_FLIP;
+            if (cmd === "v") cy += y; else cy = y;
+            shape.lineTo(cx, cy);
+            break;
+          }
+
+          case "C":
+          case "c": {
+            // cubic bezier: (x1,y1,x2,y2,x,y)
+            const x1 = nextNumber();
+            const y1 = nextNumber() * Y_FLIP;
+            const x2 = nextNumber();
+            const y2 = nextNumber() * Y_FLIP;
+            const x  = nextNumber();
+            const y  = nextNumber() * Y_FLIP;
+
+            let ax1 = x1, ay1 = y1, ax2 = x2, ay2 = y2, ax = x, ay = y;
+
+            if (cmd === "c") {
+              ax1 += cx; ay1 += cy;
+              ax2 += cx; ay2 += cy;
+              ax  += cx; ay  += cy;
+            }
+
+            shape.bezierCurveTo(ax1, ay1, ax2, ay2, ax, ay);
+
+            cx = ax; cy = ay;
+            break;
+          }
+
+          case "Q":
+          case "q": {
+            // quadratic bezier: (x1,y1,x,y)
+            const x1 = nextNumber();
+            const y1 = nextNumber() * Y_FLIP;
+            const x  = nextNumber();
+            const y  = nextNumber() * Y_FLIP;
+
+            let ax1 = x1, ay1 = y1, ax = x, ay = y;
+
+            if (cmd === "q") {
+              ax1 += cx; ay1 += cy;
+              ax  += cx; ay  += cy;
+            }
+
+            shape.quadraticCurveTo(ax1, ay1, ax, ay);
+
+            cx = ax; cy = ay;
+            break;
+          }
+
+          case "Z":
+          case "z": {
+            // closePath: 開始点に戻る（必要なら）
+            shape.lineTo(sx, sy);
+            shape.closePath();
+            cx = sx; cy = sy;
+            break;
+          }
+
+          default: {
+            // 今回の d は主に M/C/L なので、ここに来たら “未対応コマンド”
+            throw new Error(`Unsupported SVG path command: ${cmd}`);
+          }
+        }
+      }
+
+      return shape;
+    }
+
+    // ============================================================
+    // 3) Three.js の基本セットアップ
+    // ============================================================
+    const infoEl = document.getElementById("info");
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xeeeeee);
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      10000
+    );
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // ============================================================
+    // 4) ライト（StandardMaterial はライト必須。暗さ対策として強めに）
+    // ============================================================
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+    hemi.position.set(0, 500, 0);
+    scene.add(hemi);
+
+    const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+    dir.position.set(300, 500, 300);
+    scene.add(dir);
+
+    // ============================================================
+    // 5) 押し出し（Extrude）
+    // ============================================================
+    let mesh = null;
+
+    function buildExtrudedBatman() {
+      // ---- (1) SVG→Shape 変換（ここが失敗すると何も出ない）
+      const shape2D = svgPathToShape(BATMAN_D);
+
+      // ---- (2) Extrude オプション
+      const depth = 40;
+      const options = {
+        depth,
+        steps: 1,
+        curveSegments: 12,
+        bevelEnabled: true,
+        bevelThickness: 4,
+        bevelSize: 2,
+        bevelSegments: 2
+      };
+
+      const geom = new THREE.ExtrudeGeometry(shape2D, options);
+
+      // ---- (3) 法線を計算（Standard の陰影のため）
+      geom.computeVertexNormals();
+
+      // ---- (4) マテリアル（ライトで陰影が出る。黒になりにくい）
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0x333333,
+        metalness: 0.15,
+        roughness: 0.55
+      });
+
+      const m = new THREE.Mesh(geom, mat);
+
+      // ---- (5) ここが超重要：bbox から中心寄せ & スケール調整
+      // SVG は巨大座標/原点から遠いことが多いので、これをしないと視界外になりやすい
+      const box = new THREE.Box3().setFromObject(m);
+      const size = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      box.getSize(size);
+      box.getCenter(center);
+
+      // 中心を原点へ移動
+      m.position.sub(center);
+
+      // 見やすい大きさへ自動スケール（最大辺が targetSize になるように）
+      const targetSize = 200; // この辺が画面に収まりやすい
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const scale = targetSize / (maxDim || 1);
+      m.scale.setScalar(scale);
+
+      // SVGっぽさ（上下反転/向き）を整える：必要なら調整
+      // - 今回は “Y を反転” しているので、追加の反転は基本不要
+      // - ただし見栄えで 180°回転したいなら Z 回転を入れる
+      m.rotation.z = Math.PI; // 好みでコメントアウト可
+
+      // ---- (6) カメラを必ず写る位置へ（真っ暗対策の決定打）
+      fitCameraToObject(camera, m, 1.3);
+
+      // 情報表示
+      infoEl.textContent =
+        `SVG→Shape→Extrude の自前実装（ローカル libs 不使用）\n` +
+        `bbox(maxDim)=${maxDim.toFixed(2)}  autoScale=${scale.toFixed(4)}\n` +
+        `もしまだ真っ暗なら：DevTools Console を見て “Unsupported command” が出てないか確認してください。`;
+
+      return m;
+    }
+
+    /**
+     * カメラを “オブジェクトが必ず画面に入る距離” に配置する
+     * - 真っ暗（視界外）をほぼ確実に潰せる
+     */
+    function fitCameraToObject(cam, obj, margin = 1.2) {
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      box.getSize(size);
+      box.getCenter(center);
+
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const fov = cam.fov * Math.PI / 180;
+      let distance = (maxDim / 2) / Math.tan(fov / 2);
+      distance *= margin;
+
+      // 斜め上からの定番位置（見栄えが安定）
+      cam.position.set(center.x + distance, center.y + distance * 0.6, center.z + distance);
+      cam.near = Math.max(0.1, distance / 100);
+      cam.far = Math.max(10000, distance * 20);
+      cam.updateProjectionMatrix();
+      cam.lookAt(center);
+    }
+
+    // ============================================================
+    // 6) メッシュ生成して追加
+    // ============================================================
+    try {
+      mesh = buildExtrudedBatman();
+      scene.add(mesh);
+    } catch (e) {
+      console.error(e);
+      scene.background = new THREE.Color(0x220000);
+      infoEl.textContent =
+        `エラーで Shape 生成に失敗しました。\n` +
+        `${e?.message || e}\n` +
+        `Console にスタックトレースが出ています。\n` +
+        `（このコードは M/L/H/V/C/Q/Z のみ対応です）`;
+    }
+
+    // ============================================================
+    // 7) アニメーション（OrbitControlsなしでも分かるように自動回転）
+    // ============================================================
+    let t = 0;
+    function animate() {
+      requestAnimationFrame(animate);
+      t += 0.01;
+      if (mesh) {
+        mesh.rotation.y = t;
+      }
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ============================================================
+    // 8) resize
+    // ============================================================
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
