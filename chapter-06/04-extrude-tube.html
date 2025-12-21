@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Example 06.04 - TubeGeometry (fixed + detailed comments)</title>
+
+  <!--
+    このサンプルの主題：TubeGeometry（曲線に沿って“チューブ”を生成）
+
+    TubeGeometry は「3D曲線（Curve）」を入力として、その曲線に沿って断面円をスイープ（掃引）し、
+    パイプ状のメッシュを生成する。
+
+    【アルゴリズムの要点】
+    1) 曲線のサンプリング
+       - t∈[0,1] を tubularSegments(=segments) 分割して点列 C(t_i) を生成する
+       - CatmullRomCurve3 を使うと制御点を滑らかに補間できる
+
+    2) 各サンプル点で局所座標系（フレネフレーム）の構築
+       - 接線 T を求め、Tに直交する法線 N と従法線 B を作る
+       - 断面円は N,B 平面上に配置される
+
+    3) 断面円（radius / radiusSegments）を生成してリング化
+       - 各 i に対して radiusSegments 分割した円周点を作り、リングの頂点群を得る
+
+    4) 隣接リングを接続して側面ポリゴン（主に三角形）を生成
+       - リング i と i+1 の対応頂点をつないで面を張る
+       - closed=true なら最後のリングと最初のリングも接続
+
+    【このコードで“動かなくなる”典型原因】
+    - THREE.SceneUtils.createMultiMaterialObject が無い/非推奨
+      → 自前で Group(Object3D) を作って Mesh を2つ重ねる方が堅い
+    - THREE.TubeGeometry.SinusoidalTaper / NoTaper が存在しない three.js 版がある
+      → 存在しないのに参照すると例外→結果的に真っ黒になりがち
+    - THREE.CatmullRomCurve3 が無い古い three.js 版がある
+      → フォールバック（SplineCurve3 / ClosedSplineCurve3）を用意すると堅い
+    - 再生成を繰り返すのに dispose しない（GPUメモリ増）
+      → traverse で geometry/material を dispose
+
+    方針：
+    - taper は「存在する場合だけ」使う（feature detection）
+    - SceneUtils を使わず、surfaceMesh + wireMesh を Group にまとめる
+    - Curve も feature detection でフォールバック
+    - 例外はオーバーレイに表示して原因を可視化（黒画面対策）
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; }
+    #error-overlay {
+      position: fixed;
+      left: 0; top: 0; right: 0;
+      background: rgba(180, 0, 0, 0.92);
+      color: #fff;
+      font: 12px/1.4 monospace;
+      padding: 10px 12px;
+      z-index: 9999;
+      white-space: pre-wrap;
+      display: none;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="error-overlay"></div>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    // ------------------------------------------------------------
+    // 黒画面のときに“何が起きたか”を画面上に出す安全装置
+    // ------------------------------------------------------------
+    (function setupErrorOverlay() {
+      var overlay = document.getElementById("error-overlay");
+      window.addEventListener("error", function (e) {
+        overlay.style.display = "block";
+        overlay.textContent =
+          "[Runtime Error]\n" +
+          (e.message || "") + "\n" +
+          (e.filename || "") + ":" + (e.lineno || "") + ":" + (e.colno || "") + "\n" +
+          (e.error && e.error.stack ? "\n" + e.error.stack : "");
+      });
+    })();
+
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（Three.jsの基本）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+      camera.position.set(-30, 40, 70);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // 補助表示（座標軸・グリッド）
+      // ※ three.js の版によって Helper 名が違うので分岐する
+      // ------------------------------------------------------------
+      if (THREE.AxesHelper) scene.add(new THREE.AxesHelper(60));
+      else if (THREE.AxisHelper) scene.add(new THREE.AxisHelper(60));
+
+      if (THREE.GridHelper) {
+        var grid = new THREE.GridHelper(200, 20);
+        grid.position.y = -20;
+        scene.add(grid);
+      }
+
+      // ------------------------------------------------------------
+      // ライト（MeshBasicMaterialなら不要だが、教材として用意）
+      // ------------------------------------------------------------
+      var ambient = new THREE.AmbientLight(0xffffff, 0.6);
+      scene.add(ambient);
+
+      var dir = new THREE.DirectionalLight(0xffffff, 0.8);
+      dir.position.set(50, 80, 40);
+      scene.add(dir);
+
+      // ------------------------------------------------------------
+      // 表示対象（点群とチューブ）
+      // ------------------------------------------------------------
+      var spGroup = null;    // 制御点の赤球群
+      var tubeGroup = null;  // チューブ（面+ワイヤ）グループ
+
+      // ------------------------------------------------------------
+      // GUIで制御するパラメータ
+      // ------------------------------------------------------------
+      var controls = new function () {
+        this.numberOfPoints = 5;     // 制御点数
+        this.segments = 64;          // 曲線方向の分割数（= tubularSegments）
+        this.radius = 1;             // チューブ半径
+        this.radiusSegments = 8;     // 断面円の分割数（= radialSegments）
+        this.closed = false;         // 曲線を閉じるか
+        this.taper = "no taper";     // （存在する実装だけ使用する）半径変調
+        this.points = [];            // 制御点配列
+
+        // ランダムな制御点を新規生成
+        this.newPoints = function () {
+          var points = [];
+          for (var i = 0; i < controls.numberOfPoints; i++) {
+            var randomX = -20 + Math.round(Math.random() * 50);
+            var randomY = -15 + Math.round(Math.random() * 40);
+            var randomZ = -20 + Math.round(Math.random() * 40);
+            points.push(new THREE.Vector3(randomX, randomY, randomZ));
+          }
+          controls.points = points;
+          controls.redraw();
+        };
+
+        // パラメータ更新→再構築
+        this.redraw = function () {
+          rebuild();
+        };
+      };
+
+      var gui = new dat.GUI();
+      gui.add(controls, "newPoints");
+      gui.add(controls, "numberOfPoints", 2, 15).step(1).onChange(controls.newPoints);
+      gui.add(controls, "segments", 1, 300).step(1).onChange(controls.redraw);
+      gui.add(controls, "radius", 0, 20).onChange(controls.redraw);
+      gui.add(controls, "radiusSegments", 3, 64).step(1).onChange(controls.redraw);
+      gui.add(controls, "closed").onChange(controls.redraw);
+      gui.add(controls, "taper", ["no taper", "sinusoidal"]).onChange(controls.redraw);
+
+      // 初期生成
+      controls.newPoints();
+
+      // ------------------------------------------------------------
+      // アニメーションループ
+      // ------------------------------------------------------------
+      var step = 0;
+      render();
+
+      function render() {
+        stats.update();
+
+        step += 0.01;
+        if (spGroup) spGroup.rotation.y = step;
+        if (tubeGroup) tubeGroup.rotation.y = step;
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // 再構築：点群表示＋TubeGeometry生成
+      // ------------------------------------------------------------
+      function rebuild() {
+        // 古いものを撤去し、GPUリソースを解放
+        if (spGroup) {
+          scene.remove(spGroup);
+          disposeObject3D(spGroup);
+          spGroup = null;
+        }
+        if (tubeGroup) {
+          scene.remove(tubeGroup);
+          disposeObject3D(tubeGroup);
+          tubeGroup = null;
+        }
+
+        // 1) 制御点（赤い球）を作成
+        spGroup = buildPointsGroup(controls.points);
+        scene.add(spGroup);
+
+        // 2) 制御点→曲線（Curve）を生成（環境に応じてフォールバック）
+        var curve = buildCurveFromPoints(controls.points, !!controls.closed);
+
+        // 3) TubeGeometry を生成（taper の存在を検出して安全に生成）
+        var segments = Math.max(1, Math.floor(controls.segments));
+        var radius = Math.max(0.0001, controls.radius);
+        var radiusSegments = Math.max(3, Math.floor(controls.radiusSegments));
+        var closed = !!controls.closed;
+
+        var tubeGeometry = buildTubeGeometrySafe(
+          curve,
+          segments,
+          radius,
+          radiusSegments,
+          closed,
+          controls.taper
+        );
+
+        // 4) 表示（面＋ワイヤ）を重ねる
+        tubeGroup = buildTubeDisplayGroup(tubeGeometry);
+        scene.add(tubeGroup);
+
+        // 5) 見失いにくいように原点を見る
+        camera.lookAt(new THREE.Vector3(0, 0, 0));
+      }
+
+      // ------------------------------------------------------------
+      // 制御点を球で表示する（点列の可視化）
+      // ------------------------------------------------------------
+      function buildPointsGroup(points) {
+        var group = new THREE.Object3D();
+
+        var material = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+        for (var i = 0; i < points.length; i++) {
+          // 半径を少し大きめにして見やすく
+          var spGeom = new THREE.SphereGeometry(0.6, 8, 8);
+          var spMesh = new THREE.Mesh(spGeom, material);
+          spMesh.position.copy(points[i]);
+          group.add(spMesh);
+        }
+        return group;
+      }
+
+      // ------------------------------------------------------------
+      // points[] → Curve
+      // - 新しめ：CatmullRomCurve3（滑らかな補間）
+      // - 古め：SplineCurve3 / ClosedSplineCurve3
+      // ------------------------------------------------------------
+      function buildCurveFromPoints(points, closed) {
+        if (THREE.CatmullRomCurve3) {
+          var c = new THREE.CatmullRomCurve3(points);
+          if (typeof c.closed !== "undefined") c.closed = closed;
+          return c;
+        }
+
+        // 古い three.js 用フォールバック
+        if (closed && THREE.ClosedSplineCurve3) {
+          return new THREE.ClosedSplineCurve3(points);
+        }
+        if (THREE.SplineCurve3) {
+          return new THREE.SplineCurve3(points);
+        }
+
+        // ここに来たら教材環境としては異常なので、明示的にエラーを出す
+        throw new Error("No supported Curve class found (CatmullRomCurve3/SplineCurve3).");
+      }
+
+      // ------------------------------------------------------------
+      // TubeGeometry を安全に生成する
+      // - 標準的な three.js: new THREE.TubeGeometry(path, tubularSegments, radius, radialSegments, closed)
+      // - 一部教材拡張: taper 引数が追加されていることがある
+      //
+      // 「taper 定数が存在する場合だけ taper を使う」のが重要。
+      // 存在しないのに参照すると例外→黒画面の原因になる。
+      // ------------------------------------------------------------
+      function buildTubeGeometrySafe(path, tubularSegments, radius, radialSegments, closed, taperMode) {
+        var hasTaper =
+          THREE.TubeGeometry &&
+          (THREE.TubeGeometry.SinusoidalTaper || THREE.TubeGeometry.NoTaper);
+
+        if (hasTaper) {
+          var taper =
+            (taperMode === "sinusoidal")
+              ? THREE.TubeGeometry.SinusoidalTaper
+              : THREE.TubeGeometry.NoTaper;
+
+          return new THREE.TubeGeometry(path, tubularSegments, radius, radialSegments, closed, taper);
+        }
+
+        // 一般的な three.js は taper を受け取らないので渡さない
+        return new THREE.TubeGeometry(path, tubularSegments, radius, radialSegments, closed);
+      }
+
+      // ------------------------------------------------------------
+      // 表示用グループ：面（半透明）＋ワイヤ（線）を同じジオメトリで重ねる
+      // SceneUtils.createMultiMaterialObject を避ける
+      // ------------------------------------------------------------
+      function buildTubeDisplayGroup(geom) {
+        var group = new THREE.Object3D();
+
+        // 面：半透明（形状が把握しやすい）
+        var surfaceMat = new THREE.MeshBasicMaterial({
+          color: 0x00ff00,
+          transparent: true,
+          opacity: 0.35,
+          side: THREE.DoubleSide
+        });
+        var surface = new THREE.Mesh(geom, surfaceMat);
+        group.add(surface);
+
+        // ワイヤ：同じジオメトリを wireframe で重ねる
+        var wireMat = new THREE.MeshBasicMaterial({
+          color: 0x000000,
+          wireframe: true
+        });
+        var wire = new THREE.Mesh(geom, wireMat);
+        group.add(wire);
+
+        return group;
+      }
+
+      // ------------------------------------------------------------
+      // 再生成があるサンプルでは必須：GPUリソースを解放する
+      // ------------------------------------------------------------
+      function disposeObject3D(obj) {
+        obj.traverse(function (child) {
+          if (!child) return;
+
+          if (child.geometry && typeof child.geometry.dispose === "function") {
+            child.geometry.dispose();
+          }
+
+          if (child.material) {
+            if (Array.isArray(child.material)) {
+              child.material.forEach(function (m) {
+                if (m && typeof m.dispose === "function") m.dispose();
+              });
+            } else if (typeof child.material.dispose === "function") {
+              child.material.dispose();
+            }
+          }
+        });
+      }
+
+      // ------------------------------------------------------------
+      // リサイズ対応
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        var w = window.innerWidth;
+        var h = window.innerHeight;
+        renderer.setSize(w, h);
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      });
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
