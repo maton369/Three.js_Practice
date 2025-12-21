@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 06.07 - Text geometry (no local libs, importmap fixed + detailed comments)</title>
+
+  <!--
+    ✅ 今回のエラーの原因（超重要）
+      TypeError: Failed to resolve module specifier "three"
+      → OrbitControls / FontLoader / TextGeometry (examples/jsm/*) の内部が
+         `import ... from "three"`（bare specifier）になっているため、
+         ブラウザは "three" をURLに解決できずに落ちる。
+
+    ✅ 解決策
+      importmap で "three" と "three/addons/" を URL にマッピングする。
+
+      これで以下が可能になる：
+        import * as THREE from "three";
+        import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+        import { FontLoader } from "three/addons/loaders/FontLoader.js";
+        import { TextGeometry } from "three/addons/geometries/TextGeometry.js";
+
+    ✅ 追加のデバッグ方針（表示されない問題を“沈黙させない”）
+      - 例外は画面下の赤いボックスに表示
+      - three.js が動いているか判定するため常に “デバッグ立方体” を表示
+      - フォントロード失敗も例外として表示
+  -->
+
+  <!-- ★ ここがポイント：importmap で bare specifier を解決する -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eaeaea; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+    canvas { display: block; }
+
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 360px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.90);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+      backdrop-filter: blur(8px);
+      user-select: none;
+      z-index: 10;
+    }
+    #ui h1 { font-size: 14px; margin: 0 0 10px; font-weight: 800; }
+    .row { display: grid; grid-template-columns: 140px 1fr; gap: 10px; align-items: center; margin: 8px 0; }
+    label { font-size: 12px; color: #333; }
+    select, input[type="range"], input[type="text"] { width: 100%; }
+    .value { font-size: 12px; text-align: right; color: #333; }
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+      z-index: 10;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255, 80, 80, 0.92);
+      color: #fff;
+      font-size: 12px;
+      max-width: calc(100vw - 24px);
+      display: none;
+      white-space: pre-wrap;
+      z-index: 10;
+    }
+    button {
+      width: 100%;
+      padding: 10px 12px;
+      border: 0;
+      border-radius: 10px;
+      background: #111;
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:active { transform: translateY(1px); }
+    small { color: #444; }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Text Geometry（libs無し版 / importmap修正版）</h1>
+
+    <div class="row">
+      <label for="text1">1行目</label>
+      <input id="text1" type="text" value="Learning" />
+    </div>
+
+    <div class="row">
+      <label for="text2">2行目</label>
+      <input id="text2" type="text" value="Three.js" />
+    </div>
+
+    <div class="row">
+      <label for="font">フォント</label>
+      <select id="font">
+        <option value="helvetiker">helvetiker</option>
+        <option value="optimer">optimer</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label for="size">size（文字サイズ）</label>
+      <div>
+        <input id="size" type="range" min="10" max="200" step="1" value="90" />
+        <div class="value" id="sizeVal">90</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="depth">depth（厚み）</label>
+      <div>
+        <input id="depth" type="range" min="1" max="200" step="1" value="40" />
+        <div class="value" id="depthVal">40</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="curveSegments">curveSegments</label>
+      <div>
+        <input id="curveSegments" type="range" min="1" max="40" step="1" value="12" />
+        <div class="value" id="curveSegmentsVal">12</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="bevelEnabled">bevelEnabled</label>
+      <input id="bevelEnabled" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label for="bevelThickness">bevelThickness</label>
+      <div>
+        <input id="bevelThickness" type="range" min="0" max="20" step="0.1" value="2" />
+        <div class="value" id="bevelThicknessVal">2.0</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="bevelSize">bevelSize</label>
+      <div>
+        <input id="bevelSize" type="range" min="0" max="20" step="0.1" value="0.5" />
+        <div class="value" id="bevelSizeVal">0.5</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="bevelSegments">bevelSegments</label>
+      <div>
+        <input id="bevelSegments" type="range" min="0" max="20" step="1" value="3" />
+        <div class="value" id="bevelSegmentsVal">3</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="rotSpeed">回転速度</label>
+      <div>
+        <input id="rotSpeed" type="range" min="0" max="0.05" step="0.001" value="0.01" />
+        <div class="value" id="rotSpeedVal">0.010</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="rebuildBtn">再生成</label>
+      <button id="rebuildBtn" type="button">Rebuild（再生成）</button>
+    </div>
+
+    <small>
+      左ドラッグ：回転 / ホイール：ズーム / 右ドラッグ：平行移動
+    </small>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    // ------------------------------------------------------------
+    // importmap により "three" / "three/addons/*" が解決される
+    // ------------------------------------------------------------
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { FontLoader } from "three/addons/loaders/FontLoader.js";
+    import { TextGeometry } from "three/addons/geometries/TextGeometry.js";
+
+    // ------------------------------------------------------------
+    // 画面にエラーを出す（沈黙防止）
+    // ------------------------------------------------------------
+    const errBox = document.getElementById("err");
+    const hud = document.getElementById("hud");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+
+    // windowレベルの例外も捕まえる（フォントロード失敗などの切り分けが楽）
+    window.addEventListener("error", (ev) => {
+      showError("window.onerror:\n" + (ev?.error?.stack || ev?.message || ev));
+    });
+    window.addEventListener("unhandledrejection", (ev) => {
+      showError("unhandledrejection:\n" + (ev?.reason?.stack || ev?.reason || ev));
+    });
+
+    // ------------------------------------------------------------
+    // UI参照
+    // ------------------------------------------------------------
+    const uiText1 = document.getElementById("text1");
+    const uiText2 = document.getElementById("text2");
+    const uiFont  = document.getElementById("font");
+
+    const uiSize = document.getElementById("size");
+    const uiDepth = document.getElementById("depth");
+    const uiCurveSegments = document.getElementById("curveSegments");
+
+    const uiBevelEnabled = document.getElementById("bevelEnabled");
+    const uiBevelThickness = document.getElementById("bevelThickness");
+    const uiBevelSize = document.getElementById("bevelSize");
+    const uiBevelSegments = document.getElementById("bevelSegments");
+
+    const uiRotSpeed = document.getElementById("rotSpeed");
+    const uiRebuildBtn = document.getElementById("rebuildBtn");
+
+    const sizeVal = document.getElementById("sizeVal");
+    const depthVal = document.getElementById("depthVal");
+    const curveSegmentsVal = document.getElementById("curveSegmentsVal");
+    const bevelThicknessVal = document.getElementById("bevelThicknessVal");
+    const bevelSizeVal = document.getElementById("bevelSizeVal");
+    const bevelSegmentsVal = document.getElementById("bevelSegmentsVal");
+    const rotSpeedVal = document.getElementById("rotSpeedVal");
+
+    function syncLabels() {
+      sizeVal.textContent = String(uiSize.value);
+      depthVal.textContent = String(uiDepth.value);
+      curveSegmentsVal.textContent = String(uiCurveSegments.value);
+      bevelThicknessVal.textContent = Number(uiBevelThickness.value).toFixed(1);
+      bevelSizeVal.textContent = Number(uiBevelSize.value).toFixed(1);
+      bevelSegmentsVal.textContent = String(uiBevelSegments.value);
+      rotSpeedVal.textContent = Number(uiRotSpeed.value).toFixed(3);
+    }
+    syncLabels();
+
+    // ------------------------------------------------------------
+    // Three.js 基本セットアップ
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xeeeeee);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 10000);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    // 補助（スケール/向きがわかる & “描画が動いているか”が一目でわかる）
+    scene.add(new THREE.AxesHelper(200));
+    const grid = new THREE.GridHelper(1400, 40);
+    grid.position.y = -120;
+    scene.add(grid);
+
+    // ライト（文字のベベルが陰影で見えるように）
+    scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+    const dir1 = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir1.position.set(400, 600, 300);
+    scene.add(dir1);
+    const dir2 = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir2.position.set(-400, 400, 300);
+    scene.add(dir2);
+
+    // OrbitControls（今度は importmap により "three" が解決されるので確実に動く）
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+
+    // ------------------------------------------------------------
+    // “three.js自体が動いているか” 判定するためのデバッグ立方体
+    // これが回転して見えていれば、描画ループはOK。
+    // ------------------------------------------------------------
+    const debugCube = new THREE.Mesh(
+      new THREE.BoxGeometry(60, 60, 60),
+      new THREE.MeshStandardMaterial({ color: 0x22aa22, roughness: 0.4, metalness: 0.0 })
+    );
+    debugCube.position.set(-260, 30, 0);
+    scene.add(debugCube);
+
+    // ------------------------------------------------------------
+    // Font の読み込み（TextGeometry の前提条件）
+    // ------------------------------------------------------------
+    const fonts = new Map();
+    const fontLoader = new FontLoader();
+
+    function loadFont(url) {
+      return new Promise((resolve, reject) => {
+        fontLoader.load(url, resolve, undefined, reject);
+      });
+    }
+
+    async function ensureFonts() {
+      // ※ local assets を使わない。three の examples/fonts を CDN から取得する。
+      const helvUrl = "https://unpkg.com/three@0.160.0/examples/fonts/helvetiker_regular.typeface.json";
+      const optiUrl = "https://unpkg.com/three@0.160.0/examples/fonts/optimer_regular.typeface.json";
+
+      if (!fonts.has("helvetiker")) fonts.set("helvetiker", await loadFont(helvUrl));
+      if (!fonts.has("optimer")) fonts.set("optimer", await loadFont(optiUrl));
+    }
+
+    // ------------------------------------------------------------
+    // 表示対象（2行テキストをまとめたGroup）
+    // ------------------------------------------------------------
+    let textGroup = null;
+
+    function disposeObject3D(obj) {
+      if (!obj) return;
+      obj.traverse((child) => {
+        if (child.geometry && child.geometry.dispose) child.geometry.dispose();
+        if (child.material) {
+          if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose && m.dispose());
+          else child.material.dispose && child.material.dispose();
+        }
+      });
+    }
+
+    // 1行のX方向を中央寄せ（左右のセンタリング）
+    function centerTextGeometryX(geom) {
+      geom.computeBoundingBox();
+      const bb = geom.boundingBox;
+      if (!bb) return;
+
+      const center = new THREE.Vector3();
+      bb.getCenter(center);
+
+      // Xだけを中心へ。Yは行間のため触らない。
+      geom.translate(-center.x, 0, 0);
+      geom.computeBoundingBox();
+    }
+
+    // Group全体を原点へ（回転の支点を安定）
+    function centerObjectToOrigin(obj) {
+      const box = new THREE.Box3().setFromObject(obj);
+      const center = new THREE.Vector3();
+      box.getCenter(center);
+      obj.position.sub(center);
+    }
+
+    // カメラを必ず見える距離へ（黒画面対策の決定打）
+    function fitCameraToObject(obj, margin = 1.35) {
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+
+      const maxDim = Math.max(size.x, size.y, size.z);
+      if (!isFinite(maxDim) || maxDim <= 0) {
+        throw new Error("Text bbox が不正（サイズ0/NaN）です。フォントロード or TextGeometry生成失敗の可能性が高いです。");
+      }
+
+      const fov = camera.fov * (Math.PI / 180);
+      let distance = (maxDim / 2) / Math.tan(fov / 2);
+      distance *= margin;
+
+      camera.position.set(distance, distance * 0.6, distance);
+      camera.near = Math.max(0.1, distance / 100);
+      camera.far = Math.max(10000, distance * 10);
+      camera.updateProjectionMatrix();
+
+      camera.lookAt(0, 0, 0);
+      orbit.target.set(0, 0, 0);
+      orbit.update();
+    }
+
+    // ------------------------------------------------------------
+    // ✅ ここが “アルゴリズムの中心” ：TextGeometry生成
+    //
+    // 1) フォント(typeface.json)をロード
+    // 2) 文字列をアウトライン（2D Shape群）に変換
+    // 3) Shape群を Extrude（depth / bevel）して 3D化（= TextGeometry）
+    // 4) bboxでセンタリング（回転支点安定）
+    // 5) bboxからカメラをfit（視界外を根絶）
+    // ------------------------------------------------------------
+    async function rebuild() {
+      clearError();
+      syncLabels();
+
+      try {
+        await ensureFonts();
+
+        // 既存撤去
+        if (textGroup) {
+          scene.remove(textGroup);
+          disposeObject3D(textGroup);
+          textGroup = null;
+        }
+
+        const font = fonts.get(uiFont.value);
+        if (!font) throw new Error("フォントが読み込めていません。");
+
+        const size = Number(uiSize.value);
+        const depth = Number(uiDepth.value);
+        const curveSegments = Math.max(1, Math.floor(Number(uiCurveSegments.value)));
+
+        const bevelEnabled = !!uiBevelEnabled.checked;
+        const bevelThickness = Number(uiBevelThickness.value);
+        const bevelSize = Number(uiBevelSize.value);
+        const bevelSegments = Math.max(0, Math.floor(Number(uiBevelSegments.value)));
+
+        const options = {
+          font,
+          size,
+          depth,
+          curveSegments,
+          bevelEnabled,
+          bevelThickness,
+          bevelSize,
+          bevelSegments
+        };
+
+        // 表裏カリングで消える事故を避けるため DoubleSide
+        const mat = new THREE.MeshPhongMaterial({
+          color: 0xff6666,
+          specular: 0xffffff,
+          shininess: 100,
+          side: THREE.DoubleSide
+        });
+
+        textGroup = new THREE.Group();
+
+        const line1 = (uiText1.value || "Learning").trim();
+        const g1 = new TextGeometry(line1, options);
+        centerTextGeometryX(g1);
+        g1.computeVertexNormals();
+        const m1 = new THREE.Mesh(g1, mat);
+        m1.position.set(0, 140, -80);
+        textGroup.add(m1);
+
+        const line2 = (uiText2.value || "Three.js").trim();
+        const g2 = new TextGeometry(line2, options);
+        centerTextGeometryX(g2);
+        g2.computeVertexNormals();
+        const m2 = new THREE.Mesh(g2, mat);
+        m2.position.set(0, 0, 0);
+        textGroup.add(m2);
+
+        // 2行まとめて原点中心へ（回転の支点が安定する）
+        centerObjectToOrigin(textGroup);
+        scene.add(textGroup);
+
+        // “必ず見える” 距離にカメラを合わせる
+        fitCameraToObject(textGroup, 1.35);
+      } catch (e) {
+        showError("再生成でエラーが発生しました:\n" + (e && e.stack ? e.stack : e));
+      }
+    }
+
+    // UIイベント
+    uiText1.addEventListener("change", rebuild);
+    uiText2.addEventListener("change", rebuild);
+    uiFont.addEventListener("change", rebuild);
+
+    ["size","depth","curveSegments","bevelThickness","bevelSize","bevelSegments","rotSpeed"].forEach((id) => {
+      const el = document.getElementById(id);
+      el.addEventListener("input", syncLabels);
+      el.addEventListener("change", rebuild);
+    });
+    uiBevelEnabled.addEventListener("change", rebuild);
+    uiRebuildBtn.addEventListener("click", rebuild);
+
+    // 初期カメラ（rebuildで上書きされる）
+    camera.position.set(600, 400, 600);
+    camera.lookAt(0, 0, 0);
+
+    // 初回生成
+    await rebuild();
+
+    // ------------------------------------------------------------
+    // ループ + FPS
+    // ------------------------------------------------------------
+    let rot = 0;
+    let lastT = performance.now();
+    let frames = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // Debug cube は常に回して「描画ループは生きてる」を保証
+      debugCube.rotation.y += 0.01;
+      debugCube.rotation.x += 0.008;
+
+      const rs = Number(uiRotSpeed.value);
+      rot += rs;
+      if (textGroup) textGroup.rotation.y = rot;
+
+      orbit.update();
+      renderer.render(scene, camera);
+
+      frames++;
+      const now = performance.now();
+      if (now - lastT >= 1000) {
+        const fps = (frames * 1000) / (now - lastT);
+        frames = 0;
+        lastT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "font: " + uiFont.value + "\n" +
+          "size/depth: " + uiSize.value + "/" + uiDepth.value + "\n" +
+          "importmap: OK";
+      }
+    }
+    animate();
+
+    // resize
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
