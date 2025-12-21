@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 07.02 - Particles (WebGL / Points) - libs無し + 詳細コメント版</title>
+
+  <!--
+    目的：
+      旧サンプルは
+        - ../libs/three.js / stats.js / dat.gui.js に依存
+        - THREE.Geometry + vertices/colors（現在は廃止）
+      という「古い Three.js 前提」の構造になっている。
+
+      ここでは「libsを使わない」要件に合わせて、
+        - Three.js は CDN の ES Modules から import
+        - stats/dat.gui なし（HUD で FPS 表示、簡易 UI）
+        - THREE.Geometry を廃止し、BufferGeometry + TypedArray に置換
+      し、現行 WebGLRenderer で確実に動く形に修正する。
+
+    全体アルゴリズム（この教材のコア）：
+      1) 粒子の頂点位置（positions）を作る
+         - グリッド状に配置：x,y をループして (x*spacing, y*spacing, z) を格納
+      2) 粒子の色（colors）を作る
+         - vertexColors を有効にし、頂点ごとに RGB を割り当てる
+      3) BufferGeometry に属性としてセットする
+         - setAttribute("position", BufferAttribute(Float32Array, 3))
+         - setAttribute("color", BufferAttribute(Float32Array, 3))
+      4) PointsMaterial を用意する
+         - size: 点の見た目サイズ
+         - vertexColors: true（頂点色を使う）
+         - transparent / blending で “粒子っぽさ” を出す（任意）
+      5) THREE.Points(geometry, material) を生成して scene に追加
+      6) requestAnimationFrame で毎フレーム描画（必要ならアニメで揺らす）
+      7) （重要）再生成時は geometry/material を dispose して GPU リソースを解放する
+
+    よくある「何も表示されない」原因と対策：
+      - Geometry 廃止：THREE.Geometry を使うと新しい three では動かない
+        → BufferGeometry に置換済み
+      - vertexColors の設定ミス：
+        → material.vertexColors = true（これが無いと色配列が無視される）
+      - カメラが視界外：
+        → 粒子群サイズから z 距離を自動フィット
+      - import が失敗（ネットワーク / importmap 不備）：
+        → importmap を同梱し、three の specifier を解決する
+  -->
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+    #ui {
+      position: fixed;
+      top: 12px; left: 12px;
+      width: 320px;
+      padding: 12px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.90);
+      box-shadow: 0 12px 32px rgba(0,0,0,0.35);
+      backdrop-filter: blur(8px);
+      user-select: none;
+    }
+    #ui h1 { margin: 0 0 10px; font-size: 14px; }
+    .row { display: grid; grid-template-columns: 120px 1fr; gap: 10px; align-items: center; margin: 10px 0; }
+    label { font-size: 12px; color: #222; }
+    input[type="range"], input[type="number"] { width: 100%; }
+    .value { font-size: 12px; color: #222; text-align: right; }
+    #hud {
+      position: fixed;
+      right: 12px; top: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      max-width: calc(100vw - 24px);
+      display: none;
+      white-space: pre-wrap;
+    }
+    button {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: none;
+      background: #111;
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:active { transform: translateY(1px); }
+  </style>
+
+  <!--
+    重要：ローカル libs を使わず、three の specifier を解決するために importmap を使う。
+    これにより `import * as THREE from "three"` の形式が安定する（URL直書きでもOKだが、examples との整合が良い）。
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+      }
+    }
+  </script>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Particles / Points（libs無し版）</h1>
+
+    <div class="row">
+      <label for="gridN">グリッド幅 N</label>
+      <div>
+        <input id="gridN" type="range" min="2" max="40" step="1" value="5" />
+        <div class="value" id="gridNVal">5</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="spacing">間隔 spacing</label>
+      <div>
+        <input id="spacing" type="range" min="2" max="30" step="1" value="10" />
+        <div class="value" id="spacingVal">10</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="size">点サイズ size</label>
+      <div>
+        <input id="size" type="range" min="1" max="20" step="1" value="4" />
+        <div class="value" id="sizeVal">4</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="animate">アニメ</label>
+      <input id="animate" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label for="rebuild">再生成</label>
+      <button id="rebuild" type="button">Rebuild</button>
+    </div>
+
+    <div style="font-size:12px; color:#333; line-height:1.5; margin-top:8px;">
+      左ドラッグ：回転 / ホイール：ズーム
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+
+    // ------------------------------------------------------------
+    // エラー表示（黒画面で沈黙しないための保険）
+    // ------------------------------------------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+
+    // ------------------------------------------------------------
+    // 旧 OrbitControls の libs 依存を避けるため、簡易 Orbit を自前実装する
+    // （このサンプルは「Points の生成」が主題なので、操作は最小限でOK）
+    //
+    // 実装方針：
+    //   - 目標点 target を中心に、カメラを球面座標（radius, theta, phi）で回す
+    //   - マウスドラッグで theta/phi を変える
+    //   - ホイールで radius を変える
+    // ------------------------------------------------------------
+    function makeMiniOrbit(camera, dom, target = new THREE.Vector3(0,0,0)) {
+      const state = {
+        target,
+        radius: 150,
+        theta: 0.0,          // 水平方向角
+        phi: 1.1,            // 垂直方向角（0..π）
+        isDown: false,
+        lastX: 0,
+        lastY: 0
+      };
+
+      function apply() {
+        // phi を極端にすると上下反転や特異点が出るのでクランプ
+        const eps = 0.001;
+        state.phi = Math.max(eps, Math.min(Math.PI - eps, state.phi));
+
+        const x = state.target.x + state.radius * Math.sin(state.phi) * Math.cos(state.theta);
+        const y = state.target.y + state.radius * Math.cos(state.phi);
+        const z = state.target.z + state.radius * Math.sin(state.phi) * Math.sin(state.theta);
+
+        camera.position.set(x, y, z);
+        camera.lookAt(state.target);
+      }
+
+      dom.addEventListener("mousedown", (e) => {
+        state.isDown = true;
+        state.lastX = e.clientX;
+        state.lastY = e.clientY;
+      });
+      window.addEventListener("mouseup", () => { state.isDown = false; });
+      window.addEventListener("mousemove", (e) => {
+        if (!state.isDown) return;
+        const dx = e.clientX - state.lastX;
+        const dy = e.clientY - state.lastY;
+        state.lastX = e.clientX;
+        state.lastY = e.clientY;
+
+        // 感度（適当に）
+        state.theta -= dx * 0.01;
+        state.phi   -= dy * 0.01;
+        apply();
+      }, { passive: true });
+
+      dom.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        const delta = Math.sign(e.deltaY);
+        state.radius *= (delta > 0) ? 1.08 : 0.92;
+        state.radius = Math.max(10, Math.min(2000, state.radius));
+        apply();
+      }, { passive: false });
+
+      // 初期反映
+      apply();
+
+      return {
+        setRadius(r) { state.radius = r; apply(); },
+        setTarget(v) { state.target.copy(v); apply(); },
+        apply
+      };
+    }
+
+    // ------------------------------------------------------------
+    // Three.js 基本セットアップ
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      5000
+    );
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // 最小 Orbit（OrbitControls 不要）
+    const orbit = makeMiniOrbit(camera, renderer.domElement, new THREE.Vector3(0,0,0));
+
+    // ------------------------------------------------------------
+    // UI
+    // ------------------------------------------------------------
+    const uiGridN = document.getElementById("gridN");
+    const uiSpacing = document.getElementById("spacing");
+    const uiSize = document.getElementById("size");
+    const uiAnimate = document.getElementById("animate");
+    const uiRebuild = document.getElementById("rebuild");
+
+    const gridNVal = document.getElementById("gridNVal");
+    const spacingVal = document.getElementById("spacingVal");
+    const sizeVal = document.getElementById("sizeVal");
+
+    function syncLabels() {
+      gridNVal.textContent = String(uiGridN.value);
+      spacingVal.textContent = String(uiSpacing.value);
+      sizeVal.textContent = String(uiSize.value);
+    }
+    syncLabels();
+
+    // ------------------------------------------------------------
+    // 表示対象：Points（点群）
+    //   - 再生成のため参照を保持し、dispose できるようにする
+    // ------------------------------------------------------------
+    let points = null;
+
+    function disposePoints(obj) {
+      if (!obj) return;
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material) obj.material.dispose();
+    }
+
+    // ------------------------------------------------------------
+    // 重要：旧 THREE.Geometry を BufferGeometry に置換する
+    //
+    // 旧実装：
+    //   geom.vertices.push(Vector3)
+    //   geom.colors.push(Color)
+    //
+    // 新実装：
+    //   positions: Float32Array [x,y,z, x,y,z, ...]
+    //   colors:    Float32Array [r,g,b, r,g,b, ...] （0..1）
+    //   geometry.setAttribute("position", BufferAttribute(positions, 3))
+    //   geometry.setAttribute("color",    BufferAttribute(colors, 3))
+    //
+    // ※ vertexColors を true にしないと colors が反映されない。
+    // ------------------------------------------------------------
+    function rebuild() {
+      clearError();
+      try {
+        // 既存を撤去 + GPU リソース解放
+        if (points) scene.remove(points);
+        disposePoints(points);
+        points = null;
+
+        const N = Math.max(2, Math.floor(Number(uiGridN.value)));     // -N..N-1 を作る
+        const spacing = Math.max(1, Math.floor(Number(uiSpacing.value)));
+        const size = Math.max(1, Math.floor(Number(uiSize.value)));
+
+        const countX = N * 2;  // 旧コードは -5..4 の 10 個、つまり 2N 個
+        const countY = N * 2;
+        const count = countX * countY;
+
+        // positions/colors を TypedArray で確保（GPUにそのまま送れる）
+        const positions = new Float32Array(count * 3);
+        const colors = new Float32Array(count * 3);
+
+        let k = 0; // positions/colors の書き込みインデックス（頂点単位）
+        for (let ix = -N; ix < N; ix++) {
+          for (let iy = -N; iy < N; iy++) {
+            const x = ix * spacing;
+            const y = iy * spacing;
+            const z = 0;
+
+            // positions
+            positions[k * 3 + 0] = x;
+            positions[k * 3 + 1] = y;
+            positions[k * 3 + 2] = z;
+
+            // colors（0..1）
+            // 旧コードは new THREE.Color(Math.random()*0x00ffff) だったが、
+            // ここでは「青〜シアン系」を作りやすいように HSV 的に寄せる。
+            // - r: 0..0.2
+            // - g: 0.4..1
+            // - b: 0.6..1
+            const r = Math.random() * 0.2;
+            const g = 0.4 + Math.random() * 0.6;
+            const b = 0.6 + Math.random() * 0.4;
+
+            colors[k * 3 + 0] = r;
+            colors[k * 3 + 1] = g;
+            colors[k * 3 + 2] = b;
+
+            k++;
+          }
+        }
+
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+        geom.computeBoundingSphere(); // カリングや camera fit に有用
+
+        // PointsMaterial：
+        // - vertexColors: true が最重要
+        // - sizeAttenuation: true にすると遠くの点が小さく見える（自然）
+        // - transparent + AdditiveBlending で “光る粒子” に寄せる（黒背景と相性良）
+        const mat = new THREE.PointsMaterial({
+          size,
+          vertexColors: true,
+          sizeAttenuation: true,
+          transparent: true,
+          opacity: 0.95,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending
+        });
+
+        points = new THREE.Points(geom, mat);
+        scene.add(points);
+
+        // カメラを自動フィット（何も見えない問題の予防）
+        // 粒子群の半径はおおよそ max(|x|,|y|) なので N*spacing を使って距離を決める。
+        const extent = (N - 1) * spacing;
+        const maxDim = extent * 2;
+        const fov = camera.fov * (Math.PI / 180);
+        let dist = (maxDim / 2) / Math.tan(fov / 2);
+        dist *= 1.4; // マージン
+
+        orbit.setTarget(new THREE.Vector3(0,0,0));
+        orbit.setRadius(Math.max(30, dist));
+      } catch (e) {
+        showError("再生成でエラーが発生しました:\n" + (e && e.stack ? e.stack : e));
+      }
+    }
+
+    // UIイベント
+    uiGridN.addEventListener("input", () => { syncLabels(); });
+    uiSpacing.addEventListener("input", () => { syncLabels(); });
+    uiSize.addEventListener("input", () => { syncLabels(); });
+
+    uiGridN.addEventListener("change", rebuild);
+    uiSpacing.addEventListener("change", rebuild);
+    uiSize.addEventListener("change", rebuild);
+    uiRebuild.addEventListener("click", rebuild);
+
+    // ------------------------------------------------------------
+    // FPS（stats.js の代替）
+    // ------------------------------------------------------------
+    const hud = document.getElementById("hud");
+    let lastT = performance.now();
+    let frames = 0;
+
+    // ------------------------------------------------------------
+    // ループ
+    // ------------------------------------------------------------
+    let t = 0;
+    rebuild();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // アニメ：z を軽く波打たせる（Points の “動き” が分かるように）
+      if (points && uiAnimate.checked) {
+        t += 0.02;
+
+        // position を動かすには attributes を直接更新する
+        // ※ GPUに送るので needsUpdate が必要
+        const posAttr = points.geometry.getAttribute("position");
+        const arr = posAttr.array;
+
+        // 全頂点の z だけ更新（x,y は固定）
+        // グリッド座標から位相を作って “波” を出す（見た目が分かりやすい）
+        for (let i = 0; i < posAttr.count; i++) {
+          const x = arr[i * 3 + 0];
+          const y = arr[i * 3 + 1];
+          arr[i * 3 + 2] = Math.sin(t + x * 0.05) * 3 + Math.cos(t * 1.3 + y * 0.05) * 3;
+        }
+
+        posAttr.needsUpdate = true;
+        points.geometry.computeBoundingSphere();
+      }
+
+      renderer.render(scene, camera);
+
+      // FPS 更新（1秒に1回）
+      frames++;
+      const now = performance.now();
+      if (now - lastT >= 1000) {
+        const fps = (frames * 1000) / (now - lastT);
+        frames = 0;
+        lastT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "N: " + uiGridN.value + " (count=" + (Number(uiGridN.value)*2)**2 + ")\n" +
+          "spacing: " + uiSpacing.value + "\n" +
+          "size: " + uiSize.value + "\n" +
+          "animate: " + (uiAnimate.checked ? "on" : "off");
+      }
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // リサイズ
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ------------------------------------------------------------
+    // 予期しない例外を HUD に出す（デバッグ用）
+    // ------------------------------------------------------------
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e && e.error && e.error.stack ? e.error.stack : (e.message || e)));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e && e.reason && e.reason.stack ? e.reason.stack : e.reason));
+    });
+  </script>
+</body>
+</html>
