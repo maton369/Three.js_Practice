@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 06.08 - Binary operations (CSG / libs無し・修正版 + 詳細コメント)</title>
+
+  <!--
+    ✅ 今回のエラー
+      TypeError: object.onBeforeShadow is not a function
+
+    これは「three.js の ShadowMap パスが object.onBeforeShadow() を呼ぶ」一方で、
+    シーン内に “three.js の Object3D ではない Mesh” が混ざったときに起きやすい。
+
+    原因の典型：
+      - CSG ライブラリが “別インスタンスの THREE” で Mesh を作って返している
+        -> 見た目は Mesh っぽいが、renderer が期待する Object3D のメソッドを持っていない
+
+    ✅ 対策（本コードの修正点）
+      1) CSG.toMesh(...) を使わない
+         -> CSG.toGeometry(...) で「ジオメトリだけ」を取り出す
+         -> それを “このページの THREE” で new THREE.Mesh(...) し直す
+         -> これで必ず Object3D として整合する
+
+      2) さらに教材として shadow は不要なので renderer.shadowMap を OFF にして保険をかける
+         -> 影処理パス自体を走らせないので、同系統の事故を潰せる
+
+    --------------------------------------------
+    CSG（ブーリアン演算）全体アルゴリズム（教材のコア）
+    --------------------------------------------
+    入力：形状A（Sphere1）, 形状B（Sphere2）, 形状C（Cube）
+    操作：A ? B を行い、その結果 ? C を行う（? は subtract/union/intersect）
+
+    実装の内部（BSP/CSG系の共通概念）：
+      (1) メッシュ（多数の三角形ポリゴン）を “切断可能な形” に変換する
+      (2) union/subtract/intersect の規則に従い、不要な面を捨てる/残す
+      (3) 生成された新しいポリゴン集合からジオメトリを再構築する
+      (4) 法線を再計算し、ライティングで立体として見えるようにする
+
+    重い理由：
+      - 三角形同士の交差判定・分割が大量に起きるため（分割数が増えるほど急激に重くなる）
+      - なので「スピナー表示」「Rebuild ボタンで確定」が実用的
+  -->
+
+  <!-- importmap: addons が import "three"（bare specifier）するので必須 -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #999; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 360px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.88);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.22);
+      backdrop-filter: blur(8px);
+      user-select: none;
+    }
+    #ui h1 { font-size: 14px; margin: 0 0 10px; font-weight: 800; }
+    .row { display: grid; grid-template-columns: 140px 1fr; gap: 10px; align-items: center; margin: 8px 0; }
+    .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; align-items: center; }
+    label { font-size: 12px; color: #222; }
+    select, input[type="range"] { width: 100%; }
+    input[type="checkbox"] { transform: scale(1.1); }
+    .subhead { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(0,0,0,0.08); font-weight: 800; font-size: 12px; color: #222; }
+
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+    }
+
+    #err {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 80, 80, 0.95);
+      color: #fff;
+      font-size: 12px;
+      max-width: calc(100vw - 24px);
+      display: none;
+      white-space: pre-wrap;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    }
+
+    /* spin.js の代替：CSS スピナー */
+    #spinner {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.22);
+    }
+    .spin {
+      width: 64px;
+      height: 64px;
+      border-radius: 999px;
+      border: 10px solid rgba(255,255,255,0.45);
+      border-top-color: rgba(255,255,255,0.95);
+      animation: spin 0.9s linear infinite;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    button {
+      width: 100%;
+      padding: 10px 12px;
+      border: 0;
+      border-radius: 12px;
+      background: #111;
+      color: #fff;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    button:active { transform: translateY(1px); }
+
+    .hint { font-size: 12px; color: #333; line-height: 1.4; margin-top: 8px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 11px; }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Binary Operations (CSG) / libs無し版</h1>
+
+    <div class="subhead">演算</div>
+    <div class="row">
+      <label for="actionSphere">Sphere1 ? Sphere2</label>
+      <select id="actionSphere">
+        <option value="subtract">subtract（差：S1 - S2）</option>
+        <option value="intersect">intersect（共通）</option>
+        <option value="union">union（和）</option>
+        <option value="none">none（S2無視）</option>
+      </select>
+    </div>
+    <div class="row">
+      <label for="actionCube">（上の結果）? Cube</label>
+      <select id="actionCube">
+        <option value="subtract">subtract（差）</option>
+        <option value="intersect">intersect（共通）</option>
+        <option value="union">union（和）</option>
+        <option value="none">none（Cube無視）</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label>操作</label>
+      <button id="rebuildBtn" type="button">Rebuild（再計算）</button>
+    </div>
+
+    <div class="row">
+      <label for="hideWire">元形状を非表示</label>
+      <input id="hideWire" type="checkbox" />
+    </div>
+    <div class="row">
+      <label for="rotateResult">結果を回転</label>
+      <input id="rotateResult" type="checkbox" />
+    </div>
+
+    <div class="subhead">Sphere1</div>
+    <div class="row3">
+      <div><label>X</label><input id="s1x" type="range" min="-15" max="15" step="0.1" value="-2"></div>
+      <div><label>Y</label><input id="s1y" type="range" min="-15" max="15" step="0.1" value="0"></div>
+      <div><label>Z</label><input id="s1z" type="range" min="-15" max="15" step="0.1" value="0"></div>
+    </div>
+    <div class="row">
+      <label for="s1s">Scale</label>
+      <input id="s1s" type="range" min="0.2" max="4" step="0.01" value="1">
+    </div>
+
+    <div class="subhead">Sphere2</div>
+    <div class="row3">
+      <div><label>X</label><input id="s2x" type="range" min="-15" max="15" step="0.1" value="3"></div>
+      <div><label>Y</label><input id="s2y" type="range" min="-15" max="15" step="0.1" value="0"></div>
+      <div><label>Z</label><input id="s2z" type="range" min="-15" max="15" step="0.1" value="0"></div>
+    </div>
+    <div class="row">
+      <label for="s2s">Scale</label>
+      <input id="s2s" type="range" min="0.2" max="4" step="0.01" value="1">
+    </div>
+
+    <div class="subhead">Cube</div>
+    <div class="row3">
+      <div><label>X</label><input id="cx" type="range" min="-15" max="15" step="0.1" value="-7"></div>
+      <div><label>Y</label><input id="cy" type="range" min="-15" max="15" step="0.1" value="0"></div>
+      <div><label>Z</label><input id="cz" type="range" min="-15" max="15" step="0.1" value="0"></div>
+    </div>
+    <div class="row3">
+      <div><label>scaleX</label><input id="csx" type="range" min="0.2" max="4" step="0.01" value="1"></div>
+      <div><label>scaleY</label><input id="csy" type="range" min="0.2" max="4" step="0.01" value="1"></div>
+      <div><label>scaleZ</label><input id="csz" type="range" min="0.2" max="4" step="0.01" value="1"></div>
+    </div>
+
+    <div class="hint">
+      左ドラッグ: 回転 / ホイール: ズーム / 右ドラッグ: 平行移動<br>
+      <span class="mono">CSG は重いので、Rebuild ボタンで確定が安全。</span>
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+  <div id="spinner"><div class="spin"></div></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { CSG } from "https://cdn.jsdelivr.net/npm/three-csg-ts@3.1.12/+esm";
+
+    // ------------------------------------------------------------
+    // エラー表示（沈黙しない保険）
+    // ------------------------------------------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) { errBox.style.display = "block"; errBox.textContent = String(msg); }
+    function clearError() { errBox.style.display = "none"; errBox.textContent = ""; }
+
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e && e.error && e.error.stack ? e.error.stack : e.message));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e && e.reason && e.reason.stack ? e.reason.stack : e.reason));
+    });
+
+    // ------------------------------------------------------------
+    // スピナー（spin.js の代替）
+    // ------------------------------------------------------------
+    const spinner = document.getElementById("spinner");
+    function showSpinner() { spinner.style.display = "flex"; }
+    function hideSpinner() { spinner.style.display = "none"; }
+
+    // ------------------------------------------------------------
+    // Three.js 基本セットアップ
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x999999);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 2000);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+    // ✅ 影は教材的に不要＆今回の onBeforeShadow 系事故の温床なので OFF（重要）
+    renderer.shadowMap.enabled = false;
+
+    document.body.appendChild(renderer.domElement);
+
+    // 補助表示
+    scene.add(new THREE.AxesHelper(10));
+    const grid = new THREE.GridHelper(80, 20);
+    grid.position.y = -8;
+    scene.add(grid);
+
+    // ライト（StandardMaterial を“立体として”見せる）
+    scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.95);
+    dir.position.set(40, 60, 35);
+    scene.add(dir);
+
+    // OrbitControls
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+
+    camera.position.set(0, 20, 28);
+    orbit.target.set(0, 0, 0);
+    orbit.update();
+
+    // ------------------------------------------------------------
+    // UI 参照
+    // ------------------------------------------------------------
+    const ui = {
+      actionSphere: document.getElementById("actionSphere"),
+      actionCube: document.getElementById("actionCube"),
+      rebuildBtn: document.getElementById("rebuildBtn"),
+      hideWire: document.getElementById("hideWire"),
+      rotateResult: document.getElementById("rotateResult"),
+
+      s1x: document.getElementById("s1x"),
+      s1y: document.getElementById("s1y"),
+      s1z: document.getElementById("s1z"),
+      s1s: document.getElementById("s1s"),
+
+      s2x: document.getElementById("s2x"),
+      s2y: document.getElementById("s2y"),
+      s2z: document.getElementById("s2z"),
+      s2s: document.getElementById("s2s"),
+
+      cx: document.getElementById("cx"),
+      cy: document.getElementById("cy"),
+      cz: document.getElementById("cz"),
+      csx: document.getElementById("csx"),
+      csy: document.getElementById("csy"),
+      csz: document.getElementById("csz"),
+    };
+
+    // ------------------------------------------------------------
+    // 元形状（Sphere1/Sphere2/Cube）と結果
+    // ------------------------------------------------------------
+    let sphere1, sphere2, cube;
+    let resultMesh = null;
+
+    // 元形状はワイヤで位置関係を見せる（教材向け）
+    const srcMat1 = new THREE.MeshBasicMaterial({ color: 0x111111, wireframe: true });
+    const srcMat2 = new THREE.MeshBasicMaterial({ color: 0x222222, wireframe: true });
+
+    // 結果は立体感が欲しいので StandardMaterial
+    const resultMat = new THREE.MeshStandardMaterial({
+      color: 0x4dd0ff,
+      roughness: 0.35,
+      metalness: 0.10,
+      side: THREE.DoubleSide
+    });
+
+    // ------------------------------------------------------------
+    // 形状生成（分割数は CSG の重さに直結）
+    // ------------------------------------------------------------
+    function buildSources() {
+      if (sphere1) scene.remove(sphere1);
+      if (sphere2) scene.remove(sphere2);
+      if (cube) scene.remove(cube);
+
+      // 元: SphereGeometry(5,20,30) だが、CSGが重いので少し抑える
+      sphere1 = new THREE.Mesh(new THREE.SphereGeometry(5, 18, 14), srcMat1);
+      sphere2 = new THREE.Mesh(new THREE.SphereGeometry(5, 18, 14), srcMat1);
+      cube    = new THREE.Mesh(new THREE.BoxGeometry(5, 5, 5), srcMat2);
+
+      scene.add(sphere1);
+      scene.add(sphere2);
+      scene.add(cube);
+
+      applyUIToSources();
+      setSourcesVisible(!ui.hideWire.checked);
+    }
+
+    function applyUIToSources() {
+      sphere1.position.set(Number(ui.s1x.value), Number(ui.s1y.value), Number(ui.s1z.value));
+      sphere2.position.set(Number(ui.s2x.value), Number(ui.s2y.value), Number(ui.s2z.value));
+      cube.position.set(Number(ui.cx.value), Number(ui.cy.value), Number(ui.cz.value));
+
+      const s1 = Number(ui.s1s.value);
+      const s2 = Number(ui.s2s.value);
+      sphere1.scale.set(s1, s1, s1);
+      sphere2.scale.set(s2, s2, s2);
+
+      cube.scale.set(Number(ui.csx.value), Number(ui.csy.value), Number(ui.csz.value));
+    }
+
+    function setSourcesVisible(visible) {
+      sphere1.visible = visible;
+      sphere2.visible = visible;
+      cube.visible = visible;
+    }
+
+    // ------------------------------------------------------------
+    // dispose（再生成で GPU リソースが溜まるのを防ぐ）
+    // ------------------------------------------------------------
+    function disposeMesh(m) {
+      if (!m) return;
+      if (m.geometry) m.geometry.dispose();
+      // resultMat は共有しているので dispose しない（必要なら別管理する）
+    }
+
+    // ------------------------------------------------------------
+    // カメラを bbox からフィット（視界外対策の決定打）
+    // ------------------------------------------------------------
+    function fitCameraToObject(cam, obj, margin = 1.25) {
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const fov = cam.fov * (Math.PI / 180);
+      let distance = (maxDim / 2) / Math.tan(fov / 2);
+      distance *= margin;
+
+      cam.position.set(distance, distance * 0.7, distance);
+      cam.near = Math.max(0.1, distance / 100);
+      cam.far  = Math.max(2000, distance * 10);
+      cam.updateProjectionMatrix();
+
+      orbit.target.set(0, 0, 0);
+      orbit.update();
+    }
+
+    // ------------------------------------------------------------
+    // CSG 再計算（本題）
+    // 重要：CSG.toMesh を使わず “toGeometry -> new THREE.Mesh” で安全にする
+    // ------------------------------------------------------------
+    async function rebuildCSG() {
+      clearError();
+      showSpinner();
+
+      applyUIToSources();
+
+      // UI を固めにくくするため軽く待つ（spin.js の setTimeout 相当）
+      await new Promise((r) => setTimeout(r, 10));
+
+      try {
+        // 既存結果を撤去
+        if (resultMesh) {
+          scene.remove(resultMesh);
+          disposeMesh(resultMesh);
+          resultMesh = null;
+        }
+
+        // transform（position/scale）を matrix に反映してから CSG
+        sphere1.updateMatrixWorld(true); sphere1.updateMatrix();
+        sphere2.updateMatrixWorld(true); sphere2.updateMatrix();
+        cube.updateMatrixWorld(true);    cube.updateMatrix();
+
+        // CSG 用に変換
+        const A = CSG.fromMesh(sphere1);
+        const B = CSG.fromMesh(sphere2);
+
+        let out;
+
+        // 1段目：Sphere1 ? Sphere2
+        switch (ui.actionSphere.value) {
+          case "subtract":  out = A.subtract(B);  break;
+          case "intersect": out = A.intersect(B); break;
+          case "union":     out = A.union(B);     break;
+          case "none":      out = A;              break;
+        }
+
+        // 2段目：上の結果 ? Cube
+        if (ui.actionCube.value !== "none") {
+          const C = CSG.fromMesh(cube);
+          switch (ui.actionCube.value) {
+            case "subtract":  out = out.subtract(C);  break;
+            case "intersect": out = out.intersect(C); break;
+            case "union":     out = out.union(C);     break;
+          }
+        }
+
+        // 両方 none なら結果は出さない（元サンプル互換）
+        if (ui.actionSphere.value === "none" && ui.actionCube.value === "none") {
+          hideSpinner();
+          return;
+        }
+
+        // ✅ ここが最大の修正点：
+        //    CSG.toGeometry で “生の BufferGeometry” を取り出し、
+        //    このページの THREE で Mesh を作り直す（Object3D の整合が取れる）
+        const geom = CSG.toGeometry(out, new THREE.Matrix4());
+
+        // 陰影のため法線を再計算（黒い/変な陰影の定番対策）
+        geom.computeVertexNormals();
+
+        resultMesh = new THREE.Mesh(geom, resultMat);
+        scene.add(resultMesh);
+
+        // 視界外を潰すためカメラフィット
+        fitCameraToObject(camera, resultMesh, 1.25);
+
+      } catch (e) {
+        showError("CSG 再計算でエラー:\n" + (e && e.stack ? e.stack : e));
+      } finally {
+        hideSpinner();
+      }
+    }
+
+    // ------------------------------------------------------------
+    // UIイベント
+    // 重いので、CSGは Rebuild ボタンで確定（スライダーは形状の位置だけ更新）
+    // ------------------------------------------------------------
+    ui.rebuildBtn.addEventListener("click", rebuildCSG);
+
+    ui.hideWire.addEventListener("change", () => {
+      setSourcesVisible(!ui.hideWire.checked);
+    });
+
+    const liveUpdate = [
+      ui.s1x, ui.s1y, ui.s1z, ui.s1s,
+      ui.s2x, ui.s2y, ui.s2z, ui.s2s,
+      ui.cx, ui.cy, ui.cz, ui.csx, ui.csy, ui.csz
+    ];
+    liveUpdate.forEach((el) => el.addEventListener("input", applyUIToSources));
+
+    // ------------------------------------------------------------
+    // 簡易FPS（stats.js無し）
+    // ------------------------------------------------------------
+    const hud = document.getElementById("hud");
+    let lastFpsT = performance.now();
+    let frames = 0;
+    let fps = 0;
+
+    // 初期化
+    buildSources();
+    rebuildCSG(); // 初回は結果を出す
+
+    // ループ
+    function animate() {
+      requestAnimationFrame(animate);
+
+      orbit.update();
+
+      if (ui.rotateResult.checked && resultMesh) {
+        resultMesh.rotation.y += 0.04;
+        resultMesh.rotation.z -= 0.005;
+      }
+
+      renderer.render(scene, camera);
+
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "S: " + ui.actionSphere.value + "\n" +
+          "C: " + ui.actionCube.value + "\n" +
+          "result: " + (resultMesh ? "ON" : "OFF") + "\n" +
+          "shadowMap: OFF";
+      }
+    }
+    animate();
+
+    // リサイズ
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
