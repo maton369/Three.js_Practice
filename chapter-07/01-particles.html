@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 07.01 - Particles (Sprites / libsなし版)</title>
+
+  <!--
+    このサンプルの主題：Sprite（ビルボード）を大量に配置して「粒子っぽい見た目」を作る
+
+    ■ 全体アルゴリズム（流れ）
+    1) THREE.Scene / Camera / WebGLRenderer を作る
+    2) 粒子テクスチャ（円形グラデ）を Canvas で生成し、THREE.CanvasTexture にする
+       - 外部画像を使わず「libsなし」で完結させるため
+    3) 共有 SpriteMaterial を1個だけ作り、Sprite を大量に生成してグリッド配置する
+       - “共有マテリアル” にすると GPU 的に効率が良い（同じシェーダ・同じ設定）
+    4) requestAnimationFrame のループで描画する
+       - おまけ：粒子を波打たせるアニメや簡易 FPS 表示
+    5) UI 変更時は “古いSpriteをdisposeして作り直す”
+       - 教材で一番事故りやすい「GPUメモリリーク」を防ぐ
+
+    ■ 重要ポイント（WebGLでSpriteが見えない原因を潰す）
+    - SpriteMaterial に map を入れて “円形” を作る（map無しだと四角に見える）
+    - 透過を使うので transparent=true / depthWrite=false を入れる
+    - AdditiveBlending を使うと「粒子の光」っぽくなる
+  -->
+
+  <!-- importmap：ブラウザに "three" の解決方法を教える（ローカル libs を使わない） -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+      }
+    }
+  </script>
+
+  <style>
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+    }
+
+    /* UI（dat.gui の代わり） */
+    #ui {
+      position: fixed;
+      left: 12px;
+      top: 12px;
+      width: 320px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.10);
+      color: #fff;
+      box-shadow: 0 10px 28px rgba(0,0,0,0.35);
+      backdrop-filter: blur(8px);
+      user-select: none;
+    }
+    #ui h1 { margin: 0 0 10px; font-size: 14px; font-weight: 800; }
+    .row { display: grid; grid-template-columns: 120px 1fr; gap: 10px; align-items: center; margin: 8px 0; }
+    label { font-size: 12px; opacity: 0.9; }
+    input[type="range"] { width: 100%; }
+    input[type="checkbox"] { transform: scale(1.1); }
+    .value { font-size: 12px; text-align: right; opacity: 0.9; }
+    button {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 0;
+      cursor: pointer;
+      color: #fff;
+      background: rgba(255,255,255,0.18);
+      font-weight: 700;
+    }
+    button:hover { background: rgba(255,255,255,0.25); }
+
+    /* 簡易FPS表示（stats.js の代わり） */
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.10);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+      backdrop-filter: blur(8px);
+    }
+
+    /* import失敗などのエラー表示 */
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 12px;
+      border-radius: 12px;
+      background: rgba(255,80,80,0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Particles (Sprites / libsなし版)</h1>
+
+    <div class="row">
+      <label>グリッド半径</label>
+      <div>
+        <input id="rangeN" type="range" min="2" max="30" step="1" value="10" />
+        <div class="value" id="valN">10</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>間隔（spacing）</label>
+      <div>
+        <input id="rangeSpacing" type="range" min="4" max="30" step="1" value="10" />
+        <div class="value" id="valSpacing">10</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>粒子サイズ</label>
+      <div>
+        <input id="rangeSize" type="range" min="0.5" max="10" step="0.1" value="3.0" />
+        <div class="value" id="valSize">3.0</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>発光（強さ）</label>
+      <div>
+        <input id="rangeIntensity" type="range" min="0.1" max="2.0" step="0.05" value="1.0" />
+        <div class="value" id="valIntensity">1.00</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>アニメ</label>
+      <input id="chkAnim" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label>操作</label>
+      <button id="btnRebuild" type="button">Rebuild（再生成）</button>
+    </div>
+
+    <div style="font-size:12px; opacity:.9; margin-top:6px;">
+      ※ マウス操作は無し（カメラ固定）。黒背景で Sprite の重なりを見やすくしています。
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    // ============================================================
+    // 0) import 失敗時に “画面に出す” ため、dynamic import を使う
+    //    （static import だと失敗時に何も描けず沈黙しやすい）
+    // ============================================================
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+
+    let THREE;
+    try {
+      THREE = await import("three");
+    } catch (e) {
+      showError(
+        "CDN import に失敗しました。\n" +
+        "- ネットワーク\n" +
+        "- unpkg へのアクセス\n" +
+        "- importmap の URL\n" +
+        "を確認してください。\n\n" +
+        (e && e.stack ? e.stack : e)
+      );
+      throw e;
+    }
+
+    // ============================================================
+    // 1) UI 参照（dat.gui の代替）
+    // ============================================================
+    const ui = {
+      n: document.getElementById("rangeN"),
+      spacing: document.getElementById("rangeSpacing"),
+      size: document.getElementById("rangeSize"),
+      intensity: document.getElementById("rangeIntensity"),
+      anim: document.getElementById("chkAnim"),
+      rebuild: document.getElementById("btnRebuild"),
+      vN: document.getElementById("valN"),
+      vSpacing: document.getElementById("valSpacing"),
+      vSize: document.getElementById("valSize"),
+      vIntensity: document.getElementById("valIntensity"),
+      hud: document.getElementById("hud"),
+    };
+
+    function syncLabels() {
+      ui.vN.textContent = ui.n.value;
+      ui.vSpacing.textContent = ui.spacing.value;
+      ui.vSize.textContent = Number(ui.size.value).toFixed(1);
+      ui.vIntensity.textContent = Number(ui.intensity.value).toFixed(2);
+    }
+    syncLabels();
+
+    // ============================================================
+    // 2) Three.js 基本セットアップ
+    // ============================================================
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      2000
+    );
+    // 元サンプルは z=150。今回も同等の “見えやすい距離” に固定。
+    camera.position.set(0, 0, 150);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0x000000, 1.0);
+    document.body.appendChild(renderer.domElement);
+
+    // ============================================================
+    // 3) 粒子の “見た目の核” ：円形グラデのテクスチャを Canvas で自作
+    //    - 外部画像不要（libsなし）
+    //    - SpriteMaterial.map に指定して “四角” ではなく “丸い粒子” にする
+    // ============================================================
+    function makeParticleTexture(sizePx = 128) {
+      const c = document.createElement("canvas");
+      c.width = sizePx;
+      c.height = sizePx;
+
+      const ctx = c.getContext("2d");
+      const r = sizePx / 2;
+
+      // 中心が明るく、外側が透明になるラジアルグラデーション
+      const g = ctx.createRadialGradient(r, r, 0, r, r, r);
+      g.addColorStop(0.0, "rgba(255,255,255,1.0)");
+      g.addColorStop(0.2, "rgba(255,255,255,0.9)");
+      g.addColorStop(0.6, "rgba(255,255,255,0.25)");
+      g.addColorStop(1.0, "rgba(255,255,255,0.0)");
+
+      ctx.clearRect(0, 0, sizePx, sizePx);
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(r, r, r, 0, Math.PI * 2);
+      ctx.fill();
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.needsUpdate = true;
+      return tex;
+    }
+
+    const particleTex = makeParticleTexture(128);
+
+    // ============================================================
+    // 4) Sprite をまとめて管理する Group（再生成・disposeしやすくする）
+    // ============================================================
+    let spriteGroup = new THREE.Group();
+    scene.add(spriteGroup);
+
+    // 共有マテリアル（全粒子で1個だけ）
+    // - transparent: テクスチャのアルファを使う
+    // - depthWrite=false: 透明物の “奥が抜けない” 問題を減らす（粒子向け定番）
+    // - AdditiveBlending: 光が重なる表現に向く（粒子向け定番）
+    let spriteMaterial = new THREE.SpriteMaterial({
+      map: particleTex,
+      color: 0xffffff,
+      transparent: true,
+      opacity: 1.0,
+      depthWrite: false,
+      depthTest: true,
+      blending: THREE.AdditiveBlending
+    });
+
+    // ============================================================
+    // 5) 粒子の生成（アルゴリズムの中心）
+    //    N（半径）をもとに [-N..N] の格子を走査して Sprite を配置する
+    // ============================================================
+    function rebuildSprites() {
+      // --- 既存の Sprite をシーンから外し、GPU資源を解放する ---
+      // Sprite は geometry を持たないが、material/texture は持つ。
+      // ここでは “グループ内の子” を remove して参照を切る。
+      scene.remove(spriteGroup);
+      spriteGroup.clear();
+      spriteGroup = new THREE.Group();
+      scene.add(spriteGroup);
+
+      // --- UI値を反映 ---
+      const N = Math.max(2, Math.floor(Number(ui.n.value)));
+      const spacing = Math.max(1, Number(ui.spacing.value));
+      const size = Math.max(0.1, Number(ui.size.value));
+      const intensity = Math.max(0.01, Number(ui.intensity.value));
+
+      // マテリアルの見た目を更新
+      spriteMaterial.opacity = Math.min(1.0, intensity); // 1以上はブレンドで稼ぐ
+      // intensity が大きい場合は color を少し増幅して “明るく見せる”
+      const boost = Math.min(2.0, intensity);
+      spriteMaterial.color.setRGB(boost, boost, boost);
+
+      // --- 生成 ---
+      // 二重ループで格子状に粒子を並べる（サンプルの基本形）
+      // 粒子数： (2N+1)^2
+      for (let x = -N; x <= N; x++) {
+        for (let y = -N; y <= N; y++) {
+          const s = new THREE.Sprite(spriteMaterial);
+
+          // Sprite は “常にカメラを向く板ポリ” として描画される（ビルボード）
+          s.position.set(x * spacing, y * spacing, 0);
+
+          // Sprite の大きさ（ワールド座標）
+          // ※ scale は (x,y,z) だが Sprite は基本的に平面なので z は 1 でOK
+          s.scale.set(size, size, 1);
+
+          // ちょいランダムを入れると “粒子っぽさ” が増す（教材の味付け）
+          // ただし再現性を優先したい場合は外してOK
+          s.userData.baseZ = (Math.random() - 0.5) * 2.0; // アニメ用
+          s.userData.phase = Math.random() * Math.PI * 2;
+
+          spriteGroup.add(s);
+        }
+      }
+
+      // カメラ距離を “粒子群のサイズ” に合わせて自動調整すると安全
+      // （Nやspacingを大きくした時に画面外になるのを防ぐ）
+      fitCameraToSprites(N, spacing);
+
+      syncLabels();
+    }
+
+    function fitCameraToSprites(N, spacing) {
+      // 粒子群のおおよその半径（グリッドの端まで）
+      const half = N * spacing;
+      const maxDim = Math.max(half * 2, 1);
+
+      // FOVから “見切れない距離” を近似計算
+      const fov = camera.fov * (Math.PI / 180);
+      let dist = (maxDim / 2) / Math.tan(fov / 2);
+      dist *= 1.2; // 余白
+
+      camera.position.set(0, 0, Math.max(60, dist));
+      camera.lookAt(0, 0, 0);
+      camera.updateProjectionMatrix();
+    }
+
+    // ============================================================
+    // 6) アニメーションと描画ループ
+    // ============================================================
+    let t = 0;
+
+    // 簡易FPS（stats.js無し）
+    let frames = 0;
+    let lastT = performance.now();
+    let fps = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // 粒子アニメ：z方向にわずかに揺らす（“動いている感” を出す）
+      if (ui.anim.checked) {
+        t += 0.02;
+
+        // Group 内の Sprite を走査して、yとzに軽い波を入れる
+        // ※ 粒子数が多いと重いので、教材では “分かる範囲” の揺れに留める
+        spriteGroup.children.forEach((s) => {
+          const ph = s.userData.phase || 0;
+          s.position.z = (Math.sin(t + ph) * 2.0) + (s.userData.baseZ || 0);
+        });
+      }
+
+      renderer.render(scene, camera);
+
+      // FPS更新（約1秒ごと）
+      frames++;
+      const now = performance.now();
+      if (now - lastT >= 1000) {
+        fps = (frames * 1000) / (now - lastT);
+        frames = 0;
+        lastT = now;
+
+        ui.hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "particles: " + spriteGroup.children.length + "\n" +
+          "N/spacing/size: " + ui.n.value + "/" + ui.spacing.value + "/" + Number(ui.size.value).toFixed(1);
+      }
+    }
+
+    // ============================================================
+    // 7) イベント（UIとリサイズ）
+    // ============================================================
+    ui.n.addEventListener("input", syncLabels);
+    ui.spacing.addEventListener("input", syncLabels);
+    ui.size.addEventListener("input", syncLabels);
+    ui.intensity.addEventListener("input", syncLabels);
+
+    // 変更確定で再生成（CSGほど重くないが、粒子数が多いと作り直しはコストになるので “change” で）
+    ui.n.addEventListener("change", rebuildSprites);
+    ui.spacing.addEventListener("change", rebuildSprites);
+    ui.size.addEventListener("change", rebuildSprites);
+    ui.intensity.addEventListener("change", rebuildSprites);
+    ui.rebuild.addEventListener("click", rebuildSprites);
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ============================================================
+    // 8) 起動
+    // ============================================================
+    rebuildSprites();
+    animate();
+  </script>
+</body>
+</html>
