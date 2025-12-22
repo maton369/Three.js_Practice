@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 07.09 - Sprites in 3D（libs無し / assets使用 / ES Modules版）</title>
+
+  <!--
+    目的：
+      旧サンプル（../libs/three.js + stats.js + dat.gui）を
+      “現行Three.js(ES Modules) + 自前HUD + 自前UI（最小）” に置き換えつつ、
+      スプライトシートから切り出したスプライトを 3D 空間に大量配置して回転させるデモを動かす。
+
+    ■ このサンプルのアルゴリズム（核心）
+      1) スプライトシート（sprite-sheet.png：横5コマ）を1回だけロードして共有する
+         - 旧コードは createSprite のたびに getTexture() で TextureLoader.load() を呼んでいた
+           → 400回ロードが走り、描画が重い/失敗しやすい/ネットワーク的にも地獄
+      2) 各スプライトは SpriteMaterial で作る（常にカメラ向きの板ポリ）
+      3) “コマ切り出し”は map.repeat / map.offset で行う
+         - repeat.x = 1/5
+         - offset.x = frameIndex*(1/5)
+      4) 400体のスプライトを Group に入れて、Group を回転させる
+         - 個体を毎フレーム動かすより「親を回す」方がシンプルで高速
+
+    ■ 旧コードが表示されない/不安定になりがちな原因（修正ポイント）
+      - textureLoader を 400回呼ぶ（ロード競合/メモリ/通信）
+      - map.offset/repeat を “同一Texture” に直接入れると、共有している全スプライトが同じコマになりうる
+        → 各スプライトで「テクスチャをclone()」し、offset/repeat を個別に持たせる
+           （GPUの画像は共有、UV変換だけ個別、という安全な設計）
+      - stats.js/dat.gui に依存しない要件
+        → HUD（FPS）と最小UI（range/size/count/rotateSpeed）で代替
+      - リサイズ処理が無い
+        → camera/renderer を更新する
+
+    ■ assets は使う（要件）
+      - ../assets/textures/particles/sprite-sheet.png を利用
+  -->
+
+  <!-- importmap：ブラウザに "three" の参照先を教える -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+    }
+
+    /* 最小UI（dat.gui代替） */
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 360px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.90);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      user-select: none;
+    }
+    #ui h1 {
+      font-size: 14px;
+      margin: 0 0 10px;
+      font-weight: 800;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 140px 1fr;
+      gap: 10px;
+      align-items: center;
+      margin: 10px 0;
+    }
+    label { font-size: 12px; color: #222; }
+    input[type="range"], input[type="color"] { width: 100%; }
+    .value { font-size: 12px; text-align: right; color: #111; margin-top: 4px; }
+    button {
+      width: 100%;
+      border: 0;
+      background: #111;
+      color: #fff;
+      font-weight: 800;
+      cursor: pointer;
+      padding: 10px 12px;
+      border-radius: 10px;
+    }
+    button:active { transform: translateY(1px); }
+
+    /* HUD（stats.js代替） */
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+    }
+
+    /* エラー表示 */
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Sprites in 3D（sprite-sheet 切り出し + Group回転）</h1>
+
+    <div class="row">
+      <label>count（スプライト数）</label>
+      <div>
+        <input id="count" type="range" min="50" max="2000" step="50" value="400" />
+        <div class="value" id="countVal">400</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>range（配置範囲）</label>
+      <div>
+        <input id="range" type="range" min="50" max="600" step="10" value="200" />
+        <div class="value" id="rangeVal">200</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>size（スプライトサイズ）</label>
+      <div>
+        <input id="size" type="range" min="2" max="40" step="1" value="10" />
+        <div class="value" id="sizeVal">10</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>opacity</label>
+      <div>
+        <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.6" />
+        <div class="value" id="opacityVal">0.60</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>color</label>
+      <input id="color" type="color" value="#ffffff" />
+    </div>
+
+    <div class="row">
+      <label>rotateSpeed</label>
+      <div>
+        <input id="rot" type="range" min="0" max="0.1" step="0.001" value="0.01" />
+        <div class="value" id="rotVal">0.010</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>additive（加算合成）</label>
+      <input id="additive" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label>操作</label>
+      <button id="rebuild" type="button">Rebuild（再生成）</button>
+    </div>
+
+    <div style="font-size:12px;color:#222;line-height:1.4;margin-top:6px;">
+      assets: <code>../assets/textures/particles/sprite-sheet.png</code>
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+
+    // ------------------------------------------------------------
+    // エラー表示（黒画面対策）
+    // ------------------------------------------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e?.error?.stack || e?.message || e));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e));
+    });
+
+    // ------------------------------------------------------------
+    // UI（dat.gui代替）
+    // ------------------------------------------------------------
+    const ui = {
+      count: document.getElementById("count"),
+      range: document.getElementById("range"),
+      size: document.getElementById("size"),
+      opacity: document.getElementById("opacity"),
+      color: document.getElementById("color"),
+      rot: document.getElementById("rot"),
+      additive: document.getElementById("additive"),
+      rebuild: document.getElementById("rebuild"),
+
+      countVal: document.getElementById("countVal"),
+      rangeVal: document.getElementById("rangeVal"),
+      sizeVal: document.getElementById("sizeVal"),
+      opacityVal: document.getElementById("opacityVal"),
+      rotVal: document.getElementById("rotVal")
+    };
+
+    function syncLabels() {
+      ui.countVal.textContent = String(ui.count.value);
+      ui.rangeVal.textContent = String(ui.range.value);
+      ui.sizeVal.textContent = String(ui.size.value);
+      ui.opacityVal.textContent = Number(ui.opacity.value).toFixed(2);
+      ui.rotVal.textContent = Number(ui.rot.value).toFixed(3);
+    }
+    syncLabels();
+
+    // ------------------------------------------------------------
+    // Three.js セットアップ
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+
+    // 旧コードの初期位置を踏襲（ただし見えやすさ優先で lookAt を入れる）
+    camera.position.set(20, 0, 150);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // “空間の基準” を少しだけ置く（教材用）
+    const axes = new THREE.AxesHelper(60);
+    axes.material.transparent = true;
+    axes.material.opacity = 0.35;
+    scene.add(axes);
+
+    // ------------------------------------------------------------
+    // スプライト群：Group にまとめる
+    // ------------------------------------------------------------
+    let group = null;
+
+    // ------------------------------------------------------------
+    // テクスチャ：assets を使う（要件）
+    //   - sprite-sheet.png は “横5コマ” の想定
+    // ------------------------------------------------------------
+    const spriteSheetURL = "../assets/textures/particles/sprite-sheet.png";
+    const FRAMES = 5;
+    const FRAME_W = 1 / FRAMES;
+
+    const textureLoader = new THREE.TextureLoader();
+    let baseSpriteSheetTex = null;
+
+    // ------------------------------------------------------------
+    // 重要：UV切り出し（offset/repeat）
+    //   - ここを理解すると sprite-sheet 表現が一気に作れる
+    // ------------------------------------------------------------
+    function configureSpriteSheetUV(tex, frameIndex) {
+      // offset/repeat が効くように wrap を RepeatWrapping にする
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+
+      // 1行5コマ → 横幅を 1/5 に縮めて表示領域を固定
+      tex.repeat.set(FRAME_W, 1);
+
+      // 左から frameIndex コマぶんオフセット
+      tex.offset.set(FRAME_W * frameIndex, 0);
+
+      tex.needsUpdate = true;
+    }
+
+    // ------------------------------------------------------------
+    // 破棄（GPUリーク防止）
+    // ------------------------------------------------------------
+    function disposeGroup(g) {
+      if (!g) return;
+      g.traverse((obj) => {
+        if (obj.isSprite) {
+          if (obj.material) obj.material.dispose();
+        }
+      });
+    }
+
+    // ------------------------------------------------------------
+    // スプライト1体生成
+    //
+    // ★最大の修正点：
+    //   - 旧コードは createSprite の度に getTexture() で load() を呼んでいた
+    //   - さらに map.offset/repeat を直接変えているので、共有Textureだと全員同じコマになる事故が起きる
+    //
+    // 解決策：
+    //   - 画像（baseSpriteSheetTex）は1回だけロードして共有
+    //   - 各スプライトは map = baseSpriteSheetTex.clone() を使い “UV設定だけ個別化”
+    //     （画像データは同じでも、Textureオブジェクトのパラメータは別になる）
+    // ------------------------------------------------------------
+    function createSprite3D({
+      size,
+      transparent,
+      opacity,
+      color,
+      frameIndex,
+      range,
+      additive
+    }) {
+      // “UVパラメータだけ別” のテクスチャを作る（重要）
+      const tex = baseSpriteSheetTex.clone();
+      configureSpriteSheetUV(tex, frameIndex);
+
+      const mat = new THREE.SpriteMaterial({
+        map: tex,
+        color: new THREE.Color(color),
+        opacity,
+        transparent,
+        depthTest: true,   // 3D空間なので深度テストは基本ON
+        depthWrite: false, // 透明なので書き込みはOFF（見た目安定）
+        blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending
+      });
+
+      const sprite = new THREE.Sprite(mat);
+
+      // Sprite は常にカメラを向くので “立て看板” 的に見える
+      sprite.scale.set(size, size, 1);
+
+      // 3D空間にランダム配置
+      const half = range / 2;
+      sprite.position.set(
+        Math.random() * range - half,
+        Math.random() * range - half,
+        Math.random() * range - half
+      );
+
+      return sprite;
+    }
+
+    // ------------------------------------------------------------
+    // 生成（旧 createSprites 相当）
+    // ------------------------------------------------------------
+    function rebuild() {
+      clearError();
+
+      try {
+        // 既存groupがあれば撤去＆解放
+        if (group) {
+          scene.remove(group);
+          disposeGroup(group);
+          group = null;
+        }
+
+        const count = Math.max(1, Math.floor(Number(ui.count.value)));
+        const range = Number(ui.range.value);
+        const size = Number(ui.size.value);
+        const opacity = Number(ui.opacity.value);
+        const color = ui.color.value;
+        const additive = ui.additive.checked;
+
+        group = new THREE.Group();
+
+        // 旧コードは i%5 でコマを回していた → 同じ挙動にする
+        for (let i = 0; i < count; i++) {
+          const frameIndex = i % FRAMES;
+          const sp = createSprite3D({
+            size,
+            transparent: true,
+            opacity,
+            color,
+            frameIndex,
+            range,
+            additive
+          });
+          group.add(sp);
+        }
+
+        scene.add(group);
+      } catch (e) {
+        showError("rebuild でエラー:\n" + (e?.stack || e));
+      }
+    }
+
+    // UIイベント
+    ["count","range","size","opacity","rot"].forEach((id) => {
+      ui[id].addEventListener("input", syncLabels);
+      ui[id].addEventListener("change", () => { syncLabels(); rebuild(); });
+    });
+    ui.color.addEventListener("change", rebuild);
+    ui.additive.addEventListener("change", rebuild);
+    ui.rebuild.addEventListener("click", () => { syncLabels(); rebuild(); });
+
+    // ------------------------------------------------------------
+    // HUD（簡易FPS）
+    // ------------------------------------------------------------
+    const hud = document.getElementById("hud");
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    // ------------------------------------------------------------
+    // ループ（旧 render 相当）
+    //   - group を回転させるだけで “3Dスプライト雲” が表現できる
+    // ------------------------------------------------------------
+    let step = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPS更新（1秒に1回）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "sprites: " + ui.count.value + "\n" +
+          "range: " + ui.range.value + "\n" +
+          "rotateSpeed: " + Number(ui.rot.value).toFixed(3);
+      }
+
+      // 回転（旧コード：group.rotation.x = step）
+      // ここでは speed を UI から取る
+      if (group) {
+        const spd = Number(ui.rot.value);
+        step += spd;
+        group.rotation.x = step;
+        group.rotation.y = step * 0.7;
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    // ------------------------------------------------------------
+    // リサイズ
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ------------------------------------------------------------
+    // 起動：テクスチャを 1回だけロード → rebuild → animate
+    // ------------------------------------------------------------
+    textureLoader.load(
+      spriteSheetURL,
+      (tex) => {
+        baseSpriteSheetTex = tex;
+
+        // 色空間（環境により見え方が変わるのを少し安定させる）
+        baseSpriteSheetTex.colorSpace = THREE.SRGBColorSpace;
+
+        // ここが重要：ロード完了後に生成開始
+        rebuild();
+        animate();
+      },
+      undefined,
+      (err) => {
+        showError(
+          "sprite-sheet.png の読み込みに失敗しました。\n" +
+          "パスを確認してください:\n" +
+          spriteSheetURL + "\n\n" +
+          "詳細:\n" + (err?.message || err)
+        );
+      }
+    );
+
+    // ------------------------------------------------------------
+    // 後始末
+    // ------------------------------------------------------------
+    window.addEventListener("beforeunload", () => {
+      try {
+        if (group) {
+          disposeGroup(group);
+        }
+        if (baseSpriteSheetTex) baseSpriteSheetTex.dispose();
+        renderer.dispose();
+      } catch (_) {}
+    });
+  </script>
+</body>
+</html>
