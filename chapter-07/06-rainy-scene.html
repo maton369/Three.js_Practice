@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 07.06 - Particles - Rainy scene (libs無し / assets使用 / WebGL版)</title>
+
+  <!--
+    目的：
+      旧サンプル（THREE.Geometry + vertices + 画像テクスチャ + dat.gui/stats.js）を、
+      「libs無し（../libs を使わない）」「現行Three.js(ES Modules)」「BufferGeometry」
+      「自前UI」「assets（画像）を使用」に置き換える。
+
+    重要：この版は “assets は使う” 方針
+      - 雨粒テクスチャは ../assets/textures/particles/raindrop-1.png を読み込む
+      - ローカルの three.js / stats.js / dat.gui.js は参照しない
+
+    ■ 全体アルゴリズム（この教材のコア）
+      1) 粒子の状態を CPU 側の配列（typed array）で持つ
+         - positions: Float32Array … (x,y,z) を粒子数ぶん直列に保持
+         - vels:      Float32Array … (vx,vy) を粒子数ぶん直列に保持
+      2) BufferGeometry の position attribute に positions を渡して Points を生成する
+         - Points は「頂点を点として描く」描画プリミティブ
+         - 1点＝1雨粒（スプライト）として描ける
+      3) 画像（raindrop-1.png）を TextureLoader で読み込み、PointsMaterial.map にセットする
+         - 透明PNG（アルファ）を使うので transparent=true, depthWrite=false が重要
+         - blending を Additive にすると “雨のきらめき” っぽく見える
+      4) 毎フレーム positions を vels で更新し、needsUpdate=true で GPU に転送する
+         - 「毎フレーム Points を作り直す」のは重いのでやらない
+         - “位置配列を更新して転送” が粒子表現の基本形
+      5) 画面外へ出た粒子は上へ戻してループさせる（再利用）
+         - y<=0 なら上（resetY）に戻す
+         - x が範囲外なら vx を反転させ、左右の揺れを保つ
+
+    ■ よくあるハマりどころ（この版の対策）
+      - THREE.Geometry / verticesNeedUpdate は新しめの Three.js では使えない
+        → BufferGeometry + typed array に置き換え済み
+      - 画像パスが 404 だと透明のままで「何も見えない」
+        → 読み込み失敗を画面に出し、フォールバック（簡易CanvasTexture）も用意
+      - 透明粒子は depthWrite=true だと奥が欠けやすい
+        → depthWrite=false にして破綻を減らす
+  -->
+
+  <!-- importmap：ブラウザに「three」という名前がどのURLを指すか教える -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+    }
+
+    /* UI（dat.gui の代替） */
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 360px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.90);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      user-select: none;
+    }
+    #ui h1 {
+      font-size: 14px;
+      margin: 0 0 10px;
+      font-weight: 800;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 140px 1fr;
+      gap: 10px;
+      align-items: center;
+      margin: 10px 0;
+    }
+    label { font-size: 12px; color: #222; }
+    input[type="range"], input[type="color"] { width: 100%; }
+    select, button, input[type="text"] {
+      width: 100%;
+      padding: 6px 8px;
+      border-radius: 8px;
+      border: 1px solid #ccc;
+      font-size: 12px;
+      background: #fff;
+    }
+    .value { font-size: 12px; text-align: right; color: #111; margin-top: 4px; }
+    button {
+      border: 0;
+      background: #111;
+      color: #fff;
+      font-weight: 800;
+      cursor: pointer;
+      padding: 10px 12px;
+    }
+    button:active { transform: translateY(1px); }
+
+    /* HUD（stats.js の代替） */
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+    }
+
+    /* エラー表示（黒画面で沈黙しない） */
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Particles - Rainy scene（libs無し / assets使用 / BufferGeometry版）</h1>
+
+    <div class="row">
+      <label>粒子数</label>
+      <div>
+        <input id="count" type="range" min="200" max="8000" step="100" value="1500" />
+        <div class="value" id="countVal">1500</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>size（雨粒サイズ）</label>
+      <div>
+        <input id="size" type="range" min="0.5" max="12" step="0.1" value="3" />
+        <div class="value" id="sizeVal">3.0</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>opacity</label>
+      <div>
+        <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.6" />
+        <div class="value" id="opacityVal">0.60</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>color</label>
+      <input id="color" type="color" value="#ffffff" />
+    </div>
+
+    <div class="row">
+      <label>speed（落下倍率）</label>
+      <div>
+        <input id="speed" type="range" min="0" max="4" step="0.01" value="1.0" />
+        <div class="value" id="speedVal">1.00</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>wind（横風）</label>
+      <div>
+        <input id="wind" type="range" min="-2" max="2" step="0.01" value="0.2" />
+        <div class="value" id="windVal">0.20</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>range（横/奥の広さ）</label>
+      <div>
+        <input id="range" type="range" min="10" max="120" step="1" value="40" />
+        <div class="value" id="rangeVal">40</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>additive（加算合成）</label>
+      <input id="additive" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label>操作</label>
+      <button id="rebuild" type="button">Rebuild（再生成）</button>
+    </div>
+
+    <div style="font-size:12px;color:#222;line-height:1.4;margin-top:6px;">
+      左ドラッグ：回転 / ホイール：ズーム / 右ドラッグ：平行移動
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    // =============================
+    // エラーを画面に出す（黒画面対策）
+    // =============================
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e?.error?.stack || e?.message || e));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e));
+    });
+
+    // =============================
+    // UI（dat.gui代替）
+    // =============================
+    const ui = {
+      count: document.getElementById("count"),
+      size: document.getElementById("size"),
+      opacity: document.getElementById("opacity"),
+      color: document.getElementById("color"),
+      speed: document.getElementById("speed"),
+      wind: document.getElementById("wind"),
+      range: document.getElementById("range"),
+      additive: document.getElementById("additive"),
+      rebuild: document.getElementById("rebuild"),
+
+      countVal: document.getElementById("countVal"),
+      sizeVal: document.getElementById("sizeVal"),
+      opacityVal: document.getElementById("opacityVal"),
+      speedVal: document.getElementById("speedVal"),
+      windVal: document.getElementById("windVal"),
+      rangeVal: document.getElementById("rangeVal")
+    };
+
+    function syncLabels() {
+      ui.countVal.textContent = String(ui.count.value);
+      ui.sizeVal.textContent = Number(ui.size.value).toFixed(1);
+      ui.opacityVal.textContent = Number(ui.opacity.value).toFixed(2);
+      ui.speedVal.textContent = Number(ui.speed.value).toFixed(2);
+      ui.windVal.textContent = Number(ui.wind.value).toFixed(2);
+      ui.rangeVal.textContent = String(ui.range.value);
+    }
+    syncLabels();
+
+    // =============================
+    // Three.js 基本セットアップ
+    // =============================
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      200
+    );
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // OrbitControls（カメラを回せるようにする）
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+
+    // 旧コードのカメラ構図を踏襲
+    camera.position.set(20, 40, 110);
+    camera.lookAt(20, 30, 0);
+    orbit.target.set(20, 30, 0);
+    orbit.update();
+
+    // ほんの少し基準を置く（教材用）
+    const grid = new THREE.GridHelper(120, 24);
+    grid.position.y = 0;
+    grid.material.opacity = 0.12;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    // =============================
+    // assets（雨粒画像）を読み込む
+    // =============================
+    const RAIN_TEX_URL = "../assets/textures/particles/raindrop-1.png";
+
+    let raindropTexture = null;
+
+    // “assetsは使う” が要件だが、404 など環境ミスがあると完全に見えなくなるため、
+    // 教材としては「失敗理由を出して最低限のフォールバック」も用意する。
+    function createFallbackTexture() {
+      const canvas = document.createElement("canvas");
+      canvas.width = 64;
+      canvas.height = 64;
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, 64, 64);
+
+      // 超簡易：縦長の白いしずく（これで “見えない” 状態だけは避ける）
+      ctx.save();
+      ctx.translate(32, 32);
+      const grad = ctx.createRadialGradient(0, -10, 2, 0, 0, 26);
+      grad.addColorStop(0.0, "rgba(255,255,255,0.9)");
+      grad.addColorStop(0.5, "rgba(255,255,255,0.25)");
+      grad.addColorStop(1.0, "rgba(255,255,255,0.0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.scale(0.55, 1.0);
+      ctx.arc(0, 0, 24, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.needsUpdate = true;
+      return tex;
+    }
+
+    function loadRainTexture() {
+      return new Promise((resolve) => {
+        const loader = new THREE.TextureLoader();
+
+        loader.load(
+          RAIN_TEX_URL,
+          (tex) => {
+            // 画像は通常 sRGB（色空間）として扱うのが自然（alphaも一緒に持つ）
+            tex.colorSpace = THREE.SRGBColorSpace;
+
+            // 粒子は minification で潰れやすいので、環境により調整（任意）
+            tex.minFilter = THREE.LinearMipmapLinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            tex.generateMipmaps = true;
+
+            raindropTexture = tex;
+            resolve(tex);
+          },
+          undefined,
+          (err) => {
+            // assets 読み込み失敗は “ほぼ確実にパス or 配信設定ミス” なので明示する
+            showError(
+              "雨粒テクスチャの読み込みに失敗しました。\n" +
+              "URL: " + RAIN_TEX_URL + "\n" +
+              "確認: 開発サーバが ../assets/ を配信しているか / パスが正しいか。\n" +
+              "一時的にフォールバックテクスチャで描画します。"
+            );
+
+            raindropTexture = createFallbackTexture();
+            resolve(raindropTexture);
+          }
+        );
+      });
+    }
+
+    // =============================
+    // 粒子（Points）状態
+    // =============================
+    let points = null;
+
+    // positions: geometry attribute（GPUへ送る）
+    // vels:      速度（CPU側の更新用）
+    let positions = null; // Float32Array (x,y,z)*count
+    let vels = null;      // Float32Array (vx,vy)*count
+
+    function disposePoints(obj) {
+      if (!obj) return;
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material) {
+        if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
+        else obj.material.dispose();
+      }
+    }
+
+    // =============================
+    // 粒子群の生成（旧 createPoints を置き換え）
+    // =============================
+    function rebuild() {
+      clearError();
+
+      try {
+        // 既存を撤去して解放
+        if (points) {
+          scene.remove(points);
+          disposePoints(points);
+          points = null;
+        }
+
+        // UI値
+        const count = Math.max(1, Math.floor(Number(ui.count.value)));
+        const size = Number(ui.size.value);
+        const opacity = Number(ui.opacity.value);
+        const color = new THREE.Color(ui.color.value);
+        const range = Number(ui.range.value);
+
+        // positions/vels 準備
+        positions = new Float32Array(count * 3);
+        vels = new Float32Array(count * 2);
+
+        // 生成領域
+        const spawnHeight = 60;  // y<=0 になったらここへ戻す
+        const half = range / 2;
+
+        for (let i = 0; i < count; i++) {
+          const px = (Math.random() * range) - half;
+          const py = Math.random() * spawnHeight * 1.5;
+          const pz = (Math.random() * range) - half;
+
+          positions[i * 3 + 0] = px;
+          positions[i * 3 + 1] = py;
+          positions[i * 3 + 2] = pz;
+
+          // 旧コード相当の速度初期化
+          const vx = (Math.random() - 0.5) / 3;
+          const vy = 0.1 + Math.random() / 5;
+
+          vels[i * 2 + 0] = vx;
+          vels[i * 2 + 1] = vy;
+        }
+
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        geom.computeBoundingSphere();
+
+        // ここが “assetsを使う” 本体：読み込んだ PNG を map にセット
+        const tex = raindropTexture;
+
+        // 透明PNG粒子の基本設定
+        const material = new THREE.PointsMaterial({
+          size,
+          transparent: true,
+          opacity,
+          map: tex,
+          color,
+
+          // 透明粒子の定石：深度書き込みを切る（奥が欠ける問題を減らす）
+          depthWrite: false,
+
+          // 距離で粒子サイズが自然に変化
+          sizeAttenuation: true,
+
+          // “雨っぽい” 明るさはブレンディングで作る
+          blending: ui.additive.checked ? THREE.AdditiveBlending : THREE.NormalBlending,
+
+          // ほぼ透明ピクセルを捨てて縁の汚れを減らす（画像により調整）
+          alphaTest: 0.02
+        });
+
+        points = new THREE.Points(geom, material);
+        points.name = "particles_rain";
+        scene.add(points);
+
+        // 見やすさのためターゲットを固定
+        orbit.target.set(20, 30, 0);
+        orbit.update();
+      } catch (e) {
+        showError("rebuild でエラー:\n" + (e?.stack || e));
+      }
+    }
+
+    // UIイベント：input は表示更新、change は再生成
+    ["count","size","opacity","speed","wind","range"].forEach(id => {
+      ui[id].addEventListener("input", syncLabels);
+      ui[id].addEventListener("change", () => { syncLabels(); rebuild(); });
+    });
+    ui.color.addEventListener("change", rebuild);
+    ui.additive.addEventListener("change", rebuild);
+    ui.rebuild.addEventListener("click", () => { syncLabels(); rebuild(); });
+
+    // =============================
+    // アニメーション：雨の更新
+    // =============================
+    const hud = document.getElementById("hud");
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPS（1秒に1回更新）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "particles: " + ui.count.value + "\n" +
+          "tex: " + (raindropTexture ? "OK" : "loading...") + "\n" +
+          "url: " + RAIN_TEX_URL;
+      }
+
+      if (points && positions && vels) {
+        const count = Math.floor(positions.length / 3);
+        const speed = Number(ui.speed.value);
+        const wind = Number(ui.wind.value);
+        const range = Number(ui.range.value);
+        const half = range / 2;
+
+        const resetY = 60;
+
+        for (let i = 0; i < count; i++) {
+          const pBase = i * 3;
+          const vBase = i * 2;
+
+          // 旧コードの更新則（v.y -= vy, v.x -= vx）を踏襲しつつ UI で倍率調整
+          positions[pBase + 1] -= vels[vBase + 1] * speed;
+          positions[pBase + 0] -= vels[vBase + 0] * speed;
+
+          // 横風（一定方向のバイアス）
+          positions[pBase + 0] += wind * 0.02 * speed;
+
+          // 下に落ちたら上へ戻す（再生成せず“循環”）
+          if (positions[pBase + 1] <= 0) {
+            positions[pBase + 1] = resetY + Math.random() * 10;
+            positions[pBase + 0] = (Math.random() * range) - half;
+            positions[pBase + 2] = (Math.random() * range) - half;
+          }
+
+          // 左右に出過ぎたら vx 反転（左右に揺れる）
+          if (positions[pBase + 0] <= -half || positions[pBase + 0] >= half) {
+            vels[vBase + 0] *= -1;
+          }
+        }
+
+        // GPUへ更新通知
+        points.geometry.attributes.position.needsUpdate = true;
+      }
+
+      orbit.update();
+      renderer.render(scene, camera);
+    }
+
+    // =============================
+    // リサイズ
+    // =============================
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // =============================
+    // 後始末（GPUリーク防止）
+    // =============================
+    window.addEventListener("beforeunload", () => {
+      if (points) disposePoints(points);
+      renderer.dispose();
+    });
+
+    // =============================
+    // 起動：テクスチャを先に読み、読めたら生成して開始
+    // =============================
+    syncLabels();
+    await loadRainTexture();
+    rebuild();
+    animate();
+  </script>
+</body>
+</html>
