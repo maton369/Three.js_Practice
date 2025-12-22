@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 08.02 - Merge objects（libs無し / ES Modules / BufferGeometry版）</title>
+
+  <!--
+    【このファイルのゴール】
+    旧サンプル（../libs/three.js + stats.js + dat.gui.js + THREE.Geometry.merge）を、
+    「CDNのES Modules（three.module.js） + BufferGeometry + 自前UI + 自前FPS表示」に置き換える。
+
+    ※ここで言う「assets」は「外部画像やフォント等を assets/ に置く」系だが、
+      08.02（Merge objects）は特に画像アセットに依存しない例である。
+      それでも “外部libsフォルダには依存しない” 要件を満たした現代的実装に修正している。
+
+    【全体アルゴリズム（教材の核）】
+    ■ テーマ：大量オブジェクト描画を「個別Mesh」vs「結合（マージ）Mesh」で比較する
+      1) N個の立方体をランダムに配置する
+      2) 表示方法を切り替える
+         A. separate（分離）
+            - scene に Mesh を N個追加
+            - 描画負荷の主因：Draw Call（描画命令）が N回
+         B. combined（結合）
+            - N個の BoxGeometry を「1つの BufferGeometry」に結合して Mesh を1個だけ追加
+            - 描画負荷の主因：Draw Call は 1回（大幅に減る）
+      3) カメラを円運動させて、常に scene 中心を見る（視点が変わるので“重さ”が体感しやすい）
+      4) FPSを自前HUDで表示して比較する
+
+    【旧コードが動かない/危ないポイントと修正方針】
+      - THREE.Geometry / geometry.merge は現行Three.jsでは廃止
+        → BufferGeometry + BufferGeometryUtils.mergeGeometries を使う
+      - stats.js / dat.gui.js を使わない要件
+        → HTMLの input / checkbox で簡易UIを作る、FPSも自前で計測する
+      - renderer.setClearColor(0x00000) の桁ミス（0が1つ足りない等）や
+        cameraNear/Far など未使用変数が混在
+        → 実際に使うものだけ整理して安全に
+
+    【重要な理解ポイント（描画が速くなる理由）】
+      - GPUは「1回の draw call（描画命令）」で処理できる頂点数は多いが、
+        draw call を大量に投げるのはCPU側のオーバーヘッドが大きい
+      - N個のMesh = N回の draw call（マテリアルや状態切り替えも増える）
+      - 1個に結合 = 1回の draw call（頂点数は増えるが、CPU→GPUの命令回数が減る）
+      - “結合が常に正解”ではない：
+        ・個別にアニメーション/当たり判定/インタラクションしたい場合は不向き
+        ・視界外のものを自動で省く（Frustum Culling）が効きづらくなる場合がある
+        → ユースケースで選ぶ
+  -->
+
+  <!-- importmap：ES Modules で three を読み込む -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+      background: #0b0b0b;
+      color: #fff;
+    }
+    #ui {
+      position: fixed;
+      left: 12px;
+      top: 12px;
+      width: 360px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.90);
+      color: #111;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      user-select: none;
+    }
+    #ui h1 {
+      font-size: 14px;
+      margin: 0 0 10px;
+      font-weight: 800;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 150px 1fr;
+      gap: 10px;
+      align-items: center;
+      margin: 10px 0;
+    }
+    label { font-size: 12px; }
+    input[type="range"] { width: 100%; }
+    button {
+      width: 100%;
+      padding: 10px 12px;
+      border: 0;
+      border-radius: 10px;
+      background: #111;
+      color: #fff;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    button:active { transform: translateY(1px); }
+    .value { font-size: 12px; text-align: right; color: #111; margin-top: 4px; }
+
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+    }
+
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Merge objects（DrawCall比較：Separate vs Combined）</h1>
+
+    <div class="row">
+      <label>numberOfObjects</label>
+      <div>
+        <input id="count" type="range" min="0" max="20000" step="100" value="500" />
+        <div class="value" id="countVal">500</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>combined（結合）</label>
+      <input id="combined" type="checkbox" />
+    </div>
+
+    <div class="row">
+      <label>rotationSpeed</label>
+      <div>
+        <input id="rot" type="range" min="0" max="0.2" step="0.001" value="0.02" />
+        <div class="value" id="rotVal">0.020</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>操作</label>
+      <button id="rebuild" type="button">Rebuild（再生成）</button>
+    </div>
+
+    <div style="font-size:12px;color:#222;line-height:1.4;margin-top:6px;">
+      目的：大量Meshの描画が「draw call の数」にどれくらい影響されるか体感する
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
+
+    // -----------------------------
+    // 黒画面対策：エラーを必ず画面に出す
+    // -----------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e?.error?.stack || e?.message || e));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e));
+    });
+
+    // -----------------------------
+    // UI（dat.gui の代替）
+    // -----------------------------
+    const ui = {
+      count: document.getElementById("count"),
+      combined: document.getElementById("combined"),
+      rot: document.getElementById("rot"),
+      rebuild: document.getElementById("rebuild"),
+      countVal: document.getElementById("countVal"),
+      rotVal: document.getElementById("rotVal")
+    };
+
+    function syncLabels() {
+      ui.countVal.textContent = String(ui.count.value);
+      ui.rotVal.textContent = Number(ui.rot.value).toFixed(3);
+    }
+    syncLabels();
+
+    // -----------------------------
+    // Three.js 基本セットアップ
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    // 旧コード：camera = Perspective(45, aspect, 1, 500)
+    // → near=1, far=500 を踏襲
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      1,
+      500
+    );
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // カメラ初期位置（旧サンプル踏襲）
+    camera.position.set(0, 40, 50);
+    camera.lookAt(scene.position);
+
+    // “地面”を軽く置く（位置関係が分かりやすい）
+    const grid = new THREE.GridHelper(400, 40);
+    grid.material.opacity = 0.15;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    // -----------------------------
+    // マテリアル（旧：MeshNormalMaterial transparent opacity=0.5）
+    // -----------------------------
+    const cubeMaterial = new THREE.MeshNormalMaterial({
+      transparent: true,
+      opacity: 0.5
+    });
+
+    // -----------------------------
+    // 生成物をまとめて管理するグループ
+    //   - 再生成時に一括で remove / dispose するため
+    // -----------------------------
+    let contentGroup = new THREE.Group();
+    scene.add(contentGroup);
+
+    // -----------------------------
+    // GPUリソース解放（リーク防止）
+    // -----------------------------
+    function disposeObject3D(obj) {
+      obj.traverse((child) => {
+        if (child.isMesh) {
+          if (child.geometry) child.geometry.dispose();
+          if (child.material) {
+            if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
+            else child.material.dispose();
+          }
+        }
+      });
+    }
+
+    function resetContentGroup() {
+      // 古いグループをシーンから外して解放
+      scene.remove(contentGroup);
+      disposeObject3D(contentGroup);
+
+      // 新しい空グループを作ってシーンへ
+      contentGroup = new THREE.Group();
+      scene.add(contentGroup);
+    }
+
+    // -----------------------------
+    // 立方体を1個作る（旧 addcube 相当）
+    // -----------------------------
+    function createCubeMesh() {
+      // 旧サンプル：cubeSize = 1.0
+      const size = 1.0;
+      const geom = new THREE.BoxGeometry(size, size, size);
+      const mesh = new THREE.Mesh(geom, cubeMaterial);
+
+      // 旧サンプル：ランダム配置
+      //   x: -60 + round(rand*100) → [-60, 40] あたり
+      //   y: round(rand*10)        → [0, 10]
+      //   z: -150 + round(rand*175)→ [-150, 25]
+      mesh.position.x = -60 + Math.round(Math.random() * 100);
+      mesh.position.y = Math.round(Math.random() * 10);
+      mesh.position.z = -150 + Math.round(Math.random() * 175);
+
+      mesh.castShadow = true;
+      return mesh;
+    }
+
+    // -----------------------------
+    // “結合”生成：N個のBoxGeometryを1個のBufferGeometryにまとめる
+    // -----------------------------
+    function createCombinedMesh(count) {
+      // 重要：merge する前に “各ジオメトリに変換（transform）を焼き込む”
+      // ここでは mesh.position を geometry に適用し、最終的に1つの geometry に統合する
+      const geoms = [];
+
+      for (let i = 0; i < count; i++) {
+        const cube = createCubeMesh();
+
+        // BufferGeometry へ焼き込み（位置/回転/スケールを反映）
+        cube.updateMatrix();                 // matrix に position 等を反映
+        const g = cube.geometry.clone();     // 元のBoxGeometryを複製
+        g.applyMatrix4(cube.matrix);         // 変換を頂点に焼き込む
+        geoms.push(g);
+
+        // cube 自体は scene に追加しない（結合するので不要）
+        cube.geometry.dispose(); // cloneしたので元は破棄してOK（メモリ節約）
+      }
+
+      // mergeGeometries：複数の BufferGeometry を連結して1つにする
+      // ※ false = groups を作らない（単一マテリアル想定）
+      const merged = mergeGeometries(geoms, false);
+
+      // 個別ジオメトリはここで解放（merged にコピー済み）
+      geoms.forEach(g => g.dispose());
+
+      const mesh = new THREE.Mesh(merged, cubeMaterial);
+      mesh.castShadow = true;
+
+      return mesh;
+    }
+
+    // -----------------------------
+    // “分離”生成：N個のMeshをそのまま追加
+    // -----------------------------
+    function createSeparateMeshes(count) {
+      for (let i = 0; i < count; i++) {
+        contentGroup.add(createCubeMesh());
+      }
+    }
+
+    // -----------------------------
+    // 再生成（旧 controls.redraw 相当）
+    // -----------------------------
+    function rebuild() {
+      clearError();
+      syncLabels();
+
+      try {
+        resetContentGroup();
+
+        const count = Math.max(0, Math.floor(Number(ui.count.value)));
+        const combined = ui.combined.checked;
+
+        // ここが教材の比較ポイント
+        // - combined=false：Mesh を count 個作る → draw call 多い
+        // - combined=true ：Mesh は 1個だけ   → draw call 少ない
+        if (combined) {
+          const mergedMesh = createCombinedMesh(count);
+          contentGroup.add(mergedMesh);
+        } else {
+          createSeparateMeshes(count);
+        }
+      } catch (e) {
+        showError("rebuild でエラー:\n" + (e?.stack || e));
+      }
+    }
+
+    // -----------------------------
+    // アニメーション（旧：カメラ円運動 + stats.update）
+    //   stats.js を使わず、自前でFPS算出
+    // -----------------------------
+    const hud = document.getElementById("hud");
+    let frames = 0;
+    let lastFpsT = performance.now();
+
+    let rotation = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPS更新（1秒に1回）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        // “今どれだけ重いか” をここで見せる
+        // draw call 数は WebGL の内部状態なので厳密には取らないが、
+        // combined のON/OFFでFPSが変わるのを体感できるのが目的
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "objects: " + ui.count.value + "\n" +
+          "combined: " + (ui.combined.checked ? "on" : "off") + "\n" +
+          "rotationSpeed: " + Number(ui.rot.value).toFixed(3);
+      }
+
+      // 旧コード：rotation += 0.005; cameraをsin/cosで回す
+      rotation += 0.005;
+      camera.position.x = Math.sin(rotation) * 50;
+      camera.position.z = Math.cos(rotation) * 50;
+      camera.lookAt(scene.position);
+
+      // 旧コードは個々のキューブ回転をコメントアウトしていたが、
+      // ここでは “結合 vs 分離” 比較を壊さない範囲で、
+      // シーン全体を軽く回転させて動きを出す。
+      const rotSpeed = Number(ui.rot.value);
+      contentGroup.rotation.y += rotSpeed * (ui.combined.checked ? 0.2 : 0.2);
+
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------------
+    // リサイズ対応
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // -----------------------------
+    // UIイベント
+    // -----------------------------
+    ui.count.addEventListener("input", syncLabels);
+    ui.rot.addEventListener("input", syncLabels);
+
+    // 値が確定したら再生成（重いので input 連打では作り直さない）
+    ui.count.addEventListener("change", rebuild);
+    ui.combined.addEventListener("change", rebuild);
+    ui.rebuild.addEventListener("click", rebuild);
+
+    // -----------------------------
+    // 後始末（ページ離脱時）
+    // -----------------------------
+    window.addEventListener("beforeunload", () => {
+      resetContentGroup();
+      renderer.dispose();
+    });
+
+    // 起動
+    rebuild();
+    animate();
+  </script>
+</body>
+</html>
