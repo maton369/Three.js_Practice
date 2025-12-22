@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 07.08 - Particles - Sprites（libs無し / assets使用 / ES Modules版）</title>
+
+  <!--
+    このサンプルの主題：スプライト（Sprite）を「スプライトシート」から切り出して表示し、
+    さらに 3D シーン（Perspective）と 2D オーバーレイ（Orthographic）を“同じRendererで重ね描き”する。
+
+    ■ 旧コードが動きにくい/壊れやすい理由（修正ポイント）
+      1) ../libs 依存（three.js / stats.js / dat.gui.js）
+         → CDN + ES Modules(importmap) と HTML UI/簡易HUD に置換
+      2) TextureLoader の誤り
+         var texture = new textureLoader.load(...) は誤り
+         正しくは textureLoader.load(...)（new しない）
+      3) Renderer の重ね描き手順が不安定
+         webGLRenderer.render(scene, camera);
+         webGLRenderer.autoClear = false;
+         webGLRenderer.render(sceneOrtho, cameraOrtho);
+         の順序だと、次フレーム以降のクリア挙動が読みにくい
+         → 毎フレーム先頭で renderer.clear()、その後 autoClear=false のまま2回renderが定石
+      4) リサイズ処理が無い（2Dオーバーレイは特に重要）
+         → Perspective と Orthographic の両方を更新する
+
+    ■ アルゴリズム全体（教材のコア）
+      A) 3Dパート（scene）
+         - 球体メッシュを置き、カメラを sin で上下させる（奥行き感の確認）
+      B) 2Dオーバーレイ（sceneOrtho）
+         - スプライト1枚を画面座標で動かす
+         - スプライトシートを uv で切り出し：offset/repeat を更新
+         - 画面端に到達したら反転＋次のコマへ（簡易アニメ）
+
+    ■ スプライトシート切り出しの考え方（超重要）
+      - 1行に 5コマ並んだ画像（横方向に 5分割）
+      - repeat.x = 1/5, repeat.y = 1
+      - offset.x = (1/5) * frameIndex
+      - offset.y = 0
+      → これで「同じテクスチャ」から特定のコマだけを表示できる
+  -->
+
+  <!-- importmap：ブラウザに "three" の参照先を教える（libs不要） -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+    }
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 360px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.90);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      user-select: none;
+    }
+    #ui h1 {
+      font-size: 14px;
+      margin: 0 0 10px;
+      font-weight: 800;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 140px 1fr;
+      gap: 10px;
+      align-items: center;
+      margin: 10px 0;
+    }
+    label { font-size: 12px; color: #222; }
+    input[type="range"], input[type="color"] { width: 100%; }
+    .value { font-size: 12px; text-align: right; color: #111; margin-top: 4px; }
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <!-- dat.gui の代替（HTML UI） -->
+  <div id="ui">
+    <h1>Sprites（スプライトシート切り出し + 2Dオーバーレイ）</h1>
+
+    <div class="row">
+      <label>frame（0..4）</label>
+      <div>
+        <input id="frame" type="range" min="0" max="4" step="1" value="0" />
+        <div class="value" id="frameVal">0</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>size（px）</label>
+      <div>
+        <input id="size" type="range" min="10" max="300" step="1" value="150" />
+        <div class="value" id="sizeVal">150</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>opacity</label>
+      <div>
+        <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.6" />
+        <div class="value" id="opacityVal">0.60</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>color</label>
+      <input id="color" type="color" value="#ffffff" />
+    </div>
+
+    <div class="row">
+      <label>transparent</label>
+      <input id="transparent" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label>additive（加算）</label>
+      <input id="additive" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label>velocityX（px/frame）</label>
+      <div>
+        <input id="vx" type="range" min="-20" max="20" step="1" value="5" />
+        <div class="value" id="vxVal">5</div>
+      </div>
+    </div>
+
+    <div style="font-size:12px;color:#222;line-height:1.4;margin-top:6px;">
+      sprite-sheet.png を ../assets/textures/particles/ に置く（旧サンプルと同じパス）
+    </div>
+  </div>
+
+  <!-- stats.js の代替（簡易HUD） -->
+  <div id="hud">FPS: --</div>
+  <!-- 黒画面で沈黙しないためのエラー表示 -->
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+
+    // ------------------------------------------------------------
+    // エラー表示（黒画面対策）
+    // ------------------------------------------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e?.error?.stack || e?.message || e));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e));
+    });
+
+    // ------------------------------------------------------------
+    // UI参照（dat.gui 代替）
+    // ------------------------------------------------------------
+    const ui = {
+      frame: document.getElementById("frame"),
+      size: document.getElementById("size"),
+      opacity: document.getElementById("opacity"),
+      color: document.getElementById("color"),
+      transparent: document.getElementById("transparent"),
+      additive: document.getElementById("additive"),
+      vx: document.getElementById("vx"),
+
+      frameVal: document.getElementById("frameVal"),
+      sizeVal: document.getElementById("sizeVal"),
+      opacityVal: document.getElementById("opacityVal"),
+      vxVal: document.getElementById("vxVal")
+    };
+
+    function syncLabels() {
+      ui.frameVal.textContent = String(ui.frame.value);
+      ui.sizeVal.textContent = String(ui.size.value);
+      ui.opacityVal.textContent = Number(ui.opacity.value).toFixed(2);
+      ui.vxVal.textContent = String(ui.vx.value);
+    }
+    syncLabels();
+
+    // ------------------------------------------------------------
+    // Three.js 基本セットアップ
+    //   - 3D用 scene（PerspectiveCamera）
+    //   - 2Dオーバーレイ用 sceneOrtho（OrthographicCamera）
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+    const sceneOrtho = new THREE.Scene();
+
+    // 3Dカメラ：奥行きがある世界を映す
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      250
+    );
+    camera.position.set(0, 0, 50);
+
+    // 2Dカメラ：スクリーン座標（左上が(0,0)）で扱う
+    // OrthographicCamera(left, right, top, bottom, near, far)
+    const cameraOrtho = new THREE.OrthographicCamera(
+      0, window.innerWidth,
+      window.innerHeight, 0,
+      -10, 10
+    );
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(new THREE.Color(0x000000));
+
+    document.body.appendChild(renderer.domElement);
+
+    // ------------------------------------------------------------
+    // 3D シーン：球体（背景の動きが分かりやすい）
+    //   - ライト不要な MeshNormalMaterial を使用
+    // ------------------------------------------------------------
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(15, 20, 20),
+      new THREE.MeshNormalMaterial()
+    );
+    scene.add(mesh);
+
+    // ------------------------------------------------------------
+    // テクスチャ（assets を使用）
+    //   - 旧コードの致命的バグ：new textureLoader.load(...) は誤り
+    //   - ここでは TextureLoader.load(url, onLoad, onProgress, onError) を正しく使う
+    // ------------------------------------------------------------
+    const textureLoader = new THREE.TextureLoader();
+
+    // assetsパス（要件：assetsは使う）
+    const spriteSheetURL = "../assets/textures/particles/sprite-sheet.png";
+
+    // スプライトシートは “1枚を共有” するのが基本（Sprite を作り直すたびにロードしない）
+    let spriteSheetTex = null;
+
+    // ------------------------------------------------------------
+    // オーバーレイに置く Sprite（1枚）
+    // ------------------------------------------------------------
+    let sprite = null;
+
+    // ------------------------------------------------------------
+    // スプライトシート切り出し設定（教材のコア）
+    //   - 1行5コマ
+    // ------------------------------------------------------------
+    const FRAMES = 5;
+    const FRAME_W = 1 / FRAMES;
+
+    function applySpriteSheetFrame(tex, frameIndex) {
+      // offset/repeat が効くように wrap を RepeatWrapping にする
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+
+      // 「横5分割」なので repeat.x=1/5, repeat.y=1
+      tex.repeat.set(FRAME_W, 1);
+
+      // 左から frameIndex コマ目を表示
+      tex.offset.set(FRAME_W * frameIndex, 0);
+
+      // 重要：Texture のパラメータ変更を確実に反映
+      tex.needsUpdate = true;
+    }
+
+    function disposeSprite() {
+      if (!sprite) return;
+
+      // SpriteMaterial を破棄（map は共有なので dispose しない）
+      if (sprite.material) sprite.material.dispose();
+
+      sceneOrtho.remove(sprite);
+      sprite = null;
+    }
+
+    function createOrUpdateSprite() {
+      if (!spriteSheetTex) return;
+
+      // 既存spriteがあれば破棄して作り直す（教材としてわかりやすい）
+      // もっと最適化するなら “materialだけ差し替え/プロパティ更新” も可能
+      disposeSprite();
+
+      const frameIndex = Math.max(0, Math.min(FRAMES - 1, Number(ui.frame.value)));
+
+      // テクスチャのUV切り出しを更新
+      applySpriteSheetFrame(spriteSheetTex, frameIndex);
+
+      // SpriteMaterial：2D画像をビルボードとして描画
+      const mat = new THREE.SpriteMaterial({
+        map: spriteSheetTex,
+        color: new THREE.Color(ui.color.value),
+        opacity: Number(ui.opacity.value),
+        transparent: ui.transparent.checked,
+
+        // Sprite は “画面上に浮かぶ” 感じにしたいので depthTest=false が便利
+        depthTest: false,
+        depthWrite: false,
+
+        // 加算合成にすると黒背景で派手に見える（旧コード踏襲）
+        blending: ui.additive.checked ? THREE.AdditiveBlending : THREE.NormalBlending
+      });
+
+      sprite = new THREE.Sprite(mat);
+
+      // Ortho座標系では scale は “ピクセルっぽい大きさ” として扱える
+      const sizePx = Number(ui.size.value);
+      sprite.scale.set(sizePx, sizePx, 1);
+
+      // 旧コードの位置（100,50）を踏襲
+      sprite.position.set(100, 50, 0);
+
+      // 速度（ユーザーUIで調整）
+      sprite.userData.vx = Number(ui.vx.value);
+
+      sceneOrtho.add(sprite);
+    }
+
+    // ------------------------------------------------------------
+    // UIイベント：値の反映
+    // ------------------------------------------------------------
+    function onUIChangeRebuild() {
+      syncLabels();
+      createOrUpdateSprite();
+    }
+
+    ["frame","size","opacity","vx"].forEach((id) => {
+      ui[id].addEventListener("input", () => { syncLabels(); });
+      ui[id].addEventListener("change", onUIChangeRebuild);
+    });
+    ui.color.addEventListener("change", onUIChangeRebuild);
+    ui.transparent.addEventListener("change", onUIChangeRebuild);
+    ui.additive.addEventListener("change", onUIChangeRebuild);
+
+    // ------------------------------------------------------------
+    // HUD（簡易FPS）
+    // ------------------------------------------------------------
+    const hud = document.getElementById("hud");
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    // ------------------------------------------------------------
+    // アニメーションループ
+    // ------------------------------------------------------------
+    let step = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPS更新（1秒に1回）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "frame: " + ui.frame.value + "\n" +
+          "size: " + ui.size.value + "\n" +
+          "vx: " + ui.vx.value;
+      }
+
+      // 3Dカメラを上下に揺らす（旧コード踏襲）
+      camera.position.y = Math.sin(step += 0.01) * 20;
+      camera.lookAt(0, 0, 0);
+
+      // スプライト移動（画面端で折り返し＋フレーム更新）
+      if (sprite) {
+        const vx = sprite.userData.vx ?? 5;
+        sprite.position.x += vx;
+
+        // 右端を越えたら左向きに反転し、フレームを進める
+        if (sprite.position.x > window.innerWidth) {
+          sprite.userData.vx = -Math.abs(vx);
+
+          // 次のコマへ（0..4 でループ）
+          const nextFrame = (Number(ui.frame.value) + 1) % FRAMES;
+          ui.frame.value = String(nextFrame);
+          syncLabels();
+
+          // テクスチャ切り出し更新（Spriteを作り直さず map を更新する）
+          applySpriteSheetFrame(spriteSheetTex, nextFrame);
+        }
+
+        // 左端を越えたら右向きに反転
+        if (sprite.position.x < 0) {
+          sprite.userData.vx = Math.abs(vx);
+        }
+      }
+
+      // ★ 重ね描きの定石 ★
+      // 毎フレーム先頭で clear → 3Dを描画 → 2Dを描画
+      renderer.autoClear = false;
+      renderer.clear();
+
+      renderer.render(scene, camera);
+      renderer.render(sceneOrtho, cameraOrtho);
+    }
+
+    // ------------------------------------------------------------
+    // リサイズ
+    //   - PerspectiveCamera は aspect 更新
+    //   - OrthographicCamera は right/bottom を更新
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+
+      cameraOrtho.right = window.innerWidth;
+      cameraOrtho.bottom = window.innerHeight;
+      cameraOrtho.updateProjectionMatrix();
+    });
+
+    // ------------------------------------------------------------
+    // 起動：テクスチャロード → Sprite生成 → ループ開始
+    //   - assets が見つからないと “何も出ない” ので、onError で必ず表示する
+    // ------------------------------------------------------------
+    clearError();
+    textureLoader.load(
+      spriteSheetURL,
+      (tex) => {
+        // ロード成功：共有テクスチャとして保持
+        spriteSheetTex = tex;
+
+        // 透明スプライトの縁が汚い場合に改善することがある
+        spriteSheetTex.colorSpace = THREE.SRGBColorSpace;
+
+        // 初期フレーム反映と Sprite 生成
+        applySpriteSheetFrame(spriteSheetTex, Number(ui.frame.value));
+        createOrUpdateSprite();
+
+        animate();
+      },
+      undefined,
+      (err) => {
+        showError(
+          "sprite-sheet.png の読み込みに失敗しました。\n" +
+          "パスを確認してください:\n" +
+          spriteSheetURL + "\n\n" +
+          "詳細:\n" + (err?.message || err)
+        );
+      }
+    );
+
+    // ページ離脱時：Material破棄（Textureは共有だが、ここで終わるので dispose してOK）
+    window.addEventListener("beforeunload", () => {
+      try {
+        disposeSprite();
+        if (spriteSheetTex) spriteSheetTex.dispose();
+        renderer.dispose();
+      } catch (_) {}
+    });
+  </script>
+</body>
+</html>
