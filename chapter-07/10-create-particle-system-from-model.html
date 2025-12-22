@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 07.10 - 3D TorusKnot（libs無し / ES Modules / 自前UI+FPS）</title>
+
+  <!--
+    目的：
+      旧サンプル（../libs/three.js + stats.js + dat.gui + SceneUtils）を、
+      現行 Three.js（ES Modules）で動く形に移植し、教材として理解できるコメントを追加する。
+
+    ■ 旧コードがそのまま動かない主な理由（重要）
+      1) ../libs/three.js, stats.js, dat.gui.js を読み込めない（要件：libs無し）
+         → CDN の ES Modules を import し、UI は HTML で自作、FPS は自前表示に置き換える
+
+      2) THREE.SceneUtils.createMultiMaterialObject が現行Three.jsでは削除/非推奨
+         → ふつうに new THREE.Mesh(geometry, material) を使う
+
+      3) THREE.Texture(canvas) は古い書き方。現行では THREE.CanvasTexture が自然
+         → 粒子用スプライトは CanvasTexture で生成する
+
+    ■ このサンプルのアルゴリズム（全体像）
+      A) 形状生成（ジオメトリ）
+        - TorusKnotGeometry(radius, tube, tubularSegments, radialSegments, p, q)
+        - パラメータの意味：
+          radius: 全体の大きさ（中心円の半径っぽい）
+          tube: チューブの太さ
+          tubularSegments: 進行方向（輪っかに沿う方向）の分割数
+          radialSegments: チューブ断面の分割数
+          p,q: 結び目の巻き数（トーラス上での周回数）
+
+      B) 表示（2モード）
+        1) Meshモード：面として表示（MeshNormalMaterial）
+        2) Pointsモード：頂点群として表示（PointsMaterial + CanvasTexture）
+
+      C) 再生成（rebuild）
+        - UI変更のたびに
+          1) 古いオブジェクトを scene から remove
+          2) geometry/material を dispose（GPUリーク防止）
+          3) 新しい geometry/material を生成して scene.add
+
+      D) アニメーション（rotate）
+        - requestAnimationFrame で毎フレーム描画
+        - rotate=true のときだけ回転角を増やす
+        - FPSは1秒に1回だけ更新（更新頻度を下げて軽量化）
+  -->
+
+  <!-- importmap：ブラウザに "three" がどのURLか教える -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin:0; overflow:hidden; background:#000; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+    #ui{
+      position:fixed; left:12px; top:12px; width:360px;
+      padding:12px 12px 10px; border-radius:12px;
+      background:rgba(255,255,255,0.90); box-shadow:0 10px 30px rgba(0,0,0,0.35);
+      user-select:none;
+    }
+    #ui h1{ font-size:14px; margin:0 0 10px; font-weight:800; }
+    .row{ display:grid; grid-template-columns: 150px 1fr; gap:10px; align-items:center; margin:10px 0; }
+    label{ font-size:12px; color:#222; }
+    input[type="range"]{ width:100%; }
+    .value{ font-size:12px; text-align:right; color:#111; margin-top:4px; }
+    select, button{
+      width:100%; padding:8px 10px; border-radius:10px; border:1px solid #ccc;
+      font-size:12px; background:#fff;
+    }
+    button{ border:0; background:#111; color:#fff; font-weight:800; cursor:pointer; }
+    button:active{ transform:translateY(1px); }
+
+    #hud{
+      position:fixed; right:12px; top:12px;
+      padding:8px 10px; border-radius:12px;
+      background:rgba(0,0,0,0.55); color:#fff; font-size:12px;
+      line-height:1.4; white-space:pre;
+    }
+    #err{
+      position:fixed; left:12px; right:12px; bottom:12px;
+      padding:10px 12px; border-radius:12px;
+      background:rgba(255,70,70,0.92); color:#fff; font-size:12px;
+      display:none; white-space:pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <!-- dat.gui の代替：HTML UI -->
+  <div id="ui">
+    <h1>TorusKnot（Mesh / Points）</h1>
+
+    <div class="row">
+      <label>表示モード</label>
+      <select id="mode">
+        <option value="mesh">mesh（面）</option>
+        <option value="points">points（粒子）</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label>radius</label>
+      <div>
+        <input id="radius" type="range" min="0" max="40" step="0.1" value="13" />
+        <div class="value" id="radiusVal">13.0</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>tube</label>
+      <div>
+        <input id="tube" type="range" min="0" max="20" step="0.1" value="1.7" />
+        <div class="value" id="tubeVal">1.7</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>tubularSegments</label>
+      <div>
+        <input id="tubularSegments" type="range" min="3" max="400" step="1" value="156" />
+        <div class="value" id="tubularSegmentsVal">156</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>radialSegments</label>
+      <div>
+        <input id="radialSegments" type="range" min="3" max="100" step="1" value="12" />
+        <div class="value" id="radialSegmentsVal">12</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>p</label>
+      <div>
+        <input id="p" type="range" min="1" max="10" step="1" value="5" />
+        <div class="value" id="pVal">5</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>q</label>
+      <div>
+        <input id="q" type="range" min="1" max="15" step="1" value="4" />
+        <div class="value" id="qVal">4</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>rotate</label>
+      <input id="rotate" type="checkbox" />
+    </div>
+
+    <div class="row">
+      <label>Rebuild</label>
+      <button id="rebuild" type="button">再生成</button>
+    </div>
+
+    <div style="font-size:12px;color:#222;line-height:1.4;margin-top:6px;">
+      ※ マウス操作は入れていない（教材を単純化）。視点は固定。
+    </div>
+  </div>
+
+  <!-- stats.js の代替：簡易HUD -->
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+
+    // -----------------------------
+    // エラー表示（黒画面で沈黙しない）
+    // -----------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e?.error?.stack || e?.message || e));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e));
+    });
+
+    // -----------------------------
+    // UI参照（dat.gui代替）
+    // -----------------------------
+    const ui = {
+      mode: document.getElementById("mode"),
+      radius: document.getElementById("radius"),
+      tube: document.getElementById("tube"),
+      tubularSegments: document.getElementById("tubularSegments"),
+      radialSegments: document.getElementById("radialSegments"),
+      p: document.getElementById("p"),
+      q: document.getElementById("q"),
+      rotate: document.getElementById("rotate"),
+      rebuild: document.getElementById("rebuild"),
+
+      radiusVal: document.getElementById("radiusVal"),
+      tubeVal: document.getElementById("tubeVal"),
+      tubularSegmentsVal: document.getElementById("tubularSegmentsVal"),
+      radialSegmentsVal: document.getElementById("radialSegmentsVal"),
+      pVal: document.getElementById("pVal"),
+      qVal: document.getElementById("qVal")
+    };
+
+    function syncLabels() {
+      ui.radiusVal.textContent = Number(ui.radius.value).toFixed(1);
+      ui.tubeVal.textContent = Number(ui.tube.value).toFixed(1);
+      ui.tubularSegmentsVal.textContent = String(ui.tubularSegments.value);
+      ui.radialSegmentsVal.textContent = String(ui.radialSegments.value);
+      ui.pVal.textContent = String(ui.p.value);
+      ui.qVal.textContent = String(ui.q.value);
+    }
+    syncLabels();
+
+    // -----------------------------
+    // Three.js 基本セットアップ
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+
+    // 旧コードの視点を踏襲（固定カメラ）
+    camera.position.set(-30, 40, 50);
+    camera.lookAt(new THREE.Vector3(10, 0, 0));
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // 教材用：形状の向きが分かる補助（ライト無しでも見える）
+    // MeshNormalMaterial はライト不要だが、Points は見え方の基準が欲しいので Axes を置く
+    scene.add(new THREE.AxesHelper(30));
+
+    // -----------------------------
+    // 表示対象（knot）を保持
+    // 再生成時に remove + dispose するため参照が必要
+    // -----------------------------
+    let knot = null;
+
+    // 粒子用のスプライト（CanvasTexture）を1回だけ作って再利用
+    let particleSpriteTex = null;
+
+    // -----------------------------
+    // 粒子用スプライト生成（旧 generateSprite 相当）
+    //   - Canvas に円形グラデーションを描く
+    //   - それを CanvasTexture にして PointsMaterial の map に渡す
+    // -----------------------------
+    function generateSpriteTexture() {
+      const canvas = document.createElement("canvas");
+      canvas.width = 64;
+      canvas.height = 64;
+
+      const ctx = canvas.getContext("2d");
+      const cx = canvas.width / 2;
+      const cy = canvas.height / 2;
+      const r = canvas.width / 2;
+
+      // 放射グラデーション（中心が明るく、外側が暗い）
+      const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+      grad.addColorStop(0.00, "rgba(255,255,255,1.0)");
+      grad.addColorStop(0.20, "rgba(0,255,255,1.0)");
+      grad.addColorStop(0.40, "rgba(0,0,64,1.0)");
+      grad.addColorStop(1.00, "rgba(0,0,0,0.0)"); // 外側は透明寄りにして“黒フチ”を減らす
+
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.needsUpdate = true;
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    // -----------------------------
+    // dispose（GPUリーク防止）
+    //   - geometry/material/texture を明示的に解放する
+    // -----------------------------
+    function disposeObject3D(obj) {
+      if (!obj) return;
+
+      // Mesh / Points どちらも geometry を持つ
+      if (obj.geometry) obj.geometry.dispose();
+
+      // material は PointsMaterial / MeshNormalMaterial など
+      // map(texture) を持つ場合は texture も dispose する
+      const mat = obj.material;
+      if (mat) {
+        if (Array.isArray(mat)) {
+          mat.forEach(m => {
+            if (m.map) m.map.dispose();
+            m.dispose();
+          });
+        } else {
+          if (mat.map) mat.map.dispose();
+          mat.dispose();
+        }
+      }
+    }
+
+    // -----------------------------
+    // Meshモード：面として表示
+    //   - 旧コードの SceneUtils.createMultiMaterialObject は使わない
+    //   - 普通に Mesh(geom, material) を返す
+    // -----------------------------
+    function createMesh(geom) {
+      const mat = new THREE.MeshNormalMaterial({
+        side: THREE.DoubleSide // ねじれ形状で裏面が見えやすいので両面描画にしておく
+      });
+      return new THREE.Mesh(geom, mat);
+    }
+
+    // -----------------------------
+    // Pointsモード：頂点を粒子として表示
+    //   - Points(geom, PointsMaterial)
+    //   - map に CanvasTexture を使い、加算合成で“発光っぽく”見せる
+    // -----------------------------
+    function createPoints(geom) {
+      if (!particleSpriteTex) particleSpriteTex = generateSpriteTexture();
+
+      const mat = new THREE.PointsMaterial({
+        color: 0xffffff,
+        size: 3,
+        transparent: true,
+        opacity: 1.0,
+        blending: THREE.AdditiveBlending,
+        map: particleSpriteTex,
+        depthWrite: false,  // 透明粒子は depthWrite すると奥が不自然に消えやすい
+        sizeAttenuation: true,
+        alphaTest: 0.02     // ほぼ透明ピクセルを捨てて“黒フチ”を軽減
+      });
+
+      return new THREE.Points(geom, mat);
+    }
+
+    // -----------------------------
+    // 再生成（UI変更で呼ぶ）
+    // -----------------------------
+    function rebuild() {
+      clearError();
+
+      try {
+        // 旧オブジェクトを撤去＆解放
+        if (knot) {
+          scene.remove(knot);
+          disposeObject3D(knot);
+          knot = null;
+        }
+
+        // UI値を読み取る（整数が必要なものは丸める）
+        const radius = Number(ui.radius.value);
+        const tube = Number(ui.tube.value);
+        const tubularSegments = Math.max(3, Math.round(Number(ui.tubularSegments.value)));
+        const radialSegments  = Math.max(3, Math.round(Number(ui.radialSegments.value)));
+        const p = Math.max(1, Math.round(Number(ui.p.value)));
+        const q = Math.max(1, Math.round(Number(ui.q.value)));
+
+        // TorusKnotGeometry を生成
+        // NOTE: 引数順は (radius, tube, tubularSegments, radialSegments, p, q)
+        const geom = new THREE.TorusKnotGeometry(
+          radius,
+          tube,
+          tubularSegments,
+          radialSegments,
+          p,
+          q
+        );
+
+        // 表示モードに応じて Mesh/Points を切り替える
+        knot = (ui.mode.value === "points") ? createPoints(geom) : createMesh(geom);
+
+        scene.add(knot);
+      } catch (e) {
+        showError("rebuild でエラー:\n" + (e?.stack || e));
+      }
+    }
+
+    // -----------------------------
+    // UIイベント
+    //   - input: ラベル更新のみ
+    //   - change/ボタン: 再生成
+    // -----------------------------
+    ["radius","tube","tubularSegments","radialSegments","p","q"].forEach(id => {
+      ui[id].addEventListener("input", syncLabels);
+      ui[id].addEventListener("change", () => { syncLabels(); rebuild(); });
+    });
+    ui.mode.addEventListener("change", rebuild);
+    ui.rotate.addEventListener("change", () => {/* rotateはループで参照するだけ */});
+    ui.rebuild.addEventListener("click", () => { syncLabels(); rebuild(); });
+
+    // -----------------------------
+    // アニメーションループ
+    // -----------------------------
+    const hud = document.getElementById("hud");
+    let step = 0;
+
+    // FPS計測（1秒に1回だけ更新）
+    let frames = 0;
+    let lastFpsT = performance.now();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPS更新
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "mode: " + ui.mode.value + "\n" +
+          "radius/tube: " + Number(ui.radius.value).toFixed(1) + "/" + Number(ui.tube.value).toFixed(1) + "\n" +
+          "tubular/radial: " + ui.tubularSegments.value + "/" + ui.radialSegments.value + "\n" +
+          "p/q: " + ui.p.value + "/" + ui.q.value + "\n" +
+          "rotate: " + (ui.rotate.checked ? "on" : "off");
+      }
+
+      // 回転
+      if (ui.rotate.checked && knot) {
+        step += 0.01;
+        knot.rotation.y = step;
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------------
+    // リサイズ
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // -----------------------------
+    // 後始末（ページ離脱時にGPU解放）
+    // -----------------------------
+    window.addEventListener("beforeunload", () => {
+      if (knot) disposeObject3D(knot);
+      if (particleSpriteTex) particleSpriteTex.dispose();
+      renderer.dispose();
+    });
+
+    // 起動
+    rebuild();
+    animate();
+  </script>
+</body>
+</html>
