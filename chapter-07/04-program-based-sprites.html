@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 07.04 - Particles - Canvas texture (WebGL, no local libs)</title>
+
+  <!--
+    このサンプルの主題：
+      「Canvas 2Dで描いた絵」をテクスチャ（CanvasTexture）にして、
+      それを粒子（Points）のスプライト画像として使う。
+
+    旧サンプルが動かない主因：
+      - THREE.CanvasRenderer / Projector / SpriteCanvasMaterial は、現行 three.js では廃止・削除されている
+      - そのため「Canvas で直接 Sprite を描く」方式をやめて、
+        「Canvasでテクスチャを生成 → WebGLRendererで Points を描画」に置き換える必要がある
+
+    全体アルゴリズム（重要）：
+      1) Canvas(2D) に “粒子画像” を1枚描く（ここでは顔アイコン）
+      2) そのCanvasから THREE.CanvasTexture を作る（GPUに渡せるテクスチャに変換）
+      3) 粒子の頂点（点）座標をランダムに N 個生成して BufferGeometry に詰める
+      4) PointsMaterial に map=CanvasTexture を設定し、透明（alpha）を有効化する
+      5) THREE.Points(geometry, material) をシーンに追加して render ループで描画する
+
+    表示されない典型原因と対策（この実装では対策済み）：
+      - カメラ far が足りない → far を十分大きくし、カメラ位置を range に合わせる
+      - テクスチャが黒塗りになる → transparent / alphaTest / depthWrite の設定を明確化
+      - 点が小さすぎて見えない → PointsMaterial.size をピクセル単位で大きめにする
+  -->
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+    }
+    #hud {
+      position: fixed;
+      left: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+      user-select: none;
+    }
+    #ui {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      width: 280px;
+      padding: 12px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.9);
+      color: #111;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+      user-select: none;
+    }
+    #ui h1 { margin: 0 0 10px; font-size: 14px; }
+    .row { display: grid; grid-template-columns: 120px 1fr; gap: 10px; align-items: center; margin: 8px 0; }
+    label { font-size: 12px; }
+    input[type="range"] { width: 100%; }
+    .val { font-size: 12px; text-align: right; }
+    #err {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255, 80, 80, 0.92);
+      color: #fff;
+      font-size: 12px;
+      max-width: calc(100vw - 24px);
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hud">FPS: --</div>
+
+  <div id="ui">
+    <h1>Canvas Texture Particles</h1>
+
+    <div class="row">
+      <label for="count">粒子数</label>
+      <div>
+        <input id="count" type="range" min="100" max="20000" step="100" value="1500" />
+        <div class="val" id="countVal">1500</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="range">散布範囲</label>
+      <div>
+        <input id="range" type="range" min="100" max="2000" step="10" value="500" />
+        <div class="val" id="rangeVal">500</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="size">サイズ(px)</label>
+      <div>
+        <input id="size" type="range" min="2" max="80" step="1" value="24" />
+        <div class="val" id="sizeVal">24</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="rotate">回転</label>
+      <input id="rotate" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label for="rebuild">再生成</label>
+      <button id="rebuild" type="button">Rebuild</button>
+    </div>
+  </div>
+
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+
+    // ------------------------------------------------------------
+    // エラー表示（黒画面で沈黙しないように）
+    // ------------------------------------------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+
+    // ------------------------------------------------------------
+    // UI
+    // ------------------------------------------------------------
+    const uiCount = document.getElementById("count");
+    const uiRange = document.getElementById("range");
+    const uiSize  = document.getElementById("size");
+    const uiRotate = document.getElementById("rotate");
+    const uiRebuild = document.getElementById("rebuild");
+
+    const countVal = document.getElementById("countVal");
+    const rangeVal = document.getElementById("rangeVal");
+    const sizeVal  = document.getElementById("sizeVal");
+
+    function syncLabels() {
+      countVal.textContent = String(uiCount.value);
+      rangeVal.textContent = String(uiRange.value);
+      sizeVal.textContent  = String(uiSize.value);
+    }
+    syncLabels();
+
+    // ------------------------------------------------------------
+    // Three.js 基本セットアップ（CanvasRendererは使わず WebGLRenderer のみ）
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      10000
+    );
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // ------------------------------------------------------------
+    // 描画対象（Points）を保持：再生成で remove + dispose する
+    // ------------------------------------------------------------
+    let points = null;
+
+    // ------------------------------------------------------------
+    // 1) Canvasに“粒子画像”を描く → CanvasTextureに変換
+    //
+    // 旧コードの SpriteCanvasMaterial(program: ctx=>{...}) の代替：
+    //   - (旧) 毎回CanvasRendererが2Dで描いていた
+    //   - (新) 最初にCanvasへ1枚描いてテクスチャ化し、GPU上で大量に貼り付ける
+    //
+    // ここが「Canvas based texture」の現代的なやり方
+    // ------------------------------------------------------------
+    function createParticleCanvasTexture() {
+      const c = document.createElement("canvas");
+      // 小さめでもOKだが、見た目が粗いなら 128/256 に上げる
+      c.width = 128;
+      c.height = 128;
+
+      const ctx = c.getContext("2d");
+      if (!ctx) throw new Error("2D canvas context が取得できませんでした");
+
+      // 背景は透明（重要：透明部分が粒子の抜けになる）
+      ctx.clearRect(0, 0, c.width, c.height);
+
+      // ---- 以降：顔アイコンを描く（旧サンプルの“身体+目+瞳”の意図を残す） ----
+      // 描画座標はCanvas中心基準で作ると見通しが良い
+      ctx.save();
+      ctx.translate(c.width / 2, c.height / 2);
+
+      // “ボディ”相当：オレンジの丸っこい形（簡略化して円+ギザギザ）
+      ctx.fillStyle = "orange";
+      ctx.beginPath();
+      ctx.arc(0, 10, 44, 0, Math.PI * 2);
+      ctx.fill();
+
+      // “ギザギザ”（下に小さな三角形を並べてそれっぽくする）
+      ctx.fillStyle = "orange";
+      for (let i = -3; i <= 3; i++) {
+        ctx.beginPath();
+        ctx.moveTo(i * 12, 54);
+        ctx.lineTo(i * 12 - 8, 38);
+        ctx.lineTo(i * 12 + 8, 38);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // 目（白）
+      ctx.fillStyle = "white";
+      ctx.beginPath();
+      ctx.ellipse(-18, -2, 14, 18, 0, 0, Math.PI * 2);
+      ctx.ellipse( 18, -2, 14, 18, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 瞳（青）
+      ctx.fillStyle = "deepskyblue";
+      ctx.beginPath();
+      ctx.arc(-18, 2, 6, 0, Math.PI * 2);
+      ctx.arc( 18, 2, 6, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 輪郭を軽く（見やすさアップ）
+      ctx.strokeStyle = "rgba(0,0,0,0.25)";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(0, 10, 44, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.restore();
+      // ---- 描画ここまで ----
+
+      const tex = new THREE.CanvasTexture(c);
+
+      // 透過スプライトは境界がジャギりやすいので、フィルタはLinearが無難
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.generateMipmaps = false;
+
+      // 念のため（CanvasTextureは基本 true だが明示しておく）
+      tex.needsUpdate = true;
+
+      return tex;
+    }
+
+    // ------------------------------------------------------------
+    // 2) 粒子（Points）を生成する
+    //
+    // アルゴリズム（重要）：
+    //   - N個のランダム座標を positions(Float32Array) に詰める
+    //   - BufferGeometry に position attribute を設定
+    //   - PointsMaterial に map(テクスチャ) を設定し透明を有効化
+    //   - THREE.Points にして scene に追加
+    //
+    // ※ 旧サンプルは Sprite を 1500個 scene.add していた。
+    //    それでも動くが、Points の方が “粒子” として自然で、スケールしやすい。
+    // ------------------------------------------------------------
+    function rebuild() {
+      clearError();
+
+      try {
+        // 既存の点群を撤去＆GPU解放（再生成があるデモでは必須）
+        if (points) {
+          scene.remove(points);
+          if (points.geometry) points.geometry.dispose();
+          if (points.material) {
+            // material.map(=texture) は共有の場合があるので、ここでは material のみ dispose
+            // ※ テクスチャを毎回作り直す実装なら texture.dispose() も必要
+            points.material.dispose();
+          }
+          points = null;
+        }
+
+        const count = Math.max(1, Math.floor(Number(uiCount.value)));
+        const range = Math.max(10, Number(uiRange.value));
+        const sizePx = Math.max(1, Number(uiSize.value));
+
+        // Canvas→Texture（1枚生成して全粒子で共有）
+        const tex = createParticleCanvasTexture();
+
+        // positions: [x0,y0,z0, x1,y1,z1, ...]
+        const positions = new Float32Array(count * 3);
+
+        // range は立方体領域の幅：[-range/2, +range/2]
+        const half = range / 2;
+        for (let i = 0; i < count; i++) {
+          const ix = i * 3;
+          positions[ix + 0] = (Math.random() * range) - half;
+          positions[ix + 1] = (Math.random() * range) - half;
+          positions[ix + 2] = (Math.random() * range) - half;
+        }
+
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+
+        // カリング/最適化のため boundingSphere を計算しておく（Pointsでも有効）
+        geom.computeBoundingSphere();
+
+        // 透過スプライトの基本設定：
+        // - transparent: true（アルファを使う）
+        // - alphaTest: 0.2 くらい（薄い透明部分を切り落として縁を綺麗に＆描画負荷減）
+        // - depthWrite: false（透明が深度を書いてしまうと“奥が消える”事故が出やすい）
+        // - blending: Additive（光る粒子っぽい表現。不要なら NormalBlending に）
+        const mat = new THREE.PointsMaterial({
+          size: sizePx,               // ピクセル単位（大きすぎると粗く見える）
+          map: tex,                   // Canvas由来テクスチャ
+          transparent: true,
+          alphaTest: 0.2,
+          depthWrite: false,
+          // 光る粒子感。普通の見た目ならこの行を消す or NormalBlending にする
+          blending: THREE.AdditiveBlending
+        });
+
+        points = new THREE.Points(geom, mat);
+        scene.add(points);
+
+        // カメラ調整（“見えない”の最大要因＝視界外を潰す）
+        //
+        // boundingSphere がある前提で、半径に応じて距離を置く。
+        // ここを固定値にすると range/粒子数を変えた瞬間に「見えない」が起きやすい。
+        const bs = geom.boundingSphere;
+        const radius = bs ? bs.radius : (range * 0.6);
+
+        camera.position.set(0, 0, radius * 2.2);
+        camera.near = Math.max(0.1, radius / 100);
+        camera.far  = Math.max(2000, radius * 10);
+        camera.updateProjectionMatrix();
+        camera.lookAt(0, 0, 0);
+      } catch (e) {
+        showError("再生成でエラーが発生しました:\n" + (e && e.stack ? e.stack : e));
+      }
+    }
+
+    // UIイベント
+    uiCount.addEventListener("input", () => { syncLabels(); });
+    uiRange.addEventListener("input", () => { syncLabels(); });
+    uiSize.addEventListener("input",  () => { syncLabels(); });
+
+    uiCount.addEventListener("change", rebuild);
+    uiRange.addEventListener("change", rebuild);
+    uiSize.addEventListener("change",  rebuild);
+    uiRebuild.addEventListener("click", rebuild);
+
+    // ------------------------------------------------------------
+    // 簡易FPS表示（stats.js無しの代替）
+    // ------------------------------------------------------------
+    const hud = document.getElementById("hud");
+    let lastT = performance.now();
+    let frames = 0;
+    let fps = 0;
+
+    // ------------------------------------------------------------
+    // アニメーションループ
+    // ------------------------------------------------------------
+    let step = 0;
+    rebuild(); // 初期生成
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // 点群全体を剛体回転させる（粒子個々は動かさないので軽い）
+      if (uiRotate.checked && points) {
+        step += 0.003;
+        points.rotation.y = step;
+        points.rotation.x = step * 0.6;
+      }
+
+      renderer.render(scene, camera);
+
+      // FPS（1秒ごと更新）
+      frames++;
+      const now = performance.now();
+      if (now - lastT >= 1000) {
+        fps = (frames * 1000) / (now - lastT);
+        frames = 0;
+        lastT = now;
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "count: " + uiCount.value + "\n" +
+          "range: " + uiRange.value + "\n" +
+          "size(px): " + uiSize.value;
+      }
+    }
+    animate();
+
+    // リサイズ対応
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
