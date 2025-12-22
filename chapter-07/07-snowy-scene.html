@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 07.07 - Particles - Snowy scene（libs無し / assets使用 / BufferGeometry版）</title>
+
+  <!--
+    目的：
+      旧サンプル（../libs/three.js + stats.js + dat.gui.js + THREE.Geometry）を、
+      「libs を使わない（../libs を参照しない）」構成に修正しつつ、
+      「assets（雪の結晶テクスチャ）は使う」ことを維持する。
+
+    ■ 何を直すのか（重要な互換性ポイント）
+      1) THREE.Geometry / geom.vertices / verticesNeedUpdate は新しめの Three.js では廃止
+         → BufferGeometry + TypedArray（Float32Array）へ置き換える
+      2) dat.gui / stats.js を “libs” から読まない
+         → HTML UI（range, checkbox, button）＋簡易FPS表示に置き換える
+      3) 雪の見た目は assets の PNG を使う
+         → ../assets/textures/particles/snowflake*.png を TextureLoader で読み込む
+
+    ■ 全体アルゴリズム（この教材のコア）
+      - 「複数種類の雪（4種類）」＝「4つの Points システム」を作る
+        1) 各システムは同じ “粒子の運動ルール” を持つが、テクスチャだけ違う
+        2) それぞれのシステムは BufferGeometry（position attribute）で粒子群を保持
+        3) 速度（vx,vy,vz）は geometry とは別に JS の配列（typed array）として持つ
+      - 毎フレームの更新
+        1) 速度で position を更新する（CPU側）
+        2) position attribute の needsUpdate=true で GPU に転送する
+        3) 範囲外に出たら速度を反転 or 上に戻してループさせる
+
+    ■ 黒画面対策（“何も出ない” を潰す）
+      - テクスチャ 404 だと透明のままで見えない → 読み込み失敗を画面に表示
+      - PointsMaterial はライト不要だが、透明描画で欠ける → depthWrite=false
+      - 加算合成で白い雪が見える → blending=Additive（切替UIも用意）
+  -->
+
+  <!-- importmap：ES Modules で three と addons を読む -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+    }
+
+    /* UI（dat.gui の代替） */
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 360px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.90);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      user-select: none;
+    }
+    #ui h1 {
+      font-size: 14px;
+      margin: 0 0 10px;
+      font-weight: 800;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 140px 1fr;
+      gap: 10px;
+      align-items: center;
+      margin: 10px 0;
+    }
+    label { font-size: 12px; color: #222; }
+    input[type="range"], input[type="color"] { width: 100%; }
+    button {
+      width: 100%;
+      border: 0;
+      background: #111;
+      color: #fff;
+      font-weight: 800;
+      cursor: pointer;
+      padding: 10px 12px;
+      border-radius: 10px;
+    }
+    button:active { transform: translateY(1px); }
+    .value { font-size: 12px; text-align: right; color: #111; margin-top: 4px; }
+
+    /* HUD（stats.js の代替） */
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+    }
+
+    /* エラー表示 */
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Particles - Snowy scene（libs無し / assets使用）</h1>
+
+    <div class="row">
+      <label>粒子数 / 系統</label>
+      <div>
+        <input id="count" type="range" min="50" max="2000" step="10" value="200" />
+        <div class="value" id="countVal">200</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>size（雪片サイズ）</label>
+      <div>
+        <input id="size" type="range" min="0.5" max="20" step="0.1" value="10" />
+        <div class="value" id="sizeVal">10.0</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>opacity</label>
+      <div>
+        <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.6" />
+        <div class="value" id="opacityVal">0.60</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>color</label>
+      <input id="color" type="color" value="#ffffff" />
+    </div>
+
+    <div class="row">
+      <label>speed（落下倍率）</label>
+      <div>
+        <input id="speed" type="range" min="0" max="4" step="0.01" value="1.0" />
+        <div class="value" id="speedVal">1.00</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>additive（加算合成）</label>
+      <input id="additive" type="checkbox" checked />
+    </div>
+
+    <div class="row">
+      <label>操作</label>
+      <button id="rebuild" type="button">Rebuild（再生成）</button>
+    </div>
+
+    <div style="font-size:12px;color:#222;line-height:1.4;margin-top:6px;">
+      左ドラッグ：回転 / ホイール：ズーム / 右ドラッグ：平行移動
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    // =============================
+    // エラー表示（黒画面で沈黙しない）
+    // =============================
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e?.error?.stack || e?.message || e));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e));
+    });
+
+    // =============================
+    // UI（dat.gui代替）
+    // =============================
+    const ui = {
+      count: document.getElementById("count"),
+      size: document.getElementById("size"),
+      opacity: document.getElementById("opacity"),
+      color: document.getElementById("color"),
+      speed: document.getElementById("speed"),
+      additive: document.getElementById("additive"),
+      rebuild: document.getElementById("rebuild"),
+
+      countVal: document.getElementById("countVal"),
+      sizeVal: document.getElementById("sizeVal"),
+      opacityVal: document.getElementById("opacityVal"),
+      speedVal: document.getElementById("speedVal")
+    };
+
+    function syncLabels() {
+      ui.countVal.textContent = String(ui.count.value);
+      ui.sizeVal.textContent = Number(ui.size.value).toFixed(1);
+      ui.opacityVal.textContent = Number(ui.opacity.value).toFixed(2);
+      ui.speedVal.textContent = Number(ui.speed.value).toFixed(2);
+    }
+    syncLabels();
+
+    // =============================
+    // Three.js 基本セットアップ
+    // =============================
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      200
+    );
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // カメラ初期構図（旧コードを踏襲）
+    camera.position.set(20, 40, 110);
+    camera.lookAt(20, 30, 0);
+
+    // OrbitControls（見回し用）
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.target.set(20, 30, 0);
+    orbit.update();
+
+    // 目印（薄いグリッド）
+    const grid = new THREE.GridHelper(120, 24);
+    grid.position.y = 0;
+    grid.material.opacity = 0.12;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    // =============================
+    // assets：雪の結晶テクスチャを読む
+    // =============================
+    const SNOW_TEX_URLS = [
+      "../assets/textures/particles/snowflake1.png",
+      "../assets/textures/particles/snowflake2.png",
+      "../assets/textures/particles/snowflake3.png",
+      "../assets/textures/particles/snowflake5.png"
+    ];
+
+    // 複数テクスチャをまとめてロードする
+    // 1つでも失敗すると「見えない」になりやすいので、失敗したURLを表示する。
+    async function loadSnowTextures() {
+      const loader = new THREE.TextureLoader();
+
+      const loadOne = (url) => new Promise((resolve) => {
+        loader.load(
+          url,
+          (tex) => {
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.minFilter = THREE.LinearMipmapLinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            tex.generateMipmaps = true;
+            resolve({ ok: true, url, tex });
+          },
+          undefined,
+          () => {
+            resolve({ ok: false, url, tex: null });
+          }
+        );
+      });
+
+      const results = await Promise.all(SNOW_TEX_URLS.map(loadOne));
+
+      const failed = results.filter(r => !r.ok).map(r => r.url);
+      if (failed.length > 0) {
+        showError(
+          "雪テクスチャの読み込みに失敗しました（assetsのパス/配信設定を確認）:\n" +
+          failed.join("\n")
+        );
+      }
+
+      // 成功したものだけ返す（全部失敗なら空配列）
+      return results.filter(r => r.ok).map(r => r.tex);
+    }
+
+    let snowTextures = await loadSnowTextures();
+
+    // =============================
+    // 粒子システム（4系統）を管理する
+    // =============================
+    // 旧コードは Points を scene.children から探して remove していたが、
+    // それだと “他の Points” を混ぜた時に巻き込む危険がある。
+    // ここでは「自分が作ったシステムだけ」を配列で管理して確実に破棄する。
+    const systems = []; // { points, positions, vels, range, resetY }
+
+    function disposeSystem(sys) {
+      if (!sys) return;
+      if (sys.points) {
+        scene.remove(sys.points);
+        if (sys.points.geometry) sys.points.geometry.dispose();
+        if (sys.points.material) {
+          const m = sys.points.material;
+          if (m.map) m.map.dispose?.(); // map は共有しない設計にしているのでここで破棄してOK
+          m.dispose();
+        }
+      }
+    }
+
+    // =============================
+    // 1システム分の Points を作る（旧 createPoints 相当）
+    // =============================
+    function createSnowSystem({
+      name,
+      texture,
+      count,
+      size,
+      transparent,
+      opacity,
+      sizeAttenuation,
+      baseColor,
+      additive
+    }) {
+      // positions: (x,y,z)*count
+      // vels:      (vx,vy,vz)*count
+      const positions = new Float32Array(count * 3);
+      const vels = new Float32Array(count * 3);
+
+      // 旧コードの range=40 を踏襲
+      const range = 40;
+      const half = range / 2;
+      const resetY = 60;
+
+      // 旧コードは “色を少しランダムにする” ため HSL の L をランダム化していた。
+      // PointsMaterial は “1システム1色” なので、ここでもシステムごとに微妙に変える。
+      const c = new THREE.Color(baseColor);
+      const hsl = {};
+      c.getHSL(hsl);
+      c.setHSL(hsl.h, hsl.s, Math.random() * hsl.l);
+
+      const material = new THREE.PointsMaterial({
+        size,
+        transparent,
+        opacity,
+        map: texture,
+        color: c,
+
+        // 透明スプライト定石：奥の欠けを抑える
+        depthWrite: false,
+
+        // 雪の“ふわっと”感は加算合成が分かりやすい（OFFにもできる）
+        blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+
+        // 距離でサイズが変化して自然
+        sizeAttenuation,
+
+        // 透明の縁の汚れを減らす（画像により調整）
+        alphaTest: 0.02
+      });
+
+      // 初期配置＋速度を入れる（旧コードの発想をそのまま typed array に移植）
+      for (let i = 0; i < count; i++) {
+        const p = i * 3;
+        const v = i * 3;
+
+        positions[p + 0] = Math.random() * range - half;
+        positions[p + 1] = Math.random() * range * 1.5;
+        positions[p + 2] = Math.random() * range - half;
+
+        // 旧コード：
+        //   velocityY = 0.1 + rand/5
+        //   velocityX/Z = (rand-0.5)/3
+        vels[v + 0] = (Math.random() - 0.5) / 3;
+        vels[v + 1] = 0.1 + Math.random() / 5;
+        vels[v + 2] = (Math.random() - 0.5) / 3;
+      }
+
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geom.computeBoundingSphere();
+
+      const points = new THREE.Points(geom, material);
+      points.name = name;
+
+      scene.add(points);
+
+      return { points, positions, vels, range, resetY };
+    }
+
+    // =============================
+    // 4システムまとめて作る（旧 createMultiPoints 相当）
+    // =============================
+    function rebuild() {
+      // 既存を消して破棄
+      while (systems.length > 0) {
+        const sys = systems.pop();
+        disposeSystem(sys);
+      }
+
+      // テクスチャが 0 枚（全部失敗）だと何も描けないので、ここでも警告
+      if (!snowTextures || snowTextures.length === 0) {
+        showError(
+          (errBox.textContent ? errBox.textContent + "\n\n" : "") +
+          "雪テクスチャが1枚も読み込めていないため、描画できません。\n" +
+          "assets の配置と、開発サーバが ../assets を配信しているか確認してください。"
+        );
+        return;
+      }
+
+      // UI値
+      const count = Math.max(1, Math.floor(Number(ui.count.value)));
+      const size = Number(ui.size.value);
+      const opacity = Number(ui.opacity.value);
+      const baseColor = ui.color.value;
+      const additive = ui.additive.checked;
+
+      // 旧サンプルは 4種類の雪片をそれぞれ 50 個ずつ作っていた。
+      // ここでは「粒子数 / 系統」を UI で指定し、各テクスチャごとに count 個生成する。
+      const options = {
+        count,
+        size,
+        transparent: true,
+        opacity,
+        sizeAttenuation: true,
+        baseColor,
+        additive
+      };
+
+      // 読めたテクスチャの枚数ぶんだけシステムを作る（基本は4枚）
+      snowTextures.forEach((tex, idx) => {
+        systems.push(
+          createSnowSystem({
+            name: "snow_system_" + (idx + 1),
+            texture: tex,
+            ...options
+          })
+        );
+      });
+
+      // カメラターゲットを固定（見失い防止）
+      orbit.target.set(20, 30, 0);
+      orbit.update();
+    }
+
+    // UIイベント
+    ["count","size","opacity","speed"].forEach(id => {
+      ui[id].addEventListener("input", syncLabels);
+      ui[id].addEventListener("change", () => { syncLabels(); rebuild(); });
+    });
+    ui.color.addEventListener("change", rebuild);
+    ui.additive.addEventListener("change", rebuild);
+    ui.rebuild.addEventListener("click", () => { syncLabels(); rebuild(); });
+
+    // =============================
+    // 毎フレーム更新（旧 render の scene.children.forEach を移植）
+    // =============================
+    const hud = document.getElementById("hud");
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // HUD更新（1秒に1回）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "systems: " + systems.length + "\n" +
+          "count/system: " + ui.count.value + "\n" +
+          "additive: " + (ui.additive.checked ? "on" : "off");
+      }
+
+      const speed = Number(ui.speed.value);
+
+      // 各システムの position を更新
+      for (const sys of systems) {
+        const { positions, vels, range, resetY, points } = sys;
+        const half = range / 2;
+        const n = Math.floor(positions.length / 3);
+
+        for (let i = 0; i < n; i++) {
+          const p = i * 3;
+          const v = i * 3;
+
+          // 旧コード：
+          //   v.x -= velocityX
+          //   v.y -= velocityY
+          //   v.z -= velocityZ
+          positions[p + 0] -= vels[v + 0] * speed;
+          positions[p + 1] -= vels[v + 1] * speed;
+          positions[p + 2] -= vels[v + 2] * speed;
+
+          // 範囲外処理（旧コードの if を踏襲）
+          if (positions[p + 0] <= -half || positions[p + 0] >= half) vels[v + 0] *= -1;
+          if (positions[p + 1] <= 0) positions[p + 1] = resetY;
+          if (positions[p + 2] <= -half || positions[p + 2] >= half) vels[v + 2] *= -1;
+        }
+
+        // GPUへ更新通知
+        points.geometry.attributes.position.needsUpdate = true;
+      }
+
+      orbit.update();
+      renderer.render(scene, camera);
+    }
+
+    // =============================
+    // リサイズ
+    // =============================
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // =============================
+    // 後始末
+    // =============================
+    window.addEventListener("beforeunload", () => {
+      for (const sys of systems) disposeSystem(sys);
+      renderer.dispose();
+    });
+
+    // 起動
+    rebuild();
+    animate();
+  </script>
+</body>
+</html>
