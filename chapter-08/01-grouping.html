@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 08.01 - Grouping（libs無し / ES Modules版）</title>
+
+  <!--
+    目的：
+      旧サンプル（../libs/three.js + stats.js + dat.gui + SceneUtils + 自前Box計算）を
+      現行Three.js（ES Modules）に合わせて動くように作り直す。
+
+    このサンプルの主題（アルゴリズム）：
+      「Group（親）と子オブジェクトのローカル変換」 と 「個別回転 vs グループ回転」の違いを観察する。
+
+    ■ 全体アルゴリズム（観察したい因果関係）
+      1) sphere と cube を生成して group に add する
+      2) UIで sphere/cube の position/scale を変える（= 子のローカル変換が変わる）
+      3) UIで group の position/scale を変える（= 親の変換が子へ伝播する）
+      4) rotate=true のとき
+         - grouping=true なら group を回す（子は“群れ”として回転する）
+         - grouping=false なら sphere/cube をそれぞれ回す（独立回転）
+      5) bounding box は THREE.Box3().setFromObject(group) で毎回更新し、
+         “今の見た目の範囲” をワイヤーフレーム箱で表示する
+
+    ■ 旧コードがそのまま動かない理由（修正ポイント）
+      - THREE.SceneUtils.createMultiMaterialObject は現行では使わない
+        → Mesh を2個（通常材質＋wireframe材質）作って Group で束ねる
+      - node.geometry.vertices を走査する setFromObject は現行 BufferGeometry では使えない
+        → Box3.setFromObject が内部で適切に計算してくれるので置き換える
+      - stats.js / dat.gui を使わない要件
+        → HTMLの簡易UI + FPS表示で代替する
+  -->
+
+  <!-- importmap：ブラウザに「three」「three/addons/」の場所を教える -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #eee;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+    }
+
+    /* dat.gui代替のUI */
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 380px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.92);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+      user-select: none;
+      max-height: calc(100vh - 24px);
+      overflow: auto;
+    }
+
+    #ui h1 {
+      font-size: 14px;
+      margin: 0 0 8px;
+      font-weight: 800;
+    }
+
+    details {
+      border: 1px solid rgba(0,0,0,0.08);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: rgba(255,255,255,0.9);
+      margin: 8px 0;
+    }
+    summary {
+      cursor: pointer;
+      font-weight: 800;
+      font-size: 12px;
+      color: #111;
+      outline: none;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 120px 1fr 64px;
+      gap: 10px;
+      align-items: center;
+      margin: 10px 0;
+    }
+    label { font-size: 12px; color: #222; }
+    input[type="range"] { width: 100%; }
+    .value { font-size: 12px; text-align: right; color: #111; }
+
+    .row2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .toggle {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+      color: #111;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(0,0,0,0.08);
+      background: rgba(255,255,255,0.9);
+    }
+
+    button {
+      border: 0;
+      background: #111;
+      color: #fff;
+      font-weight: 800;
+      cursor: pointer;
+      padding: 10px 12px;
+      border-radius: 10px;
+    }
+    button:active { transform: translateY(1px); }
+
+    /* stats.js代替のHUD */
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+    }
+
+    /* エラー表示（黒画面で沈黙しない） */
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Grouping（Groupの回転 vs 個別回転）</h1>
+
+    <details open>
+      <summary>Sphere（子オブジェクト）</summary>
+      <div class="row">
+        <label>X</label>
+        <input id="sphereX" type="range" min="-20" max="20" step="0.1" value="10" />
+        <div class="value" id="sphereXVal">10.0</div>
+      </div>
+      <div class="row">
+        <label>Y</label>
+        <input id="sphereY" type="range" min="-20" max="20" step="0.1" value="5" />
+        <div class="value" id="sphereYVal">5.0</div>
+      </div>
+      <div class="row">
+        <label>Z</label>
+        <input id="sphereZ" type="range" min="-20" max="20" step="0.1" value="0" />
+        <div class="value" id="sphereZVal">0.0</div>
+      </div>
+      <div class="row">
+        <label>Scale</label>
+        <input id="sphereS" type="range" min="0" max="3" step="0.01" value="1" />
+        <div class="value" id="sphereSVal">1.00</div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>Cube（子オブジェクト）</summary>
+      <div class="row">
+        <label>X</label>
+        <input id="cubeX" type="range" min="-20" max="20" step="0.1" value="0" />
+        <div class="value" id="cubeXVal">0.0</div>
+      </div>
+      <div class="row">
+        <label>Y</label>
+        <input id="cubeY" type="range" min="-20" max="20" step="0.1" value="3" />
+        <div class="value" id="cubeYVal">3.0</div>
+      </div>
+      <div class="row">
+        <label>Z</label>
+        <input id="cubeZ" type="range" min="-20" max="20" step="0.1" value="10" />
+        <div class="value" id="cubeZVal">10.0</div>
+      </div>
+      <div class="row">
+        <label>Scale</label>
+        <input id="cubeS" type="range" min="0" max="3" step="0.01" value="1" />
+        <div class="value" id="cubeSVal">1.00</div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>Group（親オブジェクト）</summary>
+      <div class="row">
+        <label>X</label>
+        <input id="groupX" type="range" min="-20" max="20" step="0.1" value="10" />
+        <div class="value" id="groupXVal">10.0</div>
+      </div>
+      <div class="row">
+        <label>Y</label>
+        <input id="groupY" type="range" min="-20" max="20" step="0.1" value="5" />
+        <div class="value" id="groupYVal">5.0</div>
+      </div>
+      <div class="row">
+        <label>Z</label>
+        <input id="groupZ" type="range" min="-20" max="20" step="0.1" value="0" />
+        <div class="value" id="groupZVal">0.0</div>
+      </div>
+      <div class="row">
+        <label>Scale</label>
+        <input id="groupS" type="range" min="0" max="3" step="0.01" value="1" />
+        <div class="value" id="groupSVal">1.00</div>
+      </div>
+    </details>
+
+    <div class="row2">
+      <div class="toggle">
+        <input id="grouping" type="checkbox" />
+        <span>grouping（回転をGroupに適用）</span>
+      </div>
+      <div class="toggle">
+        <input id="rotate" type="checkbox" />
+        <span>rotate（回転アニメーション）</span>
+      </div>
+    </div>
+
+    <div class="row2">
+      <button id="reset" type="button">Reset</button>
+      <button id="toggleBox" type="button">BBox: On/Off</button>
+    </div>
+
+    <div style="font-size:12px;color:#222;line-height:1.4;margin-top:8px;">
+      左ドラッグ：回転 / ホイール：ズーム / 右ドラッグ：平行移動
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    // -----------------------------
+    // エラーを画面に出す（白画面/黒画面で沈黙しない）
+    // -----------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e?.error?.stack || e?.message || e));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e));
+    });
+
+    // -----------------------------
+    // UI参照（dat.gui代替）
+    // -----------------------------
+    const ui = {
+      sphereX: document.getElementById("sphereX"),
+      sphereY: document.getElementById("sphereY"),
+      sphereZ: document.getElementById("sphereZ"),
+      sphereS: document.getElementById("sphereS"),
+
+      cubeX: document.getElementById("cubeX"),
+      cubeY: document.getElementById("cubeY"),
+      cubeZ: document.getElementById("cubeZ"),
+      cubeS: document.getElementById("cubeS"),
+
+      groupX: document.getElementById("groupX"),
+      groupY: document.getElementById("groupY"),
+      groupZ: document.getElementById("groupZ"),
+      groupS: document.getElementById("groupS"),
+
+      grouping: document.getElementById("grouping"),
+      rotate: document.getElementById("rotate"),
+
+      reset: document.getElementById("reset"),
+      toggleBox: document.getElementById("toggleBox"),
+
+      // 値表示
+      sphereXVal: document.getElementById("sphereXVal"),
+      sphereYVal: document.getElementById("sphereYVal"),
+      sphereZVal: document.getElementById("sphereZVal"),
+      sphereSVal: document.getElementById("sphereSVal"),
+
+      cubeXVal: document.getElementById("cubeXVal"),
+      cubeYVal: document.getElementById("cubeYVal"),
+      cubeZVal: document.getElementById("cubeZVal"),
+      cubeSVal: document.getElementById("cubeSVal"),
+
+      groupXVal: document.getElementById("groupXVal"),
+      groupYVal: document.getElementById("groupYVal"),
+      groupZVal: document.getElementById("groupZVal"),
+      groupSVal: document.getElementById("groupSVal"),
+    };
+
+    function syncLabels() {
+      ui.sphereXVal.textContent = Number(ui.sphereX.value).toFixed(1);
+      ui.sphereYVal.textContent = Number(ui.sphereY.value).toFixed(1);
+      ui.sphereZVal.textContent = Number(ui.sphereZ.value).toFixed(1);
+      ui.sphereSVal.textContent = Number(ui.sphereS.value).toFixed(2);
+
+      ui.cubeXVal.textContent = Number(ui.cubeX.value).toFixed(1);
+      ui.cubeYVal.textContent = Number(ui.cubeY.value).toFixed(1);
+      ui.cubeZVal.textContent = Number(ui.cubeZ.value).toFixed(1);
+      ui.cubeSVal.textContent = Number(ui.cubeS.value).toFixed(2);
+
+      ui.groupXVal.textContent = Number(ui.groupX.value).toFixed(1);
+      ui.groupYVal.textContent = Number(ui.groupY.value).toFixed(1);
+      ui.groupZVal.textContent = Number(ui.groupZ.value).toFixed(1);
+      ui.groupSVal.textContent = Number(ui.groupS.value).toFixed(2);
+    }
+
+    // 初期ラベル
+    syncLabels();
+
+    // -----------------------------
+    // Three.js 基本セットアップ
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xeeeeee);
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // OrbitControls（観察用）
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+
+    // カメラ初期位置（旧コード踏襲）
+    camera.position.set(30, 30, 30);
+    orbit.target.set(0, 0, 0);
+    orbit.update();
+
+    // -----------------------------
+    // 地面（旧: PlaneGeometry + SceneUtilsでwire+透明面）
+    // 現行では「Meshを2枚重ねる」が分かりやすい
+    // -----------------------------
+    const groundGroup = new THREE.Group();
+
+    const groundGeo = new THREE.PlaneGeometry(100, 100, 50, 50);
+
+    // ワイヤーフレーム（格子）
+    const groundWire = new THREE.Mesh(
+      groundGeo,
+      new THREE.MeshBasicMaterial({ wireframe: true, color: 0x000000 })
+    );
+    groundWire.rotation.x = -0.5 * Math.PI;
+
+    // 透明面（薄緑）
+    const groundFill = new THREE.Mesh(
+      groundGeo,
+      new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.18 })
+    );
+    groundFill.rotation.x = -0.5 * Math.PI;
+
+    // 深度の競合（Z-fighting）を避けるため、ほんの少し持ち上げる
+    groundFill.position.y = 0.001;
+
+    groundGroup.add(groundWire);
+    groundGroup.add(groundFill);
+    scene.add(groundGroup);
+
+    // 目印（XYZ軸）
+    const axes = new THREE.AxesHelper(20);
+    scene.add(axes);
+
+    // -----------------------------
+    // “教材の主役” である sphere/cube と group
+    // -----------------------------
+    // 旧コードは SceneUtils.createMultiMaterialObject で2材質をまとめていた
+    // 現行では「(通常Mesh + wireMesh) を Group として返す」方が同じ発想で実装できる。
+    function createMultiMaterialMesh(geometry) {
+      // 面の見た目：法線色（ライト不要）
+      const solid = new THREE.Mesh(
+        geometry,
+        new THREE.MeshNormalMaterial({ side: THREE.DoubleSide })
+      );
+
+      // 形状理解のためのワイヤー（重ね表示）
+      const wire = new THREE.Mesh(
+        geometry,
+        new THREE.MeshBasicMaterial({ wireframe: true, color: 0x000000 })
+      );
+
+      const g = new THREE.Group();
+      g.add(solid);
+      g.add(wire);
+
+      // ここで返すのは Group（＝Object3D）
+      // 旧 createMesh と同じく「回転・移動・スケールをまとめて適用できる」
+      return g;
+    }
+
+    let sphere = null;
+    let cube = null;
+    let group = null;
+
+    // -----------------------------
+    // Bounding Box 表示（旧: 自前setFromObject + vertices走査）
+    // 現行：Box3.setFromObject(group) が安全で速い
+    // -----------------------------
+    let bboxHelper = null;
+    let showBBox = true;
+
+    function updateBoundingBox() {
+      if (!group) return;
+
+      // helper が無いなら生成（Box3Helper は Box3 の線表示）
+      if (!bboxHelper) {
+        bboxHelper = new THREE.Box3Helper(new THREE.Box3(), 0x000000);
+        scene.add(bboxHelper);
+      }
+
+      // 今の group の “見た目の範囲” を計算
+      //   - group 配下の Mesh を辿って world matrix を考慮したAABBを作る
+      //   - BufferGeometry/Geometry の差を気にしなくて良い
+      const box = new THREE.Box3().setFromObject(group);
+      bboxHelper.box.copy(box);
+
+      bboxHelper.visible = showBBox;
+    }
+
+    // -----------------------------
+    // 矢印（旧コードは redraw のたびに ArrowHelper を scene.add して積み上がるバグがある）
+    // → 1つだけ持って更新する
+    // -----------------------------
+    const arrow = new THREE.ArrowHelper(
+      new THREE.Vector3(0, 1, 0), // direction
+      new THREE.Vector3(0, 0, 0), // origin
+      10,
+      0x0000ff
+    );
+    scene.add(arrow);
+
+    function updateArrow() {
+      if (!group) return;
+      // 矢印の根元を group のワールド位置に合わせる
+      const wp = new THREE.Vector3();
+      group.getWorldPosition(wp);
+      arrow.position.copy(wp);
+      arrow.setLength(10, 3, 2);
+    }
+
+    // -----------------------------
+    // 生成・再生成（旧 controls.redraw 相当）
+    // -----------------------------
+    function rebuild() {
+      clearError();
+
+      try {
+        // 旧実装は「scene.remove(group)」だけで、内部geometry/materialを dispose していない
+        // 教材としては GPU リークを避けたいので dispose を入れる
+        function disposeObject3D(obj) {
+          if (!obj) return;
+          obj.traverse((n) => {
+            if (n.isMesh) {
+              if (n.geometry) n.geometry.dispose();
+              if (n.material) {
+                if (Array.isArray(n.material)) n.material.forEach(m => m.dispose());
+                else n.material.dispose();
+              }
+            }
+          });
+        }
+
+        if (group) {
+          scene.remove(group);
+          disposeObject3D(group);
+          group = null;
+        }
+
+        // sphere/cube は “グループとして返す” ので position/scale/rotation は親の Group に当てる
+        sphere = createMultiMaterialMesh(new THREE.SphereGeometry(5, 16, 16));
+        cube = createMultiMaterialMesh(new THREE.BoxGeometry(6, 6, 6));
+
+        // UI値を反映（子のローカル変換）
+        sphere.position.set(
+          Number(ui.sphereX.value),
+          Number(ui.sphereY.value),
+          Number(ui.sphereZ.value)
+        );
+        const sS = Number(ui.sphereS.value);
+        sphere.scale.set(sS, sS, sS);
+
+        cube.position.set(
+          Number(ui.cubeX.value),
+          Number(ui.cubeY.value),
+          Number(ui.cubeZ.value)
+        );
+        const cS = Number(ui.cubeS.value);
+        cube.scale.set(cS, cS, cS);
+
+        // 親 group に子を add（ここが “Grouping” の本体）
+        group = new THREE.Group();
+        group.add(sphere);
+        group.add(cube);
+
+        // group のローカル変換（親の変換）
+        group.position.set(
+          Number(ui.groupX.value),
+          Number(ui.groupY.value),
+          Number(ui.groupZ.value)
+        );
+        const gS = Number(ui.groupS.value);
+        group.scale.set(gS, gS, gS);
+
+        scene.add(group);
+
+        // BBox と Arrow を最新状態に
+        updateBoundingBox();
+        updateArrow();
+      } catch (e) {
+        showError("rebuild でエラー:\n" + (e?.stack || e));
+      }
+    }
+
+    // -----------------------------
+    // UIイベント（値変更→即反映）
+    //   - dat.gui の onChange と同等に “触った瞬間反映” を目指す
+    // -----------------------------
+    function onInputRebuild() {
+      syncLabels();
+      rebuild();
+    }
+
+    [
+      "sphereX","sphereY","sphereZ","sphereS",
+      "cubeX","cubeY","cubeZ","cubeS",
+      "groupX","groupY","groupZ","groupS"
+    ].forEach((id) => {
+      ui[id].addEventListener("input", () => { syncLabels(); });
+      ui[id].addEventListener("change", onInputRebuild);
+    });
+
+    ui.grouping.addEventListener("change", () => {});
+    ui.rotate.addEventListener("change", () => {});
+    ui.toggleBox.addEventListener("click", () => {
+      showBBox = !showBBox;
+      if (bboxHelper) bboxHelper.visible = showBBox;
+    });
+
+    ui.reset.addEventListener("click", () => {
+      // 旧コードの初期値に戻す
+      ui.cubeX.value = "0";
+      ui.cubeY.value = "3";
+      ui.cubeZ.value = "10";
+      ui.cubeS.value = "1";
+
+      ui.sphereX.value = "10";
+      ui.sphereY.value = "5";
+      ui.sphereZ.value = "0";
+      ui.sphereS.value = "1";
+
+      ui.groupX.value = "10";
+      ui.groupY.value = "5";
+      ui.groupZ.value = "0";
+      ui.groupS.value = "1";
+
+      ui.grouping.checked = false;
+      ui.rotate.checked = false;
+
+      syncLabels();
+      rebuild();
+    });
+
+    // -----------------------------
+    // 描画ループ（旧 render 相当）
+    // -----------------------------
+    const hud = document.getElementById("hud");
+    let step = 0.03;
+
+    // FPS計測（stats.js代替）
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPS（約1秒ごとに更新）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "rotate: " + (ui.rotate.checked ? "on" : "off") + "\n" +
+          "grouping: " + (ui.grouping.checked ? "on" : "off") + "\n" +
+          "bbox: " + (showBBox ? "on" : "off");
+      }
+
+      // 回転ロジック（教材の核心）
+      //   grouping=true  : group の回転（子が“まとまって”回る）
+      //   grouping=false : sphere/cube を個別回転（それぞれが自分中心に回る）
+      if (group && ui.rotate.checked) {
+        if (ui.grouping.checked) {
+          group.rotation.y += step;
+        } else {
+          if (sphere) sphere.rotation.y += step;
+          if (cube) cube.rotation.y += step;
+        }
+
+        // 回転すると見た目の bbox も変わるので更新
+        updateBoundingBox();
+        updateArrow();
+      }
+
+      orbit.update();
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------------
+    // リサイズ
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // HUD/controls だけなら不要だが、bboxや見え方の確認用に update
+      updateBoundingBox();
+      updateArrow();
+    });
+
+    // -----------------------------
+    // 起動
+    // -----------------------------
+    rebuild();
+    animate();
+  </script>
+</body>
+</html>
