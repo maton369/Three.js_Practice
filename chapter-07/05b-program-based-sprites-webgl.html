@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 07.04 - Particles - Canvas based texture (no libs / THREE fix)</title>
+
+  <!--
+    ■ 今回のエラー原因
+      ReferenceError: THREE is not defined
+      → 「../libs/three.js」を外したのに、代わりの Three.js 読み込みが無い（または失敗）状態で
+        THREE を参照しているため。
+
+    ■ 方針（libsを使わない）
+      - Three.js を CDN から読み込む
+      - 1つのCDNが落ちたりブロックされても動くように「複数CDNのフォールバック」を入れる
+      - Three.js 読み込み完了後に initApp() を呼ぶ（THREE が定義された状態で実行）
+  -->
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #hud {
+      position: fixed; top: 10px; left: 10px;
+      color: #fff; background: rgba(0,0,0,0.55);
+      padding: 8px 10px; border-radius: 10px;
+      font: 12px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+      white-space: pre; user-select: none; z-index: 10;
+    }
+    #err {
+      position: fixed; left: 10px; bottom: 10px;
+      max-width: calc(100vw - 20px);
+      color: #fff; background: rgba(220, 60, 60, 0.92);
+      padding: 10px 12px; border-radius: 10px;
+      font: 12px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+      white-space: pre-wrap; display: none; z-index: 10;
+    }
+  </style>
+
+  <!--
+    Three.js を CDN で読み込む（グローバルに THREE が生える three.min.js を使用）
+    ※ unpkg がブロックされる環境があるので jsDelivr → unpkg の順でフォールバック
+  -->
+  <script>
+    (function loadThreeWithFallback() {
+      var urls = [
+        "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js",
+        "https://unpkg.com/three@0.160.0/build/three.min.js"
+      ];
+
+      function showBootError(msg) {
+        var err = document.getElementById("err");
+        if (!err) return;
+        err.style.display = "block";
+        err.textContent = msg;
+      }
+
+      function tryLoad(i) {
+        if (i >= urls.length) {
+          showBootError(
+            "CDN から Three.js の読み込みに失敗しました。\n" +
+            "- ネットワーク/プロキシ/企業NWのブロック\n" +
+            "- CDN URL の到達不可\n\n" +
+            "試したURL:\n" + urls.join("\n")
+          );
+          return;
+        }
+
+        var s = document.createElement("script");
+        s.src = urls[i];
+        s.async = true;
+
+        s.onload = function () {
+          // THREE が生えていることを確認してから実行
+          if (typeof window.THREE === "undefined") {
+            tryLoad(i + 1);
+            return;
+          }
+          // 読み込み成功 → アプリ開始
+          initApp();
+        };
+
+        s.onerror = function () {
+          // 次のCDNへ
+          tryLoad(i + 1);
+        };
+
+        document.head.appendChild(s);
+      }
+
+      // 先にDOMがある程度できてからエラー表示要素を使いたいので、DOMContentLoaded後に開始
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", function () { tryLoad(0); });
+      } else {
+        tryLoad(0);
+      }
+    })();
+  </script>
+</head>
+
+<body>
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+  <div id="WebGL-output"></div>
+
+  <script>
+    // ============================================================
+    // Three.js 読み込み後に呼ばれるエントリポイント（THREE が必ず存在する状態）
+    // ============================================================
+    function initApp() {
+      try {
+        // ----------------------------
+        // エラー表示
+        // ----------------------------
+        var errEl = document.getElementById("err");
+        function showError(e) {
+          errEl.style.display = "block";
+          errEl.textContent = String(e && e.stack ? e.stack : e);
+        }
+
+        // ============================================================
+        // 1) Scene / Camera / Renderer
+        // ============================================================
+        var scene = new THREE.Scene();
+
+        var camera = new THREE.PerspectiveCamera(
+          45,
+          window.innerWidth / window.innerHeight,
+          0.1,
+          3000
+        );
+
+        var renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setClearColor(0x000000);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        if (renderer.setPixelRatio) renderer.setPixelRatio(window.devicePixelRatio || 1);
+
+        document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+        // ============================================================
+        // 2) “Canvasで1回だけ” 粒子テクスチャを作る → 全スプライトで共有
+        // ============================================================
+        var particleTexture = createParticleTextureCanvas32();
+
+        // SpriteMaterial(map=texture) を1つ作り、それを全Spriteで共有
+        // transparent=true で alpha を有効化
+        // depthWrite=false で透明描画の破綻を軽減（粒子系の定石）
+        var spriteMaterial = new THREE.SpriteMaterial({
+          map: particleTexture,
+          color: 0xffffff,
+          transparent: true,
+          depthWrite: false
+        });
+        // 透明縁を少し切り捨てて黒縁を減らす（環境によって効果あり）
+        spriteMaterial.alphaTest = 0.2;
+
+        // ============================================================
+        // 3) 大量Spriteを生成してランダム配置
+        // ============================================================
+        var group = new THREE.Group();
+        scene.add(group);
+
+        var COUNT = 1500;
+        var RANGE = 500;
+
+        for (var i = 0; i < COUNT; i++) {
+          var sprite = new THREE.Sprite(spriteMaterial);
+
+          sprite.position.set(
+            Math.random() * RANGE - RANGE / 2,
+            Math.random() * RANGE - RANGE / 2,
+            Math.random() * RANGE - RANGE / 2
+          );
+
+          // スプライトのワールドサイズ（見える大きさ）
+          sprite.scale.set(4, 4, 1);
+
+          group.add(sprite);
+        }
+
+        // カメラを “必ず見える距離” に置く（rangeが大きいので少し引く）
+        camera.position.set(0, 0, RANGE * 0.45);
+        camera.lookAt(0, 0, 0);
+
+        // ============================================================
+        // 4) レンダーループ（剛体回転＝軽い）
+        // ============================================================
+        var step = 0;
+
+        // stats.js の代わり：簡易FPS
+        var hud = document.getElementById("hud");
+        var lastFpsT = performance.now();
+        var frames = 0;
+
+        function animate() {
+          requestAnimationFrame(animate);
+
+          step += 0.003;
+          group.rotation.y = step;
+          group.rotation.x = step * 0.35;
+
+          renderer.render(scene, camera);
+
+          frames++;
+          var now = performance.now();
+          if (now - lastFpsT >= 1000) {
+            var fps = (frames * 1000) / (now - lastFpsT);
+            frames = 0;
+            lastFpsT = now;
+            hud.textContent =
+              "FPS: " + fps.toFixed(1) + "\n" +
+              "sprites: " + COUNT + "\n" +
+              "range: " + RANGE + "\n" +
+              "THREE: " + (THREE.REVISION || "unknown");
+          }
+        }
+        animate();
+
+        // ============================================================
+        // 5) リサイズ対応
+        // ============================================================
+        window.addEventListener("resize", function () {
+          camera.aspect = window.innerWidth / window.innerHeight;
+          camera.updateProjectionMatrix();
+          renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // ============================================================
+        // 6) 破棄（教材として：GPUメモリリークを避ける）
+        // ============================================================
+        window.addEventListener("beforeunload", function () {
+          if (particleTexture && particleTexture.dispose) particleTexture.dispose();
+          if (spriteMaterial && spriteMaterial.dispose) spriteMaterial.dispose();
+          if (renderer && renderer.dispose) renderer.dispose();
+        });
+
+      } catch (e) {
+        // initApp 内の例外はここで見える化
+        var err = document.getElementById("err");
+        err.style.display = "block";
+        err.textContent = String(e && e.stack ? e.stack : e);
+      }
+    }
+
+    // ============================================================
+    // Canvas(32x32)に粒子アイコンを描く → CanvasTextureにする
+    // ============================================================
+    function createParticleTextureCanvas32() {
+      var canvas = document.createElement("canvas");
+      canvas.width = 32;
+      canvas.height = 32;
+
+      var ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, 32, 32);
+
+      // 本体（オレンジの丸）
+      ctx.fillStyle = "orange";
+      ctx.beginPath();
+      ctx.arc(16, 16, 12, 0, Math.PI * 2, true);
+      ctx.fill();
+
+      // 目（白）
+      ctx.fillStyle = "white";
+      ctx.beginPath();
+      ctx.ellipse(12, 14, 3.2, 4.0, 0, 0, Math.PI * 2);
+      ctx.ellipse(20, 14, 3.2, 4.0, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 瞳（青）
+      ctx.fillStyle = "blue";
+      ctx.beginPath();
+      ctx.arc(13, 15, 1.6, 0, Math.PI * 2, true);
+      ctx.arc(21, 15, 1.6, 0, Math.PI * 2, true);
+      ctx.fill();
+
+      // ハイライト（薄く）
+      ctx.globalAlpha = 0.25;
+      ctx.fillStyle = "white";
+      ctx.beginPath();
+      ctx.arc(12, 11, 5, 0, Math.PI * 2, true);
+      ctx.fill();
+      ctx.globalAlpha = 1.0;
+
+      // Canvas → Texture（CanvasTexture があればそれを使用）
+      var tex = (THREE.CanvasTexture)
+        ? new THREE.CanvasTexture(canvas)
+        : new THREE.Texture(canvas);
+
+      // 旧互換：CanvasTextureが無い場合は needsUpdate が必要
+      tex.needsUpdate = true;
+
+      // 小さいテクスチャなので拡大縮小の見え方を指定
+      tex.magFilter = THREE.NearestFilter;
+      tex.minFilter = THREE.NearestFilter;
+
+      return tex;
+    }
+  </script>
+</body>
+</html>
