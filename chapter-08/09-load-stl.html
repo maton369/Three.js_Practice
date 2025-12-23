@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 08.09 - Load STL model（現行Three.js / ES Modules版）</title>
+
+  <!--
+    目的：
+      旧サンプル（../libs/three.js + STLLoader.js + stats.js + dat.gui）を
+      現行Three.js（ES Modules）で動く形に修正し、STLロード処理のアルゴリズムが分かるように
+      コメント多めで整理する。
+
+    ■ このサンプルの全体アルゴリズム（教材のコア）
+      1) Scene / Camera / Renderer を初期化（描画の土台）
+      2) ライトを置く（STLは材質情報が無いので、ライトが無いと真っ黒になりやすい）
+      3) STLLoader で .stl をロード（非同期）
+      4) ロード完了で geometry(BufferGeometry) が返る
+         → MeshLambert/Standard などの “ライトに反応するマテリアル” を付けて Mesh 化
+      5) モデルの向き・大きさ・位置を調整（STLは座標系/単位がバラつくのでここが重要）
+         - 回転：Z-up/Y-up などを合わせるために回すことが多い
+         - スケール：mm/インチ/任意単位があり得るので見える大きさにする
+         - 接地：bbox を計算して床Y=0に置く
+      6) requestAnimationFrame で描画ループを回し、モデルを少し回転させて表示
+
+    ■ 旧コードの問題点（修正ポイント）
+      - STLLoader をグローバル THREE から読む旧形式 → examples/jsm の ES Modules に変更
+      - group という名前で Object3D と Mesh を混在させて再代入しており、意図が追いにくい
+        → “model” という Mesh 参照に統一する
+      - spotLight は castShadow が無く影が出ない / renderer.shadowMap.enabled だけでは不足
+        → ライト castShadow + メッシュ cast/receiveShadow を揃える
+      - stats.js / dat.gui の依存 → HUD（簡易FPS）+ エラー表示で代替
+      - file:// 直開きは失敗しやすい → HTTPサーバ上で ../assets を配信する前提を明記
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+    }
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+      user-select: none;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { STLLoader } from "three/addons/loaders/STLLoader.js";
+
+    // -----------------------------
+    // 黒画面で沈黙しないためのエラー表示
+    // -----------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) { errBox.style.display = "block"; errBox.textContent = String(msg); }
+    function clearError() { errBox.style.display = "none"; errBox.textContent = ""; }
+    window.addEventListener("error", (e) => showError("window.onerror:\n" + (e?.error?.stack || e?.message || e)));
+    window.addEventListener("unhandledrejection", (e) => showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e)));
+
+    // -----------------------------
+    // Three.js 基本セットアップ（Scene / Camera / Renderer）
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 2000);
+    camera.position.set(150, 150, 150);
+    camera.lookAt(0, 40, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = true; // 影を使うなら必須
+    document.body.appendChild(renderer.domElement);
+
+    // 視点操作：STLの向きやサイズ調整の確認がしやすい
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.target.set(0, 40, 0);
+    orbit.update();
+
+    // 目印：床 + グリッド
+    const grid = new THREE.GridHelper(400, 40);
+    grid.material.opacity = 0.25;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(600, 600),
+      new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 1.0, metalness: 0.0 })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // -----------------------------
+    // ライト（STLは色/材質情報が無いのでライトが重要）
+    // -----------------------------
+    // 環境光：真っ黒を避ける
+    scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+    // スポットライト：旧コードを踏襲しつつ、影の設定を明示
+    const spot = new THREE.SpotLight(0xffffff, 1.8);
+    spot.position.set(150, 150, 150);
+    spot.castShadow = true;
+    spot.shadow.mapSize.set(1024, 1024);
+    spot.shadow.camera.near = 10;
+    spot.shadow.camera.far = 1200;
+    scene.add(spot);
+
+    // 方向の補助：反対側からも少し当てる（陰影が潰れないように）
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(-100, 120, -60);
+    scene.add(dir);
+
+    // -----------------------------
+    // STLロード（assets を使用）
+    // -----------------------------
+    // 注意：HTTPサーバで配信されていること（file:// 直開きは失敗しやすい）
+    const stlPath = "../assets/models/SolidHead_2_lowPoly_42k.stl";
+
+    // 読み込んだモデルを保持（アニメ回転・disposeのため）
+    let model = null;
+
+    const loader = new STLLoader();
+    loader.load(
+      stlPath,
+      (geometry) => {
+        clearError();
+
+        // STLLoader は BufferGeometry を返す（現行Three.jsではこれが標準）
+        // ここで法線（normal）が無い/壊れているモデルもあるので、必要なら計算する
+        // ※ computeVertexNormals は頂点数が多いと少し重いが、初回のみなら問題になりにくい
+        if (!geometry.attributes.normal) {
+          geometry.computeVertexNormals();
+        }
+
+        // マテリアル：ライトに反応するタイプを選ぶ
+        // - Lambert：軽い / ざっくり陰影
+        // - Standard：少し重いが現代的（roughness/metalness）
+        const material = new THREE.MeshStandardMaterial({
+          color: 0x7777ff,
+          roughness: 0.85,
+          metalness: 0.05
+        });
+
+        // Mesh化（この時点で初めて scene に add できる）
+        model = new THREE.Mesh(geometry, material);
+        model.name = "stl_model";
+
+        // 影
+        model.castShadow = true;
+        model.receiveShadow = true;
+
+        // -----------------------------
+        // 向き・大きさ・位置合わせ（STLあるある）
+        // -----------------------------
+        // 旧コード：X軸に -90度回していた（Z-up → Y-up 変換の典型）
+        // ただしモデルによっては不要/別軸の場合もある。ここは “まず旧コード踏襲”。
+        model.rotation.x = -0.5 * Math.PI;
+
+        // 旧コード：scale 0.6。STLの単位はモデル次第（mm/インチ/任意）なので、見える大きさに調整。
+        model.scale.set(0.6, 0.6, 0.6);
+
+        // 中心合わせ＆接地：bbox を使うと堅牢
+        // 1) bboxで中心を求めて原点に寄せる
+        // 2) bbox.min.y を 0 に合わせて床に置く
+        const box = new THREE.Box3().setFromObject(model);
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        model.position.sub(center);
+
+        const box2 = new THREE.Box3().setFromObject(model);
+        model.position.y -= box2.min.y; // 接地
+
+        scene.add(model);
+
+        // デバッグ：必要ならサイズを確認できる
+        // const size = new THREE.Vector3(); box2.getSize(size); console.log("STL size:", size);
+      },
+      (progressEvent) => {
+        // 進捗（totalが無いこともある）
+        const loaded = progressEvent?.loaded ?? 0;
+        const total = progressEvent?.total ?? 0;
+        if (total > 0) {
+          const pct = (loaded / total) * 100;
+          hud.textContent = "Loading... " + pct.toFixed(1) + "%";
+        } else {
+          hud.textContent = "Loading... " + loaded + " bytes";
+        }
+      },
+      (err) => {
+        showError(
+          "STL load failed:\n" +
+          "path: " + stlPath + "\n\n" +
+          (err?.stack || err?.message || JSON.stringify(err, null, 2) || err)
+        );
+      }
+    );
+
+    // -----------------------------
+    // HUD（簡易FPS：stats.js 代替）
+    // -----------------------------
+    const hud = document.getElementById("hud");
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    // -----------------------------
+    // アニメーションループ
+    // -----------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPSは1秒に1回更新
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "model: " + (model ? "loaded" : "loading...") + "\n" +
+          "shadows: " + (renderer.shadowMap.enabled ? "on" : "off");
+      }
+
+      // 旧コード：Z軸回転（見た目の動きを出す）
+      if (model) {
+        model.rotation.z += 0.006;
+      }
+
+      orbit.update();
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------------
+    // リサイズ対応
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // -----------------------------
+    // 後始末（ページ離脱時：GPUリソース解放）
+    // -----------------------------
+    window.addEventListener("beforeunload", () => {
+      if (model) {
+        if (model.geometry) model.geometry.dispose();
+        if (model.material) model.material.dispose();
+      }
+      floor.geometry.dispose();
+      floor.material.dispose();
+      renderer.dispose();
+    });
+
+    // 起動
+    animate();
+  </script>
+</body>
+</html>
