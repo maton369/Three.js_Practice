@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 08.03 - Save & Load（現行Three.js / libs無し版）</title>
+
+  <!--
+    目的：
+      旧サンプル（../libs/three.js + stats.js + dat.gui）を、現行Three.js(ES Modules)で動く形に修正する。
+      さらに「3DオブジェクトをJSONとして保存し、復元してシーンに再配置する」処理を、
+      仕組みが理解できるようにコメント多めで書き直す。
+
+    ■ このサンプルの“全体アルゴリズム”が何か
+      1) TorusKnot（トーラスノット）Mesh を生成してシーンに置く
+      2) UIのパラメータ（radius/tube/segments/p/q）を変えたら
+         → ジオメトリを作り直し、古いジオメトリ/マテリアルは dispose してGPUメモリを解放する
+      3) Save：
+         Mesh.toJSON() で「オブジェクト＋参照している geometry/material/texture 等」も含めて
+         JSON化し、localStorage に文字列として保存する
+      4) Load：
+         localStorage からJSONを読み、THREE.ObjectLoader.parse() でオブジェクトを復元する
+         → 位置を少しずらして“元のknotと復元knotの2つ”を並べて表示する
+      5) 毎フレーム、knot を回転させて描画し続ける（アニメーション）
+
+    ■ 旧コードで壊れやすいポイント（今回の修正理由）
+      - TorusKnotGeometry の引数順が間違っている（旧 redraw で radial/tubular が逆）
+        正：TorusKnotGeometry(radius, tube, tubularSegments, radialSegments, p, q)
+      - dat.gui の onChange(save) のように “ボタンなのに onChange” は不要（誤解を生む）
+      - vertexColors: THREE.VertexColors は古いAPI（現行は vertexColors: true）
+      - remove だけだと GPUメモリが解放されない → dispose を入れる
+      - ../libs の依存を消して、CDN + importmap で動く形にする
+  -->
+
+  <!-- importmap：ブラウザに「three」「three/addons/」の参照先を教える -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eaeaea; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+    /* UI（dat.gui の代替） */
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 360px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.92);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+      user-select: none;
+    }
+    #ui h1 { font-size: 14px; margin: 0 0 10px; font-weight: 800; }
+    .row {
+      display: grid;
+      grid-template-columns: 140px 1fr;
+      gap: 10px;
+      align-items: center;
+      margin: 10px 0;
+    }
+    label { font-size: 12px; color: #222; }
+    input[type="range"] { width: 100%; }
+    button {
+      width: 100%;
+      border: 0;
+      background: #111;
+      color: #fff;
+      font-weight: 800;
+      cursor: pointer;
+      padding: 10px 12px;
+      border-radius: 10px;
+    }
+    button:active { transform: translateY(1px); }
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Save & Load（TorusKnot → JSON → localStorage → 復元）</h1>
+
+    <div class="row">
+      <label>radius（外半径）</label>
+      <input id="radius" type="range" min="0" max="40" step="0.1" value="10" />
+    </div>
+
+    <div class="row">
+      <label>tube（太さ）</label>
+      <input id="tube" type="range" min="0.1" max="10" step="0.05" value="1" />
+    </div>
+
+    <div class="row">
+      <label>tubularSegments</label>
+      <input id="tubular" type="range" min="8" max="256" step="1" value="64" />
+    </div>
+
+    <div class="row">
+      <label>radialSegments</label>
+      <input id="radial" type="range" min="3" max="64" step="1" value="8" />
+    </div>
+
+    <div class="row">
+      <label>p</label>
+      <input id="p" type="range" min="1" max="10" step="1" value="2" />
+    </div>
+
+    <div class="row">
+      <label>q</label>
+      <input id="q" type="range" min="1" max="15" step="1" value="3" />
+    </div>
+
+    <div class="row">
+      <label>操作</label>
+      <button id="rebuild" type="button">Rebuild（作り直し）</button>
+    </div>
+
+    <div class="row">
+      <label>Save / Load</label>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <button id="save" type="button">Save</button>
+        <button id="load" type="button">Load</button>
+      </div>
+    </div>
+
+    <div style="font-size:12px;color:#222;line-height:1.4;margin-top:6px;">
+      左ドラッグ：回転 / ホイール：ズーム / 右ドラッグ：平行移動
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    // -----------------------------
+    // 黒画面で沈黙しないためのエラー表示
+    // -----------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) { errBox.style.display = "block"; errBox.textContent = String(msg); }
+    function clearError() { errBox.style.display = "none"; errBox.textContent = ""; }
+    window.addEventListener("error", (e) => showError("window.onerror:\n" + (e?.error?.stack || e?.message || e)));
+    window.addEventListener("unhandledrejection", (e) => showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e)));
+
+    // -----------------------------
+    // UI参照（旧 dat.gui の代替）
+    // -----------------------------
+    const ui = {
+      radius:  document.getElementById("radius"),
+      tube:    document.getElementById("tube"),
+      tubular: document.getElementById("tubular"),
+      radial:  document.getElementById("radial"),
+      p:       document.getElementById("p"),
+      q:       document.getElementById("q"),
+      rebuild: document.getElementById("rebuild"),
+      save:    document.getElementById("save"),
+      load:    document.getElementById("load"),
+    };
+
+    // -----------------------------
+    // Three.js 基本セットアップ（Scene / Camera / Renderer）
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xeeeeee);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(-30, 40, 50);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // OrbitControls：教材では視点操作できた方が理解しやすい
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.target.set(0, 0, 0);
+    orbit.update();
+
+    // 見える基準：グリッド（空間把握用）
+    const grid = new THREE.GridHelper(120, 24);
+    grid.material.opacity = 0.25;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    // -----------------------------
+    // このサンプルの主役：knot（生成対象）と loadedMesh（復元対象）
+    // -----------------------------
+    let knot = null;        // 現在操作している TorusKnot
+    let loadedMesh = null;  // Save→Load で復元したオブジェクト
+
+    // localStorage のキー（複数サンプルと衝突しないように名前を付ける）
+    const STORAGE_KEY = "threejs_example_0803_knot_json";
+
+    // -----------------------------
+    // GPUメモリリーク対策：
+    // scene.remove() は「シーンから外す」だけで、GPUのバッファは残りうる。
+    // geometry.dispose() / material.dispose() を呼んで解放するのが重要。
+    // -----------------------------
+    function disposeObject3D(obj) {
+      if (!obj) return;
+
+      obj.traverse((node) => {
+        // Mesh の場合
+        if (node.isMesh) {
+          if (node.geometry) node.geometry.dispose();
+          if (node.material) {
+            if (Array.isArray(node.material)) node.material.forEach(m => m.dispose());
+            else node.material.dispose();
+          }
+        }
+      });
+    }
+
+    // -----------------------------
+    // マテリアル：旧コードは wireframe + 灰色。
+    // wireframeLinewidth はWebGLの制限で効かない環境が多い（教材コメントとして重要）
+    // -----------------------------
+    function createWireframeMaterial() {
+      return new THREE.MeshBasicMaterial({
+        color: 0xaaaaaa,
+        wireframe: true,
+        side: THREE.DoubleSide
+      });
+    }
+
+    // -----------------------------
+    // TorusKnot を作る関数
+    // ※ 重要：TorusKnotGeometry の引数順
+    //    TorusKnotGeometry(radius, tube, tubularSegments, radialSegments, p, q)
+    // 旧コードは redraw で radial/tubular を逆に渡していたため、意図しない形状になりうる。
+    // -----------------------------
+    function createKnotFromUI() {
+      const radius = Number(ui.radius.value);
+      const tube = Number(ui.tube.value);
+      const tubularSegments = Math.round(Number(ui.tubular.value));
+      const radialSegments = Math.round(Number(ui.radial.value));
+      const p = Math.round(Number(ui.p.value));
+      const q = Math.round(Number(ui.q.value));
+
+      const geom = new THREE.TorusKnotGeometry(radius, tube, tubularSegments, radialSegments, p, q);
+      const mat = createWireframeMaterial();
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.name = "knot";
+      return mesh;
+    }
+
+    // -----------------------------
+    // Rebuild（作り直し）
+    // 旧コードの controls.redraw 相当だが、
+    // - remove だけでなく dispose する
+    // - 生成引数順を正す
+    // を必ず行う
+    // -----------------------------
+    function rebuild() {
+      clearError();
+
+      try {
+        // 既存knotを撤去＆解放
+        if (knot) {
+          scene.remove(knot);
+          disposeObject3D(knot);
+          knot = null;
+        }
+
+        knot = createKnotFromUI();
+        scene.add(knot);
+      } catch (e) {
+        showError("rebuild でエラー:\n" + (e?.stack || e));
+      }
+    }
+
+    // -----------------------------
+    // Save：knot を JSON にして localStorage に保存
+    //
+    // ここでの肝は「knot.toJSON() は、knot単体だけでなく、
+    // 参照している geometry/material 等の辞書も含んだ“復元可能な形式”を返す」点。
+    // そのため ObjectLoader.parse で復元できる。
+    //
+    // 注意：
+    // - localStorage は文字列しか保存できない → JSON.stringify が必要
+    // - 容量はブラウザ実装次第で制限がある（大きいモデルには不向き）
+    // -----------------------------
+    function save() {
+      clearError();
+
+      try {
+        if (!knot) throw new Error("knot が存在しません（先に Rebuild してください）");
+
+        const jsonObject = knot.toJSON();              // Object3D を“復元可能なJSON構造”に変換
+        const jsonText = JSON.stringify(jsonObject);   // localStorage は文字列なので stringify
+
+        localStorage.setItem(STORAGE_KEY, jsonText);
+      } catch (e) {
+        showError("save でエラー:\n" + (e?.stack || e));
+      }
+    }
+
+    // -----------------------------
+    // Load：localStorage から JSON を読み、ObjectLoader で復元してシーンに配置
+    //
+    // ObjectLoader.parse は、toJSON 形式（object/geometry/material などを含む）を入力に取る。
+    // つまり「保存したJSONが three.js の期待形式であること」が前提。
+    // -----------------------------
+    function load() {
+      clearError();
+
+      try {
+        // 以前の復元物があれば撤去＆解放
+        if (loadedMesh) {
+          scene.remove(loadedMesh);
+          disposeObject3D(loadedMesh);
+          loadedMesh = null;
+        }
+
+        const jsonText = localStorage.getItem(STORAGE_KEY);
+        if (!jsonText) {
+          throw new Error("保存データがありません（先に Save を押してください）");
+        }
+
+        const jsonObject = JSON.parse(jsonText);
+
+        // ObjectLoader：toJSON形式から Object3D を復元する
+        const loader = new THREE.ObjectLoader();
+        loadedMesh = loader.parse(jsonObject);
+
+        // 元のknotと区別できるように、少し左へずらして並べる
+        loadedMesh.position.x -= 30;
+        loadedMesh.name = "loadedMesh";
+
+        scene.add(loadedMesh);
+      } catch (e) {
+        showError("load でエラー:\n" + (e?.stack || e));
+      }
+    }
+
+    // -----------------------------
+    // UIイベント
+    // - スライダー操作後に Rebuild を押しても良いし、
+    //   change（確定）で自動Rebuildしてもよい。
+    // ここでは「changeで自動」＋「ボタンで手動」両対応にして教材として分かりやすくする。
+    // -----------------------------
+    ["radius","tube","tubular","radial","p","q"].forEach((key) => {
+      ui[key].addEventListener("change", rebuild);
+    });
+    ui.rebuild.addEventListener("click", rebuild);
+    ui.save.addEventListener("click", save);
+    ui.load.addEventListener("click", load);
+
+    // -----------------------------
+    // アニメーション（旧 render 相当）
+    // - knot を回転させる
+    // - FPSを簡易表示（stats.js 代替）
+    // -----------------------------
+    const hud = document.getElementById("hud");
+    let step = 0;
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPS計測（1秒に1回更新）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "saved: " + (localStorage.getItem(STORAGE_KEY) ? "yes" : "no") + "\n" +
+          "loaded: " + (loadedMesh ? "yes" : "no");
+      }
+
+      // 回転（knot が存在する場合のみ）
+      if (knot) {
+        step += 0.01;
+        knot.rotation.y = step;
+      }
+
+      orbit.update();
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------------
+    // リサイズ対応
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // -----------------------------
+    // ページ離脱時の後始末（念のため）
+    // -----------------------------
+    window.addEventListener("beforeunload", () => {
+      if (knot) disposeObject3D(knot);
+      if (loadedMesh) disposeObject3D(loadedMesh);
+      renderer.dispose();
+    });
+
+    // 起動
+    rebuild();
+    animate();
+  </script>
+</body>
+</html>
