@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 08.06 - Load OBJ model（現行Three.js / ES Modules版 / assets使用）</title>
+
+  <!--
+    目的：
+      旧サンプル（../libs/three.js + ../libs/loaders/OBJLoader.js + stats.js + dat.gui）を、
+      現行Three.js(ES Modules)で動く形に修正し、OBJモデル（assets）を読み込んで描画する。
+
+    ■ 全体アルゴリズム（このサンプルのコア）
+      1) Scene / Camera / Renderer を初期化して canvas をDOMへ追加
+      2) ライト（Ambient + Directional）を置いて、陰影で形状を見せる
+      3) OBJLoader で ../assets/models/pinecone.obj を非同期ロード
+         - OBJは「Group（=複数Meshの集合）」として返ることが多い
+         - traverse で Mesh を探し、material を統一して見た目を揃える
+         - 必要なら normal を計算（古いOBJや法線無しOBJ向け）
+      4) ロード完了後に scene.add(model)
+      5) requestAnimationFrame で毎フレーム回転＆描画
+      6) resize と dispose（GPUリーク対策）を入れて完成度を上げる
+
+    ■ 旧コードの問題点（修正理由）
+      - 旧 OBJLoader は examples へ移動し、../libs の構成だと壊れやすい
+        → ES Modules の OBJLoader を利用
+      - scene.add(camera) は必須ではない（CameraはObject3Dだが、一般にはSceneに入れなくてよい）
+      - DirectionalLight なのに "spotLight" という変数名で混乱する
+      - computeFaceNormals/computeVertexNormals は BufferGeometry では意味が変わる/不要な場合が多い
+        → geometry.attributes.normal が無い時だけ computeVertexNormals() を呼ぶ
+      - castShadow/receiveShadow を設定しないと shadowMap.enabled の意味が薄い
+      - エラー時に沈黙すると黒画面になりやすい → 画面にエラー表示
+
+    注意：
+      - OBJは古いフォーマットで、PBR材質やテクスチャ参照は MTL を別途読み込む必要がある。
+        今回は教材として「単色マテリアルでOBJ形状を表示」する最小構成にする。
+      - assets は使う（pinecone.obj を ../assets/ から読む）
+  -->
+
+  <!-- importmap：three と addons のURLをブラウザへ教える -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #aaaaff; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+      user-select: none;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
+
+    // -----------------------------
+    // エラーを画面に出す（黒画面対策）
+    // -----------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) { errBox.style.display = "block"; errBox.textContent = String(msg); }
+    function clearError() { errBox.style.display = "none"; errBox.textContent = ""; }
+    window.addEventListener("error", (e) => showError("window.onerror:\n" + (e?.error?.stack || e?.message || e)));
+    window.addEventListener("unhandledrejection", (e) => showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e)));
+
+    // -----------------------------
+    // Scene / Camera / Renderer
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xaaaaff);
+
+    // 旧コードの near/far を踏襲しつつ、モデルが大きい可能性もあるので far は余裕を持たせる
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 2000);
+    camera.position.set(130, 40, 50);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+    // 影を使う設定（ただし、ライト/メッシュ側も cast/receive を設定しないと影は出ない）
+    renderer.shadowMap.enabled = true;
+
+    document.body.appendChild(renderer.domElement);
+
+    // 視点操作（教材として便利）
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.target.set(0, 20, 0);
+    orbit.update();
+
+    // -----------------------------
+    // “見える基準” を置く（空間把握用）
+    // -----------------------------
+    const grid = new THREE.GridHelper(400, 40);
+    grid.material.opacity = 0.25;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    // 地面（影の受け皿）
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(600, 600),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0, metalness: 0.0 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // -----------------------------
+    // Light
+    // - OBJ を “立体” として見せるため、Ambient + Directional の定番構成
+    // -----------------------------
+    scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+    // 旧コードは DirectionalLight なのに spotLight という変数名で混乱するので命名を修正
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(30, 80, 50);
+    dirLight.castShadow = true;
+
+    // 影の品質・範囲（デフォルトだと狭すぎたり荒すぎたりするので調整）
+    dirLight.shadow.mapSize.set(1024, 1024);
+    const d = 200;
+    dirLight.shadow.camera.left = -d;
+    dirLight.shadow.camera.right = d;
+    dirLight.shadow.camera.top = d;
+    dirLight.shadow.camera.bottom = -d;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 400;
+
+    scene.add(dirLight);
+
+    // -----------------------------
+    // OBJ ロード（assetsを使う）
+    // -----------------------------
+    const MODEL_URL = "../assets/models/pinecone.obj";
+
+    // OBJは「Groupとして返る → 中に複数のMeshが入っている」パターンが多い
+    let model = null;
+
+    // 材質：OBJにMTLが無い/読まない前提なので、単色Lambert/Standardで統一する
+    // 旧サンプルは MeshLambertMaterial（拡散反射）なので近い挙動を踏襲
+    const material = new THREE.MeshLambertMaterial({ color: 0x5c3a21 });
+
+    // ローダ
+    const loader = new OBJLoader();
+
+    // load は非同期：
+    //  - 成功: onLoad(Group) が呼ばれる
+    //  - 失敗: onError(ErrorEvent) が呼ばれる
+    loader.load(
+      MODEL_URL,
+      (loaded) => {
+        clearError();
+
+        // loaded は Group（Object3D）なので、traverse で全ノードを走査して Mesh を見つける
+        loaded.traverse((node) => {
+          if (!node.isMesh) return;
+
+          // 材質を統一（OBJ由来のマテリアルが付いてても教材としては統一が分かりやすい）
+          node.material = material;
+
+          // 影を出すには Mesh 側の設定が必要
+          node.castShadow = true;
+          node.receiveShadow = true;
+
+          // 法線が無い/壊れているOBJ対策：
+          // - BufferGeometry の場合、attributes.normal が無い時に computeVertexNormals() を呼ぶ
+          // - 旧コードの computeFaceNormals は Geometry 向けで、現行では基本使わない
+          const geom = node.geometry;
+          if (geom && geom.isBufferGeometry) {
+            if (!geom.attributes.normal) {
+              geom.computeVertexNormals();
+            }
+          }
+        });
+
+        // スケールや位置を調整
+        // 旧コードは scale=100 だが、OBJの単位が不定なので「見える」ことを優先して調整する。
+        // ここでは旧値を踏襲しつつ、bbox を測って中央寄せする（見失い防止）
+        loaded.scale.setScalar(100);
+        loaded.rotation.x = -0.3;
+
+        // モデルのバウンディングボックスを使って中央寄せ & 地面に乗せる
+        const box = new THREE.Box3().setFromObject(loaded);
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        box.getSize(size);
+        box.getCenter(center);
+
+        // center を原点へ持ってくる（回転中心も分かりやすくなる）
+        loaded.position.sub(center);
+
+        // 地面に接地させる（minY が 0 になるように持ち上げる）
+        const box2 = new THREE.Box3().setFromObject(loaded);
+        loaded.position.y -= box2.min.y;
+
+        model = loaded;
+        model.name = "pinecone_obj";
+        scene.add(model);
+
+        // カメラ/ターゲットもモデルに合わせて軽く調整（巨大/小さすぎ問題の緩和）
+        // “最大辺” を基準にズーム距離を決める
+        const maxDim = Math.max(size.x, size.y, size.z) || 1;
+        orbit.target.set(0, size.y * 0.5, 0);
+        camera.position.set(maxDim * 1.2, maxDim * 0.6, maxDim * 1.2);
+        camera.lookAt(orbit.target);
+        orbit.update();
+      },
+      // onProgress（任意）：教材としてロード状況を出してもよい
+      (xhr) => {
+        // xhr.total は取れないこともある（サーバが Content-Length を返さない等）
+        // ここでは HUD に “ロード中” を薄く出す程度
+        const total = xhr.total || 0;
+        const loaded = xhr.loaded || 0;
+        const pct = total ? (loaded / total) * 100 : 0;
+        hud.textContent = total
+          ? `Loading OBJ: ${pct.toFixed(1)}%`
+          : `Loading OBJ: ${Math.round(loaded / 1024)} KB`;
+      },
+      // onError
+      (err) => {
+        showError(
+          "OBJLoader.load に失敗しました。\n" +
+          "よくある原因:\n" +
+          "- パスが間違っている（../assets/... の相対位置）\n" +
+          "- ローカルファイル直開きでCORS/制限に引っかかっている（httpサーバで開く）\n" +
+          "- サーバが404を返している\n\n" +
+          "詳細:\n" + (err?.message || err)
+        );
+      }
+    );
+
+    // -----------------------------
+    // 簡易FPS（stats.js 代替）
+    // -----------------------------
+    const hud = document.getElementById("hud");
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    // -----------------------------
+    // アニメーションループ
+    // -----------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPS表示（1秒に1回更新）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "model: " + (model ? "loaded" : "loading...") + "\n" +
+          "url: " + MODEL_URL;
+      }
+
+      // ロード完了後のみ回転
+      if (model) {
+        model.rotation.y += 0.006;
+        model.rotation.x += 0.006;
+      }
+
+      orbit.update();
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------------
+    // リサイズ対応
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // -----------------------------
+    // GPUリソース解放（ページ離脱時）
+    // -----------------------------
+    function disposeObject3D(obj) {
+      if (!obj) return;
+      obj.traverse((node) => {
+        if (node.isMesh) {
+          if (node.geometry) node.geometry.dispose();
+          if (node.material) {
+            if (Array.isArray(node.material)) node.material.forEach((m) => m.dispose());
+            else node.material.dispose();
+          }
+        }
+      });
+    }
+
+    window.addEventListener("beforeunload", () => {
+      disposeObject3D(model);
+      ground.geometry.dispose();
+      ground.material.dispose();
+      renderer.dispose();
+    });
+
+    // 起動
+    animate();
+  </script>
+</body>
+</html>
