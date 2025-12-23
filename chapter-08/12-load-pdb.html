@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 08.12 - Load PDB model (legacy)</title>
+
+  <!--
+    目的：
+      - 旧Three.js（グローバルTHREE）+ PDBLoader で PDB（aspirin.pdb）を読み込み、
+        “原子＝球” “結合＝チューブ” として可視化するサンプル。
+      - 「PDB → 原子/結合データ → Mesh群生成 → Group化 → 描画ループ」のアルゴリズムを
+        追えるように、コメント多めで整理する。
+
+    このファイルは “旧構成” を前提：
+      - ../libs/three.js が <script> で読み込まれ、window.THREE が使える
+      - ../libs/loaders/PDBLoader.js が THREE.PDBLoader を提供
+      - stats.js / dat.gui.js は補助（本質はロード→メッシュ生成→レンダリングループ）
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) Scene / Camera / Renderer を初期化し、CanvasをDOMへ追加する
+      2) ライトを配置（Phong はライトが無いと黒い）
+      3) PDBLoader で .pdb を非同期ロードし、(atomsGeometry, bondsGeometry) を受け取る
+      4) atomsGeometry.vertices を走査して「原子ごとに球Mesh」を作り group に add
+      5) bondsGeometry.vertices を2点ずつ読み「結合ごとにチューブMesh」を作り group に add
+      6) group を scene に追加
+      7) requestAnimationFrame で描画ループを回し、group を回転させて表示し続ける
+
+    旧コードからの主な修正点：
+      - group 変数のスコープ/再宣言の混乱を解消（var group; を外に明示）
+      - DirectionalLight のコンストラクタ引数が誤っている（0.4 は “色” 扱いになり得る）
+        → (color, intensity) を明示して安定化
+      - SpotLight は decay を 0 に統一（ユーザー方針）
+      - 影は renderer.shadowMap.enabled だけでは出ないので、
+        ライト castShadow / 受け側 receiveShadow の基本を追加（最小限）
+      - bonds の表現に TubeGeometry を使うと重いので、
+        CylinderGeometry で2点間を結ぶ方式を用意（高速＆分かりやすい）
+        ※教材的に “2点→方向ベクトル→回転→配置” が見えるのもメリット
+      - SphereGeometry / Materials をループ内で毎回 new しない（無駄が大きい）
+        → 共有してインスタンスだけ増やす
+      - resize 対応を追加
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/loaders/PDBLoader.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // -----------------------------
+      // Stats（FPS表示）
+      // -----------------------------
+      var stats = initStats();
+
+      // -----------------------------
+      // Scene / Camera / Renderer
+      // -----------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(6, 6, 6);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0x000000));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // -----------------------------
+      // ライト（Phong はライトが必須）
+      //
+      // 旧コード：new THREE.DirectionalLight(0.4)
+      //   → 0.4 が “色” として扱われる可能性があり意図がブレる。
+      // 修正： (color, intensity) を明示し、再現性を上げる。
+      // -----------------------------
+      scene.add(new THREE.AmbientLight(0xffffff, 0.25));
+
+      var dir1 = new THREE.DirectionalLight(0xffffff, 0.5);
+      dir1.position.set(-30, 30, -30);
+      scene.add(dir1);
+
+      var dir2 = new THREE.DirectionalLight(0xffffff, 0.5);
+      dir2.position.set(-30, 30, 30);
+      scene.add(dir2);
+
+      var dir3 = new THREE.DirectionalLight(0xffffff, 0.5);
+      dir3.position.set(30, 30, -30);
+      scene.add(dir3);
+
+      // 主光源（影を作るなら castShadow が必要）
+      var spotLight = new THREE.SpotLight(0xffffff, 1.2);
+      spotLight.position.set(30, 30, 30);
+
+      // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルト
+      if ("decay" in spotLight) spotLight.decay = 0;
+
+      spotLight.castShadow = true;
+      if (spotLight.shadow && spotLight.shadow.mapSize) {
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+      }
+      scene.add(spotLight);
+
+      // 影を見せるための床（受け側）
+      var floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(40, 40),
+        new THREE.MeshLambertMaterial({ color: 0x111111 })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = -2;
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // -----------------------------
+      // GUI（教材として：回転ON/OFF、速度、表示方式を切替）
+      // -----------------------------
+      var params = new (function () {
+        this.autoRotate = true;
+        this.rotateSpeed = 0.006;
+
+        // bondsの描画方式：
+        //  - "tube": TubeGeometry（重いが曲線表現が簡単）
+        //  - "cylinder": CylinderGeometry（軽い＆2点間ベクトルで理解しやすい）
+        this.bondStyle = "cylinder";
+
+        // 原子球の大きさ / 結合の太さ
+        this.atomRadius = 0.2;
+        this.bondRadius = 0.04;
+
+        // 読み直し用（aspirin/diamondの切替などに使える）
+        this.model = "aspirin";
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(params, "autoRotate");
+      gui.add(params, "rotateSpeed", 0.0, 0.05);
+      gui.add(params, "atomRadius", 0.05, 0.6).step(0.01).onChange(rebuildIfLoaded);
+      gui.add(params, "bondRadius", 0.01, 0.2).step(0.01).onChange(rebuildIfLoaded);
+      gui.add(params, "bondStyle", ["cylinder", "tube"]).onChange(rebuildIfLoaded);
+      gui.add(params, "model", ["aspirin", "diamond"]).onChange(reload);
+
+      // -----------------------------
+      // PDBモデルの“表示グループ”
+      // - 原子球 Mesh と結合 Mesh をまとめて持つ
+      // - 回転/移動などの操作を group 一発で行える
+      // -----------------------------
+      var group = new THREE.Group();
+      scene.add(group);
+
+      // ロード結果（再描画用に保持）
+      var loadedAtomsGeometry = null;
+      var loadedBondsGeometry = null;
+
+      // -----------------------------
+      // 共有ジオメトリ/マテリアル
+      // - 原子球は全原子で同じ形状（半径だけパラメータ）
+      // - bondsも同様に共有したいが、2点間距離が毎回違うので cylinder は都度 scale する
+      //
+      // 重要：ループ内で new SphereGeometry() を毎回作るのは無駄が大きい。
+      // -----------------------------
+      var sphereGeom = null;
+
+      function rebuildSharedGeometries() {
+        if (sphereGeom) sphereGeom.dispose();
+        sphereGeom = new THREE.SphereGeometry(params.atomRadius, 16, 16);
+      }
+      rebuildSharedGeometries();
+
+      // bondsの共有材質（色固定）
+      var bondMat = new THREE.MeshPhongMaterial({ color: 0xcccccc });
+
+      // -----------------------------
+      // PDBロード（非同期）
+      // PDBLoader.load(url, onLoad(atomsGeom, bondsGeom), onProgress, onError)
+      //
+      // atomsGeom:
+      //   - vertices: 原子の位置配列（Vector3）
+      //   - colors:   原子ごとの色（Color）配列（PDBLoaderが元素等から付与する想定）
+      //
+      // bondsGeom:
+      //   - vertices: 結合の端点が [a0, b0, a1, b1, ...] のように並ぶ（2点で1本）
+      // -----------------------------
+      var loader = new THREE.PDBLoader();
+
+      function getPdbPath() {
+        if (params.model === "diamond") return "../assets/models/diamond.pdb";
+        return "../assets/models/aspirin.pdb";
+      }
+
+      function reload() {
+        // 既存表示をクリア
+        clearGroup(group);
+
+        loadedAtomsGeometry = null;
+        loadedBondsGeometry = null;
+
+        // 共有ジオメトリ更新（atomRadiusが変わっている可能性）
+        rebuildSharedGeometries();
+
+        loader.load(
+          getPdbPath(),
+          function (atomsGeom, bondsGeom) {
+            loadedAtomsGeometry = atomsGeom;
+            loadedBondsGeometry = bondsGeom;
+
+            // ロード完了後に “表示用Mesh群” を構築
+            buildMoleculeMeshes(atomsGeom, bondsGeom);
+          },
+          undefined,
+          function (err) {
+            console.error("PDB load failed:", err);
+          }
+        );
+      }
+
+      // 初回ロード
+      reload();
+
+      // -----------------------------
+      // buildMoleculeMeshes：
+      // PDBLoaderが返す “原子点群” と “結合線分群” を
+      // Three.jsの Mesh 群に変換して group に詰める処理。
+      //
+      // ここが “データ → 描画オブジェクト” の変換パイプラインの中心。
+      // -----------------------------
+      function buildMoleculeMeshes(atomsGeom, bondsGeom) {
+        // 既存表示を消す（再構築のため）
+        clearGroup(group);
+
+        // 1) 原子：atomsGeom.vertices を走査して球Meshを作る
+        //    - 色は atomsGeom.colors[i] を使う（元素ごとの色付け想定）
+        var i = 0;
+
+        atomsGeom.vertices.forEach(function (pos) {
+          var atomColor = atomsGeom.colors[i] || new THREE.Color(0xffffff);
+          i++;
+
+          // 原子ごとに色が違うので material は原子ごとに作る（簡易）
+          // ※最適化するなら色ごとに材質をキャッシュする
+          var atomMat = new THREE.MeshPhongMaterial({ color: atomColor });
+
+          var atomMesh = new THREE.Mesh(sphereGeom, atomMat);
+          atomMesh.position.copy(pos);
+          atomMesh.castShadow = true;
+          atomMesh.receiveShadow = true;
+
+          group.add(atomMesh);
+        });
+
+        // 2) 結合：bondsGeom.vertices を 2点ずつ読んで “1本の結合” として描画
+        //    - tube方式：CatmullRomCurve3 + TubeGeometry（実質は直線でも作れる）
+        //    - cylinder方式：2点間を結ぶ円柱を “距離/向き” に合わせて配置（軽い）
+        for (var j = 0; j < bondsGeom.vertices.length; j += 2) {
+          var a = bondsGeom.vertices[j];
+          var b = bondsGeom.vertices[j + 1];
+
+          if (params.bondStyle === "tube") {
+            var path = new THREE.CatmullRomCurve3([a, b]);
+            var tubeGeom = new THREE.TubeGeometry(path, 1, params.bondRadius, 8, false);
+            var tubeMesh = new THREE.Mesh(tubeGeom, bondMat);
+            tubeMesh.castShadow = true;
+            tubeMesh.receiveShadow = true;
+            group.add(tubeMesh);
+          } else {
+            // cylinder方式（推奨）
+            // 2点 a→b を結ぶ円柱を作るには：
+            //   - 中点に配置
+            //   - 長さ = |b-a|
+            //   - 円柱のY軸を (b-a) 方向へ回転させる
+            var cyl = createCylinderBetweenPoints(a, b, params.bondRadius, bondMat);
+            cyl.castShadow = true;
+            cyl.receiveShadow = true;
+            group.add(cyl);
+          }
+        }
+
+        // 3) 中心合わせ（回転が自然になる）
+        // レガシー環境では Box3.getCenter が無い場合があるので互換対応する。
+        var box = new THREE.Box3().setFromObject(group);
+        var center = getBoxCenterCompat(box);
+        group.position.sub(center);
+
+        // 4) スケール感の調整（モデルによっては大きさが違うので必要ならここで）
+        // group.scale.set(1, 1, 1);
+
+        // 5) カメラが近すぎ/遠すぎなら調整（簡易に少し引く）
+        // ※本格的には box サイズから最適距離を計算すると良い
+        camera.lookAt(new THREE.Vector3(0, 0, 0));
+      }
+
+      // -----------------------------
+      // createCylinderBetweenPoints：
+      // 2点 a, b を結ぶ円柱Meshを生成する。
+      //
+      // アルゴリズム：
+      //   1) dir = (b-a) を計算
+      //   2) length = |dir|
+      //   3) 中点 mid = (a+b)/2 に配置
+      //   4) CylinderGeometry は “Y軸方向に伸びた柱” なので、
+      //      Y軸(0,1,0) を dir方向へ回す回転（クォータニオン）を作って適用
+      //
+      // 教材的に「2点間線分の可視化」は頻出なので、ここを理解すると応用が効く。
+      // -----------------------------
+      function createCylinderBetweenPoints(a, b, radius, material) {
+        var dir = new THREE.Vector3().subVectors(b, a);
+        var len = dir.length();
+
+        // 退避：同一点が来た場合は長さ0になるので何もしない（安全策）
+        if (len <= 1e-8) {
+          var dummy = new THREE.Mesh(new THREE.SphereGeometry(radius, 8, 8), material);
+          dummy.position.copy(a);
+          return dummy;
+        }
+
+        // CylinderGeometry は高さ=1で作って、あとで scale.y で長さ合わせすると軽い
+        // ※ 旧Three.jsだと CylinderGeometry の引数順は (rTop, rBottom, height, radialSegments)
+        var geom = new THREE.CylinderGeometry(radius, radius, 1, 8, 1, false);
+        var mesh = new THREE.Mesh(geom, material);
+
+        // 中点
+        var mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
+        mesh.position.copy(mid);
+
+        // 長さ合わせ（高さ=1 → len にしたい）
+        mesh.scale.set(1, len, 1);
+
+        // 回転：Y軸をdir方向へ
+        var yAxis = new THREE.Vector3(0, 1, 0);
+        var quat = new THREE.Quaternion().setFromUnitVectors(yAxis, dir.clone().normalize());
+        mesh.quaternion.copy(quat);
+
+        return mesh;
+      }
+
+      // -----------------------------
+      // Box3.getCenter 互換
+      // 古いThree.jsでは getCenter が無い場合がある。
+      // その場合は (min+max)/2 で中心を作る。
+      // -----------------------------
+      function getBoxCenterCompat(box) {
+        var center = new THREE.Vector3();
+        if (typeof box.getCenter === "function") {
+          box.getCenter(center);
+        } else {
+          center.addVectors(box.min, box.max).multiplyScalar(0.5);
+        }
+        return center;
+      }
+
+      // -----------------------------
+      // group内の子を安全にクリアする
+      // - group.remove(child) だけだと GPU リソースが残る場合がある
+      // - レガシーコードでも “最低限の dispose” を習慣化しておくと事故が減る
+      // -----------------------------
+      function clearGroup(g) {
+        if (!g) return;
+
+        while (g.children.length > 0) {
+          var child = g.children[0];
+          g.remove(child);
+
+          // Mesh の場合、geometry/material を破棄
+          if (child.geometry && typeof child.geometry.dispose === "function") {
+            child.geometry.dispose();
+          }
+          if (child.material) {
+            if (Array.isArray(child.material)) {
+              child.material.forEach(function (m) {
+                if (m && typeof m.dispose === "function") m.dispose();
+              });
+            } else if (typeof child.material.dispose === "function") {
+              child.material.dispose();
+            }
+          }
+        }
+      }
+
+      // GUI変更時に、ロード済みなら再構築（重いので“毎フレーム”はやらない）
+      function rebuildIfLoaded() {
+        if (!loadedAtomsGeometry || !loadedBondsGeometry) return;
+
+        // atomRadius 変更に合わせて球ジオメトリ更新
+        rebuildSharedGeometries();
+
+        buildMoleculeMeshes(loadedAtomsGeometry, loadedBondsGeometry);
+      }
+
+      // -----------------------------
+      // 描画ループ（render loop）
+      // -----------------------------
+      function render() {
+        stats.update();
+
+        if (group && params.autoRotate) {
+          group.rotation.y += params.rotateSpeed;
+          group.rotation.x += params.rotateSpeed;
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // -----------------------------
+      // resize対応
+      // -----------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // -----------------------------
+      // Stats 初期化
+      // -----------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
