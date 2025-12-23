@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 08.11 - Load AWD model (legacy / r78互換寄り)</title>
+
+  <!--
+    いま出ているエラーの理解
+
+    1) content.js:1 Uncaught (in promise) The message port closed...
+       これは（ほぼ確実に）Chrome拡張（React DevTools / 何かの拡張 / 通信系拡張）が
+       ページに注入している content script 側の警告で、あなたの Three.js コード本体とは無関係。
+       “このページのJSが壊れている” という意味ではないので、基本は無視でOK。
+
+    2) Uncaught TypeError: box.getCenter is not a function
+       あなたの three.js が “r78” のように古い版で、Box3.getCenter() がまだ存在しないため。
+       （新しい版では box.getCenter(target) があるが、古い版は box.center() だったり、そもそも無い）
+       → 対策：Box3の中心を求める互換関数を自前で用意する。
+          center = (min + max) / 2 を計算すればどの版でも成立する。
+
+    目的：
+      - 旧Three.js(グローバルTHREE) + AWDLoader + OrbitControls で
+        AWDモデル（PolarBear.awd）を読み込み、表示・操作するサンプルを “r78系でも落ちにくい形” に修正する。
+      - 「ロード → 下処理（material/影/中心合わせ）→ sceneへ追加 → 毎フレーム描画」の流れをコメントで明確化。
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/loaders/AWDLoader.js"></script>
+  <script type="text/javascript" src="../libs/controls/OrbitControls.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    // ------------------------------------------------------------
+    // 全体アルゴリズム（このサンプルのコア）
+    //
+    // 1) Scene / Camera / Renderer を初期化
+    // 2) OrbitControls をセット（視点操作）
+    // 3) ライトを配置（Lambert系はライト必須）
+    // 4) AWDLoader.load で .awd を非同期ロード
+    //    - 読み込み完了 callback で Object3D(model) を受け取る
+    //    - model.traverse で子Meshを巡回し、material/影/法線などの調整
+    //    - modelを中心合わせ＆床合わせして scene.add(model)
+    // 5) requestAnimationFrame で render loop を回す
+    //    - controls.update()
+    //    - modelを回転（任意）
+    //    - renderer.render(scene, camera)
+    // ------------------------------------------------------------
+
+    function init() {
+      // -----------------------------
+      // Stats（FPS表示）
+      // -----------------------------
+      var stats = initStats();
+
+      // -----------------------------
+      // Scene / Camera / Renderer
+      // -----------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0x000000));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // 影を使う場合のスイッチ（影の出力にはライトcastShadowとメッシュreceiveShadow等も必要）
+      renderer.shadowMap.enabled = true;
+
+      camera.position.set(30, 30, 30);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // -----------------------------
+      // OrbitControls（旧版は (camera, domElement)）
+      // enableDamping は古い版だと無いことがあるのでガードする
+      // -----------------------------
+      var orbit = new THREE.OrbitControls(camera, renderer.domElement);
+      if ("enableDamping" in orbit) orbit.enableDamping = true;
+      if ("dampingFactor" in orbit) orbit.dampingFactor = 0.08;
+
+      // -----------------------------
+      // ライト（LambertMaterial用）
+      // -----------------------------
+      var dir1 = new THREE.DirectionalLight(0xffffff, 0.6);
+      dir1.position.set(-30, 30, -30);
+      scene.add(dir1);
+
+      var dir2 = new THREE.DirectionalLight(0xffffff, 0.6);
+      dir2.position.set(-30, 30, 30);
+      scene.add(dir2);
+
+      var dir3 = new THREE.DirectionalLight(0xffffff, 0.6);
+      dir3.position.set(30, 30, -30);
+      scene.add(dir3);
+
+      // 影用のスポット（古いthreeでは decay が無いので触らない/ガード）
+      var spotLight = new THREE.SpotLight(0xffffff, 1.2);
+      spotLight.position.set(30, 30, 30);
+      spotLight.castShadow = true;
+      if (spotLight.shadow && spotLight.shadow.mapSize) {
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+      }
+      // ユーザー方針：SpotLight/PointLight の decay は 0（存在する場合のみ）
+      if ("decay" in spotLight) spotLight.decay = 0;
+      scene.add(spotLight);
+
+      // 床（影を“受ける”対象）
+      var floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(200, 200),
+        new THREE.MeshLambertMaterial({ color: 0x111111 })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = 0;
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // -----------------------------
+      // dat.GUI（回転ON/OFFと速度）
+      // -----------------------------
+      var controls = new (function () {
+        this.autoRotate = true;
+        this.rotateSpeed = 0.006;
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(controls, "autoRotate");
+      gui.add(controls, "rotateSpeed", 0.0, 0.05);
+
+      // -----------------------------
+      // Box3の中心を求める “互換関数”
+      // r78 だと box.getCenter が無いので自前で (min+max)/2 を計算する
+      // -----------------------------
+      function getBoxCenterCompat(box, target) {
+        target = target || new THREE.Vector3();
+
+        // 新しめのthree.js
+        if (typeof box.getCenter === "function") {
+          return box.getCenter(target);
+        }
+
+        // 一部の古いthree.js
+        if (typeof box.center === "function") {
+          // box.center() が target を返す実装もあるが、無い場合に備える
+          var c = box.center();
+          if (c && c.isVector3) {
+            target.copy(c);
+            return target;
+          }
+        }
+
+        // 最低保証：中心 = (min + max) / 2
+        target.addVectors(box.min, box.max).multiplyScalar(0.5);
+        return target;
+      }
+
+      // -----------------------------
+      // モデル参照（ロード後に代入）
+      // -----------------------------
+      var modelRoot = null;
+
+      // -----------------------------
+      // AWDロード
+      // -----------------------------
+      var loader = new THREE.AWDLoader();
+      loader.load(
+        "../assets/models/awd/PolarBear.awd",
+        function (model) {
+          // 1) ロード完了：Object3Dが来る
+          modelRoot = model;
+
+          // 2) 子Meshを巡回して“見える状態”に整える
+          modelRoot.traverse(function (child) {
+            if (child instanceof THREE.Mesh) {
+              // Lambertに差し替え（ライトで陰影が出る）
+              child.material = new THREE.MeshLambertMaterial({ color: 0xaaaaaa });
+
+              // 影設定（ライトcastShadow + メッシュcast/receive + renderer.shadowMap.enabled が揃って成立）
+              child.castShadow = true;
+              child.receiveShadow = true;
+
+              // 法線（古いGeometryなら計算可能）
+              if (child.geometry) {
+                if (typeof child.geometry.computeFaceNormals === "function") {
+                  child.geometry.computeFaceNormals();
+                }
+                if (typeof child.geometry.computeVertexNormals === "function") {
+                  child.geometry.computeVertexNormals();
+                }
+              }
+            }
+          });
+
+          // 3) スケール調整（AWDは単位がまちまちなので“まず見える大きさ”に合わせる）
+          modelRoot.scale.set(0.1, 0.1, 0.1);
+
+          // 4) 中心合わせ（回転が自然になる）
+          // Box3.setFromObject が無い版はかなり古いが、一応チェックしてフォールバックする
+          var box = new THREE.Box3();
+          if (typeof box.setFromObject === "function") {
+            box.setFromObject(modelRoot);
+          } else {
+            // setFromObjectが無い場合、近いことをするには traverse で頂点走査が必要（重い）
+            // ここでは簡易にスキップし、表示だけ優先する
+            console.warn("Box3.setFromObject がありません（three.jsが非常に古い可能性）。中心合わせをスキップします。");
+          }
+
+          if (box && box.min && box.max) {
+            var center = getBoxCenterCompat(box, new THREE.Vector3());
+            modelRoot.position.sub(center);
+
+            // 5) 床合わせ（min.y が 0 になるように下げる）
+            // center移動後にもう一度 box を作り直すのが厳密だが、ここでは軽量に再計算する
+            if (typeof box.setFromObject === "function") {
+              box.setFromObject(modelRoot);
+              modelRoot.position.y -= box.min.y;
+            }
+          }
+
+          // 6) シーンへ追加
+          scene.add(modelRoot);
+        },
+        function (progressEvent) {
+          // 読み込み進捗（必要ならconsole.log）
+          // console.log(progressEvent);
+        },
+        function (err) {
+          console.error("AWD load failed:", err);
+        }
+      );
+
+      // -----------------------------
+      // Render loop
+      // -----------------------------
+      function render() {
+        stats.update();
+
+        // OrbitControls は毎フレーム update
+        orbit.update();
+
+        // モデルがロード済みなら回転
+        if (modelRoot && controls.autoRotate) {
+          modelRoot.rotation.y += controls.rotateSpeed;
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // -----------------------------
+      // resize対応
+      // -----------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // -----------------------------
+      // Stats 初期化
+      // -----------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0);
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>

@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 08.08 - Load COLLADA(.dae) model（現行Three.js / ES Modules版）</title>
+
+  <!--
+    目的：
+      旧サンプル（../libs/three.js + ColladaLoader.js + stats.js + dat.gui）を
+      現行Three.js（ES Modules）で動く形に直し、ロード処理のアルゴリズムが理解できるように
+      コメント多めで整理する。
+
+    ■ このサンプルの全体アルゴリズム（何をしているか）
+      1) Scene / Camera / Renderer を初期化する（3D描画の土台）
+      2) ライトを置く（モデルが見えるようにする）
+      3) ColladaLoader で .dae をロードする（非同期）
+      4) ロード完了コールバックで
+         - result.scene（COLLADA全体のルート）を取得し
+         - 影設定 / スケール / 位置合わせ（必要なら）を行い
+         - シーンに add する
+      5) requestAnimationFrame で描画ループを回し続ける
+
+    ■ 旧コードの問題点（修正ポイント）
+      - 旧 ColladaLoader はグローバル THREE に依存する（現行は examples/jsm の ES Modules）
+      - result.scene.children[0].children[0] のような “深い決め打ち” は壊れやすい
+        → result.scene を丸ごと扱う or traverse で Mesh を拾う
+      - stats.js / dat.gui を使わない前提が増えている
+        → HUD（簡易FPS）とエラー表示で代替する
+      - shadowMap はライト側とメッシュ側の設定が揃って初めて効く
+        → castShadow/receiveShadow を traverse で一括設定
+
+    ■ 実行時の注意
+      - ../assets/models/dae/Truck_dae.dae は HTTP サーバで配信すること（file:// 直開きだとCORS等で失敗しやすい）
+  -->
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #cccccc;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+    }
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+      user-select: none;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
+
+    // -----------------------------
+    // 黒画面で沈黙しないためのエラー表示
+    // -----------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e?.error?.stack || e?.message || e));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e));
+    });
+
+    // -----------------------------
+    // Three.js 基本セットアップ（Scene / Camera / Renderer）
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xcccccc);
+
+    // カメラ：旧コードの「(150,150,150) から (0,20,0) を見る」を踏襲
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(150, 150, 150);
+    camera.lookAt(0, 20, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+    // 影：有効化するだけでは不十分で、
+    //  - ライト側 castShadow=true
+    //  - メッシュ側 castShadow/receiveShadow=true
+    // が揃って初めて影が出る
+    renderer.shadowMap.enabled = true;
+
+    document.body.appendChild(renderer.domElement);
+
+    // 操作用（教材的に回り込める方が分かりやすい）
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.target.set(0, 20, 0);
+    orbit.update();
+
+    // 空間把握用：グリッドと簡単な床
+    const grid = new THREE.GridHelper(400, 40);
+    grid.material.opacity = 0.35;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(600, 600),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0, metalness: 0.0 })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // -----------------------------
+    // ライト（見える＆影が分かるように）
+    // -----------------------------
+    // 環境光：真っ黒を避ける（陰影が潰れない程度に弱く）
+    const ambient = new THREE.AmbientLight(0xffffff, 0.35);
+    scene.add(ambient);
+
+    // スポットライト：旧コードを踏襲しつつ、影用設定を明示
+    const spot = new THREE.SpotLight(0xffffff, 2.0);
+    spot.position.set(150, 150, 150);
+    spot.castShadow = true;
+
+    // 影の品質（重いので必要最低限）
+    spot.shadow.mapSize.set(1024, 1024);
+    spot.shadow.camera.near = 10;
+    spot.shadow.camera.far = 600;
+
+    scene.add(spot);
+
+    // -----------------------------
+    // COLLADA(.dae) のロード
+    // -----------------------------
+    // 注意：ColladaLoader は “result.scene” にモデル全体が入る。
+    // 旧コードのように children[0].children[0] と決め打つと、
+    // モデル構造が少し違うだけで壊れる。
+    const loader = new ColladaLoader();
+
+    // 読み込んだモデル参照（アニメや dispose に備える）
+    let modelRoot = null;
+
+    // assets を使う要件なので、旧パスをそのまま採用
+    const daePath = "../assets/models/dae/Truck_dae.dae";
+
+    // ロードは非同期：成功/進捗/失敗のコールバックを持つ
+    loader.load(
+      daePath,
+      (result) => {
+        clearError();
+
+        // result.scene が COLLADA のルート（Object3D）
+        modelRoot = result.scene;
+
+        // 旧コードでは clone していたが、このサンプルでは「読み込んだものをそのまま表示」で十分
+        // 複数回ロードして並べたい場合などは clone が必要になる。
+        // modelRoot = result.scene.clone(true);
+
+        // スケール：旧コードは mesh.scale.set(4,4,4) だったので踏襲
+        modelRoot.scale.set(4, 4, 4);
+
+        // 位置調整：床に置きたい場合は bbox を使うのが定石
+        // （COLLADAは原点やY軸の基準がモデルによりバラつく）
+        const box = new THREE.Box3().setFromObject(modelRoot);
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        box.getSize(size);
+        box.getCenter(center);
+
+        // 中心を原点近くへ（OrbitControlsの回転中心と揃う）
+        modelRoot.position.sub(center);
+
+        // 接地（床Y=0に置く）：bbox.min.y が 0 になるように上へずらす
+        const box2 = new THREE.Box3().setFromObject(modelRoot);
+        modelRoot.position.y -= box2.min.y;
+
+        // 影設定：モデル配下の Mesh を traverse して一括設定
+        modelRoot.traverse((node) => {
+          if (node.isMesh) {
+            node.castShadow = true;
+            node.receiveShadow = true;
+
+            // COLLADA 由来の material が古い/想定外のときもあるので、
+            // 表示が変ならここで material.side や透明設定を調整する。
+            // 例：
+            // if (node.material) node.material.side = THREE.DoubleSide;
+          }
+        });
+
+        scene.add(modelRoot);
+
+        // デバッグ：必要なら構造を見る（教材には便利）
+        // console.log("Collada loaded:", result);
+      },
+      (progressEvent) => {
+        // 進捗表示（bytes合計が取れない場合もあるのでガード）
+        // progressEvent.loaded / progressEvent.total が 0 のことがある
+        const loaded = progressEvent?.loaded ?? 0;
+        const total = progressEvent?.total ?? 0;
+        if (total > 0) {
+          const pct = (loaded / total) * 100;
+          hud.textContent = "Loading... " + pct.toFixed(1) + "%";
+        } else {
+          hud.textContent = "Loading... " + loaded + " bytes";
+        }
+      },
+      (err) => {
+        showError(
+          "COLLADA load failed:\n" +
+          "path: " + daePath + "\n\n" +
+          (err?.stack || err?.message || JSON.stringify(err, null, 2) || err)
+        );
+      }
+    );
+
+    // -----------------------------
+    // HUD（簡易FPS：stats.js 代替）
+    // -----------------------------
+    const hud = document.getElementById("hud");
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    // -----------------------------
+    // アニメーションループ
+    // -----------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPSは1秒に1回更新
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "model: " + (modelRoot ? "loaded" : "loading...") + "\n" +
+          "shadows: " + (renderer.shadowMap.enabled ? "on" : "off");
+      }
+
+      // 軽く回転させると「ロードできてる」確認がしやすい（教材向け）
+      if (modelRoot) {
+        modelRoot.rotation.y += 0.003;
+      }
+
+      orbit.update();
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------------
+    // リサイズ対応
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // -----------------------------
+    // 後始末（ページ離脱時）
+    // ※ assets 由来のテクスチャ等がある場合、dispose は地味に重要
+    // -----------------------------
+    function disposeObject3D(obj) {
+      if (!obj) return;
+      obj.traverse((node) => {
+        if (node.isMesh) {
+          if (node.geometry) node.geometry.dispose();
+          if (node.material) {
+            if (Array.isArray(node.material)) node.material.forEach(m => m.dispose());
+            else node.material.dispose();
+          }
+        }
+      });
+    }
+    window.addEventListener("beforeunload", () => {
+      if (modelRoot) disposeObject3D(modelRoot);
+      floor.geometry.dispose();
+      floor.material.dispose();
+      renderer.dispose();
+    });
+
+    // 起動
+    animate();
+  </script>
+</body>
+</html>

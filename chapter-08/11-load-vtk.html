@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 08.11 - Load VTK model（現行Three.js / ES Modules版・詳細コメント付き）</title>
+
+  <!--
+    目的：
+      旧サンプル（../libs/three.js + VTKLoader.js + stats.js + dat.gui）を
+      現行Three.js（ES Modules）で動く形に修正し、
+      「VTK（.vtk）モデルをロードしてメッシュ化し、回転表示する」流れを
+      アルゴリズム中心に理解できるように整理する。
+
+    ■ 全体アルゴリズム（この教材のコア）
+      1) Scene / Camera / Renderer を初期化して描画の土台を作る
+      2) ライトを置く（Lambert/Standard系はライトがないと真っ黒）
+      3) VTKLoader で .vtk を非同期ロードして geometry（多くは BufferGeometry）を得る
+      4) geometry に法線を用意する（無い場合 computeVertexNormals）→ 光が綺麗に当たる
+      5) geometry + material から Mesh を作り、シーンに追加する
+      6) 必要なら「中心合わせ」「床合わせ」「スケール調整」を行い見やすくする
+      7) requestAnimationFrame で描画ループを回し、モデルを回転させて表示する
+      8) （重要）読み直し/差し替え時は dispose してGPUリソースを解放する
+
+    ■ 旧コードからの主な修正点
+      - ../libs/three.js 依存を廃止し、importmap + ES Modules に変更
+      - VTKLoader は examples/jsm 側を使用
+      - stats.js/dat.gui を外し、HUD（簡易FPS）+ エラー表示を追加
+      - group という変数に Object3D と Mesh を混在させて再代入していた → model に統一
+      - BufferGeometry 前提の法線計算に修正（Geometry.computeFaceNormals は現行だと無い）
+      - ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルトにする
+      - 中心合わせ＆床合わせを入れて、モデルが画面外に飛ぶのを防ぐ
+  -->
+
+  <!-- importmap：three と addons の参照先 -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+      user-select: none;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { VTKLoader } from "three/addons/loaders/VTKLoader.js";
+
+    // -----------------------------
+    // エラー表示（黒画面で沈黙しない）
+    // -----------------------------
+    const hud = document.getElementById("hud");
+    const errBox = document.getElementById("err");
+
+    function showError(msg) { errBox.style.display = "block"; errBox.textContent = String(msg); }
+    function clearError() { errBox.style.display = "none"; errBox.textContent = ""; }
+
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e?.error?.stack || e?.message || e));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e));
+    });
+
+    // -----------------------------
+    // Scene / Camera / Renderer（描画の土台）
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    // 旧コードは camera=(10,10,10) と近かったが、モデルサイズ次第で近すぎる
+    // → OrbitControls で調整しやすいように少し引いて開始
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 5000);
+    camera.position.set(60, 40, 60);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // 目視しやすいように視点操作を提供
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.target.set(0, 0, 0);
+    orbit.update();
+
+    // 空間把握のためのグリッド
+    const grid = new THREE.GridHelper(300, 30);
+    grid.material.opacity = 0.25;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    // -----------------------------
+    // ライト（Lambert はライト必須）
+    // -----------------------------
+    scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+    // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルト
+    const spot = new THREE.SpotLight(0xffffff, 1.6);
+    spot.position.set(120, 120, 120);
+    spot.decay = 0;     // ★方針適用
+    spot.distance = 0;  // decay=0 とセットで “距離減衰なし”
+    spot.castShadow = true;
+    spot.shadow.mapSize.set(1024, 1024);
+    scene.add(spot);
+
+    // 影が分かる床（VTKモデルが“浮いてる/沈んでる”を判断しやすい）
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(500, 500),
+      new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 1.0, metalness: 0.0 })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // -----------------------------
+    // モデル参照（旧コードの group を整理）
+    // -----------------------------
+    let model = null;
+
+    // GPUメモリ解放（読み直し・差し替え時に重要）
+    function disposeMesh(mesh) {
+      if (!mesh) return;
+      if (mesh.geometry) mesh.geometry.dispose();
+      if (mesh.material) {
+        if (Array.isArray(mesh.material)) mesh.material.forEach(m => m.dispose());
+        else mesh.material.dispose();
+      }
+    }
+
+    // -----------------------------
+    // VTK ロード（assets を使用）
+    // -----------------------------
+    const vtkPath = "../assets/models/moai_fixed.vtk";
+
+    function loadVTK() {
+      clearError();
+      hud.textContent = "Loading VTK...\n" + vtkPath;
+
+      const loader = new VTKLoader();
+
+      loader.load(
+        vtkPath,
+        (geometry) => {
+          // ここが「ファイル → geometry → mesh → scene」の変換点
+          // 旧コードは geometry.computeFaceNormals() を呼んでいたが、
+          // 現行の主流は BufferGeometry で faceNormals は存在しないことが多い。
+          // → computeVertexNormals で光の当たり方を整える。
+          if (geometry?.isBufferGeometry) {
+            // VTKデータに法線がないことがあるので、無い/壊れてそうなら再計算
+            if (!geometry.attributes.normal) {
+              geometry.computeVertexNormals();
+            }
+            // boundingSphere/Box は中心合わせ・カメラ調整に使える
+            geometry.computeBoundingBox();
+            geometry.computeBoundingSphere();
+          } else {
+            // もし古い Geometry が来た場合（環境によってはあり得る）
+            if (geometry.computeVertexNormals) geometry.computeVertexNormals();
+            if (geometry.computeFaceNormals) geometry.computeFaceNormals();
+          }
+
+          // 旧サンプルは LambertMaterial
+          const material = new THREE.MeshLambertMaterial({ color: 0xaaffaa });
+
+          // 既にモデルがあるなら差し替え（dispose込み）
+          if (model) {
+            scene.remove(model);
+            disposeMesh(model);
+            model = null;
+          }
+
+          model = new THREE.Mesh(geometry, material);
+          model.name = "vtk_model";
+          model.castShadow = true;
+          model.receiveShadow = true;
+
+          // スケール：旧コードは 9
+          // VTKモデルの単位はまちまちなので、まず踏襲して必要に応じて調整する
+          model.scale.set(9, 9, 9);
+
+          // -----------------------------
+          // “中心合わせ”と“床合わせ”
+          // - VTKは座標原点からずれていることが多い
+          // - そのままだと回転軸が不自然、また床を突き抜ける
+          // -----------------------------
+          const box = new THREE.Box3().setFromObject(model);
+          const center = new THREE.Vector3();
+          box.getCenter(center);
+          model.position.sub(center); // 中心を原点へ寄せる
+
+          const box2 = new THREE.Box3().setFromObject(model);
+          model.position.y -= box2.min.y; // Y最小が0になるよう接地
+
+          scene.add(model);
+
+          hud.textContent = "Loaded.\n" + vtkPath;
+        },
+        (progressEvent) => {
+          const loaded = progressEvent?.loaded ?? 0;
+          const total = progressEvent?.total ?? 0;
+          if (total > 0) {
+            hud.textContent = "Loading... " + ((loaded / total) * 100).toFixed(1) + "%\n" + vtkPath;
+          } else {
+            hud.textContent = "Loading... " + loaded + " bytes\n" + vtkPath;
+          }
+        },
+        (err) => {
+          showError(
+            "VTK load failed:\n" +
+            "path: " + vtkPath + "\n\n" +
+            (err?.stack || err?.message || JSON.stringify(err, null, 2) || err)
+          );
+        }
+      );
+    }
+
+    // -----------------------------
+    // アニメーションループ（旧 render 相当）
+    // -----------------------------
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPSを1秒ごとに更新（stats.js代替）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        // ロード中は loadVTK の progress 表示があるので、
+        // “ロード完了後”だけ FPS HUD を上書きする
+        if (!hud.textContent.startsWith("Loading...")) {
+          hud.textContent =
+            "FPS: " + fps.toFixed(1) + "\n" +
+            "model: " + (model ? "loaded" : "loading...") + "\n" +
+            "file: " + vtkPath;
+        }
+      }
+
+      // モデルがあれば回転（動きがあるとロード成功が分かりやすい）
+      if (model) {
+        model.rotation.y += 0.006;
+      }
+
+      orbit.update();
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------------
+    // リサイズ対応
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // -----------------------------
+    // 後始末（念のため）
+    // -----------------------------
+    window.addEventListener("beforeunload", () => {
+      disposeMesh(model);
+      floor.geometry.dispose();
+      floor.material.dispose();
+      renderer.dispose();
+    });
+
+    // 起動
+    loadVTK();
+    animate();
+  </script>
+</body>
+</html>

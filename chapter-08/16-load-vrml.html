@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 08.16 - Load VRML model (legacy / VRMLLoader)</title>
+
+  <!--
+    目的：
+      - 旧Three.js（グローバルTHREE） + VRMLLoader + OrbitControls で
+        VRML（*.wrl）モデルを読み込み、表示・操作する。
+      - 「非同期ロード → 下処理（材質/影/中心合わせ/床合わせ）→ シーン投入 → 毎フレーム描画」
+        という“モデル表示の典型アルゴリズム”をコメント中心で分解して理解する。
+
+    このサンプルの全体アルゴリズム（重要）
+      1) Scene / Camera / Renderer を初期化（描画の土台）
+      2) OrbitControls を初期化（視点操作）
+      3) ライト配置（Lambert/Phong/Standard はライト無しだと真っ黒）
+      4) VRMLLoader.load(url, onLoad, onProgress, onError) で非同期ロード
+         - onLoad(model) で Object3D（階層）を受け取る
+         - traverse() で子Meshを巡回し、必要なら material / shadow / normals を調整
+         - スケール調整＆中心合わせ＆床合わせ（見やすさと回転軸の自然さ）
+         - scene.add(model)
+      5) requestAnimationFrame で render loop
+         - controls.update()
+         - （任意）modelを回転
+         - renderer.render(scene, camera)
+
+    旧コードの問題点（修正ポイント）
+      - OrbitControls の生成が camera だけ：旧実装では (camera, domElement) が必要なことがある
+      - DirectionalLight(0.4) は引数が “色” 扱いの世代が多く、意図した強度になりにくい
+        → color(0xffffff) + intensity(0.4) を明示して安定させる
+      - group 変数が二重宣言＆回転対象が不明（実際は model を回したい）
+        → modelRoot に統一し、回転も modelRoot に適用
+      - shadowMap.enabled だけでは影が出ない（light.castShadow / mesh.castShadow / floor.receiveShadow が必要）
+      - Box3.getCenter が無い世代がある（前のエラーと同じ）
+        → getCenter 互換関数で安全に中心合わせする
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/loaders/VRMLLoader.js"></script>
+
+  <script type="text/javascript" src="../libs/controls/OrbitControls.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // -----------------------------
+      // Stats（FPS表示）
+      // -----------------------------
+      var stats = initStats();
+
+      // -----------------------------
+      // Scene / Camera / Renderer
+      // -----------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+      camera.position.set(30, 30, 30);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0x000000));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // 影を使う（ただしライトcastShadow＋床receiveShadow等も必要）
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // -----------------------------
+      // OrbitControls（旧版：camera + domElement）
+      // -----------------------------
+      var orbit = new THREE.OrbitControls(camera, renderer.domElement);
+      if ("enableDamping" in orbit) orbit.enableDamping = true;
+      if ("dampingFactor" in orbit) orbit.dampingFactor = 0.08;
+
+      // -----------------------------
+      // ライト
+      //
+      // 元コードの DirectionalLight(0.4) は “0.4=色” と解釈される世代が多く、意図が崩れがち。
+      // → color と intensity を明示して、どのthree.js世代でもだいたい同じ見え方に寄せる。
+      // -----------------------------
+      var dir1 = new THREE.DirectionalLight(0xffffff, 0.4);
+      dir1.position.set(-30, 30, -30);
+      scene.add(dir1);
+
+      var dir2 = new THREE.DirectionalLight(0xffffff, 0.4);
+      dir2.position.set(-30, 30, 30);
+      scene.add(dir2);
+
+      var dir3 = new THREE.DirectionalLight(0xffffff, 0.4);
+      dir3.position.set(30, 30, -30);
+      scene.add(dir3);
+
+      // 影用の主光源（SpotLight）
+      var spotLight = new THREE.SpotLight(0xffffff, 1.2);
+      spotLight.position.set(30, 30, 30);
+
+      // 影をON（重いならfalseにする）
+      spotLight.castShadow = true;
+
+      // 影の品質（重いなら下げる）
+      if (spotLight.shadow && spotLight.shadow.mapSize) {
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+      }
+
+      // ユーザー方針：SpotLight/PointLight の decay は 0（存在する場合のみ）
+      if ("decay" in spotLight) spotLight.decay = 0;
+
+      scene.add(spotLight);
+
+      // 影を“受ける”床：モデルの設置感が出て理解が進む
+      var floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(200, 200),
+        new THREE.MeshLambertMaterial({ color: 0x111111 })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // -----------------------------
+      // dat.GUI：回転ON/OFFと速度、Lambert強制
+      // -----------------------------
+      var controls = new (function () {
+        this.autoRotate = true;
+        this.rotateSpeed = 0.006;
+
+        // VRML内の材質を尊重するか、Lambertで統一するか
+        // 教材として “ライトが効いている” のを見せたい場合は true が分かりやすい
+        this.forceLambert = false;
+
+        // 影を使うか（重い時にOFF）
+        this.enableShadow = true;
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(controls, "autoRotate");
+      gui.add(controls, "rotateSpeed", 0.0, 0.05);
+      gui.add(controls, "forceLambert");
+      gui.add(controls, "enableShadow").onChange(function (v) {
+        renderer.shadowMap.enabled = !!v;
+        spotLight.castShadow = !!v;
+      });
+
+      // -----------------------------
+      // Box3中心計算の互換関数
+      // - three.js世代によって getCenter が無い / center() しか無い / どちらも無い が起きる
+      // -----------------------------
+      function getBoxCenterCompat(box, target) {
+        target = target || new THREE.Vector3();
+
+        if (typeof box.getCenter === "function") {
+          return box.getCenter(target);
+        }
+        if (typeof box.center === "function") {
+          var c = box.center();
+          if (c && c.isVector3) {
+            target.copy(c);
+            return target;
+          }
+        }
+        // 最低限： (min + max) / 2
+        target.addVectors(box.min, box.max).multiplyScalar(0.5);
+        return target;
+      }
+
+      // -----------------------------
+      // ロードしたモデル参照（回転対象）
+      // “group” ではなく modelRoot で統一する（混乱防止）
+      // -----------------------------
+      var modelRoot = null;
+
+      // -----------------------------
+      // VRMLロード（このサンプルのコア）
+      // -----------------------------
+      var loader = new THREE.VRMLLoader();
+      loader.load(
+        "../assets/models/vrml/tree.wrl",
+        function (model) {
+          // 1) ロード完了：Object3D(階層)を受け取る
+          modelRoot = model;
+
+          // 2) traverse で子Meshを調整する
+          modelRoot.traverse(function (child) {
+            if (child instanceof THREE.Mesh) {
+              // 影の設定（影を使うなら）
+              child.castShadow = true;
+              child.receiveShadow = true;
+
+              // 材質を統一したい場合（VRML内の材質は暗く見えることがある）
+              if (controls.forceLambert) {
+                child.material = new THREE.MeshLambertMaterial({ color: 0xaaffaa });
+              }
+
+              // 法線の再計算（Geometry世代なら可能）
+              if (child.geometry) {
+                if (typeof child.geometry.computeFaceNormals === "function") {
+                  child.geometry.computeFaceNormals();
+                }
+                if (typeof child.geometry.computeVertexNormals === "function") {
+                  child.geometry.computeVertexNormals();
+                }
+              }
+            }
+          });
+
+          // 3) スケール調整（元コード踏襲：VRMLは単位がバラバラなのでまず見えること優先）
+          modelRoot.scale.set(10, 10, 10);
+
+          // 4) 中心合わせ＆床合わせ（見た目と回転軸を自然にする）
+          var box = new THREE.Box3();
+          if (typeof box.setFromObject === "function") {
+            box.setFromObject(modelRoot);
+
+            var center = getBoxCenterCompat(box, new THREE.Vector3());
+            modelRoot.position.sub(center);
+
+            box.setFromObject(modelRoot);
+            modelRoot.position.y -= box.min.y;
+          }
+
+          // 5) シーンへ追加（ここで初めて画面に出る）
+          scene.add(modelRoot);
+        },
+        function (progressEvent) {
+          // 必要なら進捗表示
+          // console.log(progressEvent);
+        },
+        function (err) {
+          console.error("VRML load failed:", err);
+        }
+      );
+
+      // -----------------------------
+      // Render loop
+      // -----------------------------
+      function render() {
+        stats.update();
+        orbit.update();
+
+        // ロード済みなら回転
+        if (modelRoot && controls.autoRotate) {
+          modelRoot.rotation.y += controls.rotateSpeed;
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // -----------------------------
+      // resize
+      // -----------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // -----------------------------
+      // Stats初期化
+      // -----------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0);
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>

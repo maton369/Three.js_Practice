@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 08.10 - Load CTM model（ES Modules版 / 旧CTMLoader互換・修正版）</title>
+
+  <!--
+    いま出ているエラー：
+      TypeError: Class constructor Loader cannot be invoked without 'new'
+        at new THREE.CTMLoader (.../CTMLoader.js:13:15)
+
+    これは「旧CTMLoaderが“古いThree.jsの継承スタイル”で書かれている」のが原因です。
+
+    典型的な旧ローダーは、コンストラクタ内でこう書きます：
+      THREE.CTMLoader = function ( manager ) {
+        THREE.Loader.call(this, manager); // ★ここが地雷
+      }
+
+    しかし r120 以降の Three.js は多くの基底クラスが ES6 class 化され、
+    ES6 class は “関数として call/apply で呼び出せない” ため、
+    上の Loader.call(this, ...) が落ちます（あなたのエラーそのもの）。
+
+    ✅ 解決策（現実的に動かす最短ルート）
+      A) CTMLoader を ES6 class へ書き換える（libsの中身改造が必要、重い）
+      B) CTMをglTF等へ変換してGLTFLoaderで読む（資産変換が必要）
+      C) ★Three.js側を「旧CTMLoaderが動く世代」に合わせる（今回これ）
+
+    今回は C) を採用し、
+      - Three.js を “ES6 class 変換が本格化する前” の版に固定
+      - assets（../assets/models/auditt_wheel.ctm）をそのまま使う
+      - 旧CTMスタック（../libs/loaders/ctm/*.js）をそのまま使う
+    で動くようにします。
+
+    ■ このサンプルの全体アルゴリズム（教材のコア）
+      1) Scene / Camera / Renderer を初期化して描画の土台を作る
+      2) ライト・床・グリッドを置いて「形が見える環境」を作る
+      3) 旧CTMデコード基盤（ctm.js / lzma.js）を読み込む
+      4) 旧CTMLoader を読み込み、THREE.CTMLoader を有効化する
+      5) loader.load(ctmPath, onLoad) で .ctm を非同期ロード
+      6) geometry を受け取り Mesh(material) を作って scene に追加
+      7) requestAnimationFrame で描画ループを回し、モデルを回転させる
+      8) （重要）読み直し・差し替え時は dispose でGPUリソース解放
+
+    ■ 追加で直した点
+      - “ESMのTHREEは拡張不可”問題：
+          import * as THREE from "three" の戻り値は module namespace object で拡張不可。
+          旧ローダーは THREE.CTMLoader = ... と拡張するので落ちる。
+        → “拡張可能なコピー”を作って globalThis.THREE に置く。
+      - ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルトにする
+      - stats.js/dat.gui の依存は外し、HUD（簡易FPS）とエラー表示で代替
+  -->
+
+  <!--
+    ★重要：Three.js のバージョンを固定する
+      - r120前後から ES6 class 化が進み、旧ローダーが壊れやすい
+      - 今回は「旧CTMLoaderが動く世代」を狙って古めに固定する
+    ※ もしあなたの CTMLoader.js がさらに古い場合は 0.110.x などへ下げると安定します。
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.119.1/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.119.1/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+      user-select: none;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE_ESM from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    // -----------------------------
+    // エラー表示（黒画面で沈黙しないため）
+    // -----------------------------
+    const hud = document.getElementById("hud");
+    const errBox = document.getElementById("err");
+
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = String(msg);
+    }
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+
+    window.addEventListener("error", (e) => {
+      showError("window.onerror:\n" + (e?.error?.stack || e?.message || e));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e));
+    });
+
+    // -----------------------------
+    // ★互換性の核心：拡張可能な THREE を作る
+    //
+    // ESMの THREE_ESM は module namespace object で拡張不可。
+    // 旧ローダーは THREE.CTMLoader = ... のように生やすので、
+    // mutable なコピーを作って globalThis.THREE に置く。
+    // -----------------------------
+    const THREE = Object.assign({}, THREE_ESM);
+    globalThis.THREE = THREE;
+
+    // -----------------------------
+    // 旧ローダー（Classic script）を順序付きで読み込む
+    //
+    // 読み込み順が重要：
+    //   1) ctm.js   : CTMのデコード基盤（フォーマット処理）
+    //   2) lzma.js  : CTMがLZMA圧縮されている場合の展開
+    //   3) CTMLoader.js : THREE.CTMLoader を定義（これが最後）
+    //
+    // “import()” ではなく <script> 注入にしている理由：
+    //   - 旧スクリプトは module を想定していないことが多い
+    //   - グローバル名前空間（globalThis.THREE）に副作用で定義させたい
+    // -----------------------------
+    const legacyLoadCache = new Map();
+
+    function loadClassicScript(url) {
+      if (legacyLoadCache.has(url)) return legacyLoadCache.get(url);
+
+      const p = new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = url;
+        s.async = true;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error("Failed to load script: " + url));
+        document.head.appendChild(s);
+      });
+
+      legacyLoadCache.set(url, p);
+      return p;
+    }
+
+    async function loadLegacyCTMStack() {
+      await loadClassicScript("../libs/loaders/ctm/ctm.js");
+      await loadClassicScript("../libs/loaders/ctm/lzma.js");
+      await loadClassicScript("../libs/loaders/ctm/CTMLoader.js");
+
+      if (!globalThis.THREE?.CTMLoader) {
+        throw new Error(
+          "CTMLoader が見つかりません。\n" +
+          "確認：../libs/loaders/ctm/CTMLoader.js が THREE.CTMLoader を定義しているか、パスが正しいか。"
+        );
+      }
+    }
+
+    // -----------------------------
+    // Three.js 基本セットアップ（Scene / Camera / Renderer）
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 5000);
+    camera.position.set(80, 60, 80);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // 視点操作（モデルのスケールや中心合わせ確認に必須）
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.target.set(0, 0, 0);
+    orbit.update();
+
+    // 空間把握の目印（グリッド）
+    const grid = new THREE.GridHelper(300, 30);
+    grid.material.opacity = 0.25;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    // -----------------------------
+    // ライト（Lambert/Phong/Standard はライト必須）
+    // -----------------------------
+    scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+    // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルトにする
+    const spot = new THREE.SpotLight(0xffffff, 1.6);
+    spot.position.set(140, 160, 120);
+    spot.decay = 0;     // ★方針適用
+    spot.distance = 0;  // decay=0 とセットで「距離減衰なし」
+    spot.castShadow = true;
+    spot.shadow.mapSize.set(1024, 1024);
+    scene.add(spot);
+
+    // 影が分かる床
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(500, 500),
+      new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 1.0, metalness: 0.0 })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // -----------------------------
+    // CTMモデル（assets を使用）
+    // -----------------------------
+    const ctmPath = "../assets/models/auditt_wheel.ctm";
+    let model = null; // 読み込んだ Mesh 参照（旧コードの group を整理）
+
+    // 読み直しを想定したGPU解放
+    function disposeMesh(mesh) {
+      if (!mesh) return;
+      if (mesh.geometry) mesh.geometry.dispose();
+      if (mesh.material) {
+        if (Array.isArray(mesh.material)) mesh.material.forEach(m => m.dispose());
+        else mesh.material.dispose();
+      }
+    }
+
+    // -----------------------------
+    // CTMロード本体
+    //
+    // アルゴリズム：
+    //  1) 旧CTMスタックを読み込んで THREE.CTMLoader を有効化
+    //  2) new THREE.CTMLoader() を作る
+    //  3) loader.load(ctmPath, onLoad, onProgress, onError)
+    //  4) geometry を Mesh にして scene へ
+    // -----------------------------
+    async function loadCTM() {
+      clearError();
+      hud.textContent = "Loading CTM...\n" + ctmPath;
+
+      try {
+        // 1) 旧CTMデコード基盤 + ローダーを準備
+        await loadLegacyCTMStack();
+
+        // 2) 旧ローダー生成（ここで “Loader.call(this)” が走る）
+        //    → Three.jsを旧ローダー互換の版に下げたのでここが落ちない
+        const loader = new globalThis.THREE.CTMLoader();
+
+        // 3) 非同期ロード開始
+        loader.load(
+          ctmPath,
+          (geometry) => {
+            // 4) geometry -> Mesh -> scene への変換パイプライン
+            if (model) {
+              scene.remove(model);
+              disposeMesh(model);
+              model = null;
+            }
+
+            // geometry が旧THREE.Geometryの可能性もあるので、法線を安全に整備
+            if (geometry?.computeVertexNormals) geometry.computeVertexNormals();
+            if (geometry?.computeFaceNormals) geometry.computeFaceNormals();
+
+            const material = new THREE.MeshLambertMaterial({ color: 0xff8888 });
+
+            model = new THREE.Mesh(geometry, material);
+            model.name = "ctm_model";
+            model.castShadow = true;
+            model.receiveShadow = true;
+
+            // 旧サンプル踏襲：スケール調整（CTMは単位がまちまち）
+            model.scale.set(20, 20, 20);
+
+            // 中心合わせ：回転の軸が自然になる
+            const box = new THREE.Box3().setFromObject(model);
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            model.position.sub(center);
+
+            // 床合わせ：Y方向の最小値が 0 になるように
+            const box2 = new THREE.Box3().setFromObject(model);
+            model.position.y -= box2.min.y;
+
+            scene.add(model);
+            hud.textContent = "Loaded.\n" + ctmPath;
+          },
+          (progressEvent) => {
+            const loaded = progressEvent?.loaded ?? 0;
+            const total = progressEvent?.total ?? 0;
+            if (total > 0) {
+              hud.textContent = "Loading... " + ((loaded / total) * 100).toFixed(1) + "%\n" + ctmPath;
+            } else {
+              hud.textContent = "Loading... " + loaded + " bytes\n" + ctmPath;
+            }
+          },
+          (err) => {
+            showError(
+              "CTM load failed:\n" +
+              "path: " + ctmPath + "\n\n" +
+              (err?.stack || err?.message || JSON.stringify(err, null, 2) || err)
+            );
+          }
+        );
+      } catch (e) {
+        showError("CTM初期化/ロードでエラー:\n" + (e?.stack || e));
+      }
+    }
+
+    // -----------------------------
+    // 描画ループ（旧 render 相当）
+    // -----------------------------
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // FPS計測（1秒ごと更新）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        // ロード中も進捗表示が上書きするので、ここは軽く追記する程度にする
+        // （loadCTMのprogressが hud.textContent を上書きしている想定）
+        if (!hud.textContent.startsWith("Loading...")) {
+          hud.textContent =
+            "FPS: " + fps.toFixed(1) + "\n" +
+            "model: " + (model ? "loaded" : "loading...") + "\n" +
+            "file: " + ctmPath;
+        }
+      }
+
+      // モデルが来ていれば回転（見た目の動き）
+      if (model) {
+        model.rotation.y += 0.006;
+        model.rotation.x += 0.009;
+      }
+
+      orbit.update();
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------------
+    // リサイズ対応
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // -----------------------------
+    // 後始末（念のため）
+    // -----------------------------
+    window.addEventListener("beforeunload", () => {
+      disposeMesh(model);
+      floor.geometry.dispose();
+      floor.material.dispose();
+      renderer.dispose();
+    });
+
+    // 起動
+    loadCTM();
+    animate();
+  </script>
+</body>
+</html>
