@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.02 - Selecting objects（現行Three.js / ES Modules版）</title>
+
+  <!--
+    目的：
+      旧サンプル（../libs/three.js + stats.js + dat.gui + Projector.js）を、
+      現行Three.js（ES Modules）で動く形に修正し、「Raycasterでオブジェクトを選択する」アルゴリズムを
+      追えるようにコメントを増やして整理する。
+
+    ■ 重要：Projector.js は不要
+      旧Three.jsでは screen→world 変換に Projector が使われていた時代があるが、
+      現行では
+        - 画面座標 → NDC（Normalized Device Coordinates）
+        - Raycaster.setFromCamera(ndc, camera)
+      で直接レイを作れるため Projector は不要（むしろ混乱の元）。
+
+    ■ 全体アルゴリズム（この教材のコア）
+      A) 初期化（1回）
+        1) Scene / Camera / Renderer を作る
+        2) 床・Cube・Sphere・Cylinder を配置する
+        3) ライトを入れて Lambert を見えるようにする
+        4) 「クリック」「マウス移動」イベントを登録する
+        5) GUIで速度と “レイ可視化” ON/OFF を切り替えられるようにする
+
+      B) 毎フレーム（render loop）
+        1) 3つの物体をそれぞれ回転/バウンス/スケールで更新する
+        2) renderer.render(scene, camera) で描画する
+
+      C) 入力イベント（インタラクション）
+        1) マウス座標(clientX/Y)を NDC(-1..+1)に変換する
+        2) Raycaster.setFromCamera(ndc, camera) でカメラから伸びるレイを作る
+        3) raycaster.intersectObjects(targets, true) で交差判定
+        4) 交差があれば「一番手前のヒット(intersects[0])」を採用し、透明化などの反応を適用
+
+    ■ 旧コードの問題点（修正ポイント）
+      - Projector を2回 new している（不要）
+      - unproject の使い方が古い＆毎回「camera.position を始点」と決め打ちしており読みづらい
+        → setFromCamera に一本化
+      - showRay の可視化で TubeGeometry を毎回作っているが dispose が無くGPUメモリが溜まりやすい
+        → 使い回す or 作り直すなら dispose
+      - マウスレイの始点を固定値 (-30,39.8,30) にしている
+        → “実際のカメラ位置(camera.position)” を使う（アルゴリズム上自然）
+      - 選択時に opacity を下げるが、元に戻す仕組みがない
+        → “最後に選択した物体” を保存して復元できるようにする
+      - 速度がFPS依存（教材としてはOKだがコメントで明示）
+  -->
+
+  <!-- importmap：ブラウザに ESM の参照先を教える -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+        "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+      user-select: none;
+    }
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import GUI from "lil-gui";
+
+    // ------------------------------------------------------------
+    // 画面が真っ黒で沈黙しないためのエラー表示
+    // ------------------------------------------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) { errBox.style.display = "block"; errBox.textContent = String(msg); }
+    function clearError() { errBox.style.display = "none"; errBox.textContent = ""; }
+    window.addEventListener("error", (e) => showError("window.onerror:\n" + (e?.error?.stack || e?.message || e)));
+    window.addEventListener("unhandledrejection", (e) => showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e)));
+
+    // ------------------------------------------------------------
+    // Scene / Camera / Renderer（描画の土台）
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xeeeeee);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(-30, 40, 30);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // 視点操作（教材ではあると便利）
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.target.set(0, 0, 0);
+    orbit.update();
+
+    // ------------------------------------------------------------
+    // オブジェクト配置（床 + 3つの形状）
+    // ------------------------------------------------------------
+    const plane = new THREE.Mesh(
+      new THREE.PlaneGeometry(60, 20),
+      new THREE.MeshLambertMaterial({ color: 0xffffff })
+    );
+    plane.rotation.x = -Math.PI / 2;
+    plane.position.set(15, 0, 0);
+    scene.add(plane);
+
+    const cube = new THREE.Mesh(
+      new THREE.BoxGeometry(4, 4, 4),
+      new THREE.MeshLambertMaterial({ color: 0xff0000 })
+    );
+    cube.position.set(-9, 3, 0);
+    cube.name = "cube";
+    scene.add(cube);
+
+    const sphere = new THREE.Mesh(
+      new THREE.SphereGeometry(4, 20, 20),
+      new THREE.MeshLambertMaterial({ color: 0x7777ff })
+    );
+    sphere.position.set(20, 0, 2);
+    sphere.name = "sphere";
+    scene.add(sphere);
+
+    const cylinder = new THREE.Mesh(
+      new THREE.CylinderGeometry(2, 2, 20),
+      new THREE.MeshLambertMaterial({ color: 0x77ff77 })
+    );
+    cylinder.position.set(0, 0, 1);
+    cylinder.name = "cylinder";
+    scene.add(cylinder);
+
+    // Raycaster の対象物（床は選択対象に含めない）
+    const pickTargets = [cube, sphere, cylinder];
+
+    // ------------------------------------------------------------
+    // ライト（Lambert はライト必須）
+    // ------------------------------------------------------------
+    scene.add(new THREE.AmbientLight(0x0c0c0c));
+
+    // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルトにする
+    const spotLight = new THREE.SpotLight(0xffffff, 1.0);
+    spotLight.position.set(-40, 60, -10);
+    spotLight.decay = 0;     // ★方針
+    spotLight.distance = 0;
+    scene.add(spotLight);
+
+    // ------------------------------------------------------------
+    // GUI（旧 dat.gui の代替）
+    // ------------------------------------------------------------
+    const controls = {
+      rotationSpeed: 0.02,
+      bouncingSpeed: 0.03,
+      scalingSpeed:  0.03,
+      showRay: false,
+      hoverPreview: true,     // 追加：ホバーで薄くする（教材として分かりやすい）
+      clickSelect: true       // 追加：クリックで選択確定
+    };
+
+    const gui = new GUI();
+    gui.add(controls, "rotationSpeed", 0, 0.5, 0.001);
+    gui.add(controls, "bouncingSpeed", 0, 0.5, 0.001);
+    gui.add(controls, "scalingSpeed",  0, 0.5, 0.001);
+    gui.add(controls, "showRay").onChange(() => {
+      // レイ可視化OFFにしたら、表示用ラインを消す（disposeもする）
+      clearRayLine();
+    });
+    gui.add(controls, "hoverPreview");
+    gui.add(controls, "clickSelect");
+
+    // ------------------------------------------------------------
+    // FPS HUD（stats.js 代替）
+    // ------------------------------------------------------------
+    const hud = document.getElementById("hud");
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    // ------------------------------------------------------------
+    // アニメーション用の位相（旧コード踏襲：FPS依存）
+    // 注意：フレーム依存なので、FPSが変わると速度も変わる。
+    // 実運用では deltaTime を使うのが一般的。
+    // ------------------------------------------------------------
+    let step = 0;
+    let scalingStep = 0;
+
+    // ------------------------------------------------------------
+    // Raycaster の基本セット
+    // - ndc: マウス位置を -1..+1 の正規化座標にしたもの
+    // - raycaster: ndc + camera から「カメラから伸びるレイ」を作る
+    // ------------------------------------------------------------
+    const ndc = new THREE.Vector2();
+    const raycaster = new THREE.Raycaster();
+
+    function updateNDCFromMouseEvent(event) {
+      // DOM上のキャンバス全体に対する相対座標へ変換
+      const rect = renderer.domElement.getBoundingClientRect();
+
+      // NDC:
+      //   x: 左-1 → 右+1
+      //   y: 上+1 → 下-1  （画面座標と上下が逆）
+      ndc.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      ndc.y = -(((event.clientY - rect.top) / rect.height) * 2 - 1);
+    }
+
+    function pick() {
+      // setFromCamera が “Projector不要” の現代流
+      raycaster.setFromCamera(ndc, camera);
+
+      // 交差判定：対象が Mesh の配列ならこれでOK
+      // （Groupを含むなら recursive=true を使う）
+      const intersects = raycaster.intersectObjects(pickTargets, true);
+
+      // 手前から並ぶので先頭が「最も近いヒット」
+      return intersects.length > 0 ? intersects[0] : null;
+    }
+
+    // ------------------------------------------------------------
+    // 選択/ハイライト制御
+    // - hover: マウスを乗せたら薄くする（可視化）
+    // - click: クリックで確定して薄くする（旧コードの挙動）
+    // ※ “元に戻す” が無いと教材として事故るので、元状態を保存する
+    // ------------------------------------------------------------
+    let lastHover = null;
+    let lastSelected = null;
+
+    function setTransparent(mesh, on) {
+      if (!mesh || !mesh.material) return;
+
+      // material が配列のケースにも耐える
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+
+      for (const m of materials) {
+        // “透明化するなら transparent=true” が必要
+        if (on) {
+          m.transparent = true;
+          m.opacity = 0.15;
+        } else {
+          // 既定へ戻す（教材なので固定値でOK）
+          m.opacity = 1.0;
+          m.transparent = false;
+        }
+        m.needsUpdate = true;
+      }
+    }
+
+    function clearHover() {
+      if (lastHover && lastHover !== lastSelected) setTransparent(lastHover, false);
+      lastHover = null;
+    }
+
+    function select(mesh) {
+      if (!mesh) return;
+
+      // 前回選択を解除（同じ物を選び直した場合は何もしない）
+      if (lastSelected && lastSelected !== mesh) setTransparent(lastSelected, false);
+
+      lastSelected = mesh;
+      setTransparent(lastSelected, true);
+    }
+
+    // ------------------------------------------------------------
+    // レイ可視化（旧コードは TubeGeometry を毎回生成していた）
+    // ここでは “Line” で表示する。
+    // 理由：
+    // - Line は軽い
+    // - 毎フレーム作り直しても負荷が低い
+    // - dispose が分かりやすい
+    //
+    // 表示する情報：
+    // - レイの始点：camera.position
+    // - レイの終点：ヒット点（ヒットが無ければ適当な距離）
+    // ------------------------------------------------------------
+    let rayLine = null;
+
+    function clearRayLine() {
+      if (!rayLine) return;
+      scene.remove(rayLine);
+      rayLine.geometry.dispose();
+      rayLine.material.dispose();
+      rayLine = null;
+    }
+
+    function drawRay(toPoint) {
+      if (!controls.showRay) return;
+
+      // 既存ラインがあれば捨てて作り直し（簡潔さ優先）
+      clearRayLine();
+
+      const points = [camera.position.clone(), toPoint.clone()];
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+
+      const material = new THREE.LineBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.7 });
+
+      rayLine = new THREE.Line(geometry, material);
+      rayLine.name = "rayLine";
+      scene.add(rayLine);
+    }
+
+    // ------------------------------------------------------------
+    // 入力イベント
+    // - mousemove: hover とレイ可視化
+    // - mousedown: クリック選択（旧コード相当）
+    //
+    // 注意：
+    // - “mousemove で毎回 Raycaster” は軽い対象数ならOK。
+    //   重いシーンなら throttle / requestAnimationFrame にまとめるのが一般的。
+    // ------------------------------------------------------------
+    renderer.domElement.addEventListener("mousemove", (event) => {
+      updateNDCFromMouseEvent(event);
+
+      const hit = pick();
+
+      if (controls.hoverPreview) {
+        // hover対象を更新
+        if (hit?.object) {
+          // intersects[0].object は Mesh とは限らない場合があるが、
+          // 今回は直接 Mesh を入れているので Mesh とみなせる
+          const obj = hit.object;
+          if (lastHover !== obj && obj !== lastSelected) {
+            clearHover();
+            lastHover = obj;
+            setTransparent(lastHover, true);
+          }
+        } else {
+          clearHover();
+        }
+      }
+
+      // レイ表示
+      if (controls.showRay) {
+        if (hit?.point) {
+          drawRay(hit.point);
+        } else {
+          // ヒットしない場合は “レイ方向に一定距離” へ線を伸ばす
+          raycaster.setFromCamera(ndc, camera);
+          const farPoint = raycaster.ray.origin.clone().add(raycaster.ray.direction.clone().multiplyScalar(100));
+          drawRay(farPoint);
+        }
+      }
+    });
+
+    renderer.domElement.addEventListener("mousedown", (event) => {
+      if (!controls.clickSelect) return;
+
+      updateNDCFromMouseEvent(event);
+      const hit = pick();
+
+      if (hit?.object) {
+        // クリックで選択確定
+        select(hit.object);
+        console.log("Selected:", hit.object.name || hit.object);
+      }
+    });
+
+    // ------------------------------------------------------------
+    // render loop（旧コードのアニメを踏襲）
+    // ------------------------------------------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      clearError();
+
+      // FPS計測（1秒に1回）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "hover: " + (lastHover ? (lastHover.name || "mesh") : "-") + "\n" +
+          "selected: " + (lastSelected ? (lastSelected.name || "mesh") : "-") + "\n" +
+          "showRay: " + (controls.showRay ? "on" : "off");
+      }
+
+      // Cube：回転
+      cube.rotation.x += controls.rotationSpeed;
+      cube.rotation.y += controls.rotationSpeed;
+      cube.rotation.z += controls.rotationSpeed;
+
+      // Sphere：バウンス（sin/cos）
+      step += controls.bouncingSpeed;
+      sphere.position.x = 20 + (10 * Math.cos(step));
+      sphere.position.y = 2 + (10 * Math.abs(Math.sin(step)));
+
+      // Cylinder：スケール（非等方）
+      scalingStep += controls.scalingSpeed;
+      const scaleX = Math.max(0.05, Math.abs(Math.sin(scalingStep / 4)));
+      const scaleY = Math.max(0.05, Math.abs(Math.cos(scalingStep / 5)));
+      const scaleZ = Math.max(0.05, Math.abs(Math.sin(scalingStep / 7)));
+      cylinder.scale.set(scaleX, scaleY, scaleZ);
+
+      orbit.update();
+      renderer.render(scene, camera);
+    }
+
+    // ------------------------------------------------------------
+    // resize
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ------------------------------------------------------------
+    // 後始末（教材として dispose を見せる）
+    // ------------------------------------------------------------
+    window.addEventListener("beforeunload", () => {
+      clearRayLine();
+      renderer.dispose();
+      gui.destroy();
+    });
+
+    // 起動
+    animate();
+  </script>
+</body>
+</html>
