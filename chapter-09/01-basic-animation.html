@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.01 - Basic animations（現行Three.js / ES Modules版）</title>
+
+  <!--
+    目的：
+      旧サンプル（../libs/three.js + stats.js + dat.gui.js）を、
+      現行Three.js（ES Modules）で動く形に修正しつつ、
+      「基本アニメーション（回転・バウンス・スケール）」の仕組みが理解できるように
+      コメントを厚めにして整理する。
+
+    ■ 全体アルゴリズム（この教材のコア）
+      1) Scene / Camera / Renderer を初期化して描画の土台を作る
+      2) 地面（Plane）と、動かす対象（Cube/Sphere/Cylinder）を用意して scene に追加
+      3) ライトを追加（LambertMaterialは光がないと真っ黒）
+      4) UI（スライダー）で「回転速度・バウンス速度・スケール速度」を調整可能にする
+      5) requestAnimationFrame で描画ループを回し続ける
+         - Cube：各軸回転
+         - Sphere：sin/cos を使った周期運動（バウンス）
+         - Cylinder：sin/cos を使ったスケーリング
+      6) リサイズ対応、（必要なら）GPUリソースの後始末
+
+    ■ 旧コードからの主な修正ポイント
+      - ES Modules（importmap + type="module"）に変更し、../libs依存を解消
+      - stats.js/dat.gui.js を「HUD（簡易FPS）」＋「自作UI（range）」で代替
+      - 物体が床を突き抜けないように初期位置・バウンス基準高さを調整
+      - 影を出す場合の設定を整理（castShadow/receiveShadow/renderer.shadowMap）
+      - SpotLight の decay は 0（ユーザー方針）に統一
+  -->
+
+  <!-- importmap：ブラウザに three の参照先を教える -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 340px;
+      padding: 12px 12px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.92);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.20);
+      user-select: none;
+    }
+    #ui h1 { font-size: 14px; margin: 0 0 10px; font-weight: 800; }
+    .row { display: grid; grid-template-columns: 130px 1fr; gap: 10px; align-items: center; margin: 10px 0; }
+    label { font-size: 12px; color: #222; }
+    input[type="range"] { width: 100%; }
+
+    #hud {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre;
+      user-select: none;
+    }
+
+    #err {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 70, 70, 0.92);
+      color: #fff;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Basic animations（回転・バウンス・スケール）</h1>
+
+    <div class="row">
+      <label>rotationSpeed</label>
+      <input id="rotationSpeed" type="range" min="0" max="0.5" step="0.001" value="0.02" />
+    </div>
+
+    <div class="row">
+      <label>bouncingSpeed</label>
+      <input id="bouncingSpeed" type="range" min="0" max="0.5" step="0.001" value="0.03" />
+    </div>
+
+    <div class="row">
+      <label>scalingSpeed</label>
+      <input id="scalingSpeed" type="range" min="0" max="0.5" step="0.001" value="0.03" />
+    </div>
+
+    <div style="font-size:12px;color:#222;line-height:1.4;margin-top:6px;">
+      操作：右上のFPS表示を見ながらスライダーで動きを調整
+    </div>
+  </div>
+
+  <div id="hud">FPS: --</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    // -----------------------------
+    // 黒画面で沈黙しないためのエラー表示
+    // -----------------------------
+    const errBox = document.getElementById("err");
+    function showError(msg) { errBox.style.display = "block"; errBox.textContent = String(msg); }
+    function clearError() { errBox.style.display = "none"; errBox.textContent = ""; }
+    window.addEventListener("error", (e) => showError("window.onerror:\n" + (e?.error?.stack || e?.message || e)));
+    window.addEventListener("unhandledrejection", (e) => showError("unhandledrejection:\n" + (e?.reason?.stack || e?.reason || e)));
+
+    // -----------------------------
+    // UI参照（旧dat.guiの代替）
+    // -----------------------------
+    const ui = {
+      rotationSpeed: document.getElementById("rotationSpeed"),
+      bouncingSpeed: document.getElementById("bouncingSpeed"),
+      scalingSpeed: document.getElementById("scalingSpeed"),
+    };
+
+    // UIの値は毎フレーム読む（変化に即応できて分かりやすい）
+    function getControls() {
+      return {
+        rotationSpeed: Number(ui.rotationSpeed.value),
+        bouncingSpeed: Number(ui.bouncingSpeed.value),
+        scalingSpeed: Number(ui.scalingSpeed.value),
+      };
+    }
+
+    // -----------------------------
+    // 1) Scene / Camera / Renderer（描画の土台）
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xeeeeee);
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+
+    // 旧サンプルのカメラ配置を踏襲しつつ、見やすい方向へ
+    camera.position.set(-30, 40, 30);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+    // 色を正しく扱う設定（最近のthree.jsの推奨）
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    // 影を使う（ライト側 castShadow、物体側 cast/receive、地面 receive が必要）
+    renderer.shadowMap.enabled = true;
+
+    document.body.appendChild(renderer.domElement);
+
+    // OrbitControls：視点を動かせると理解が進む（教材向け）
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.target.set(0, 0, 0);
+    orbit.update();
+
+    // -----------------------------
+    // 2) オブジェクト配置（地面 + 3つの形状）
+    // -----------------------------
+
+    // 地面（Plane）
+    // - LambertMaterial はライトに反応するので陰影が分かる
+    // - receiveShadow をtrueにして影の“受け皿”にする
+    const planeGeometry = new THREE.PlaneGeometry(60, 20, 1, 1);
+    const planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+    plane.rotation.x = -0.5 * Math.PI; // x軸で -90度回して水平にする
+    plane.position.set(15, 0, 0);
+    plane.receiveShadow = true;
+    scene.add(plane);
+
+    // Cube（回転アニメーション）
+    const cubeGeometry = new THREE.BoxGeometry(4, 4, 4);
+    const cubeMaterial = new THREE.MeshLambertMaterial({ color: 0xff0000 });
+    const cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+
+    // 4x4x4 の立方体なので、床に“ちょうど乗せる”なら y=2（半分の高さ）
+    // ただし旧サンプルは少し浮かせていたので、ここでは y=3 として視認性優先
+    cube.position.set(-9, 3, 0);
+    cube.castShadow = true;
+    cube.receiveShadow = true;
+    scene.add(cube);
+
+    // Sphere（バウンスアニメーション）
+    const sphereGeometry = new THREE.SphereGeometry(4, 20, 20);
+    const sphereMaterial = new THREE.MeshLambertMaterial({ color: 0x7777ff });
+    const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+
+    // 半径4なので、床の上に“最低でも乗る”なら y>=4 が安全
+    // バウンスで上下するので基準高さも 4 にして床を突き抜けにくくする
+    sphere.position.set(20, 4, 2);
+    sphere.castShadow = true;
+    sphere.receiveShadow = true;
+    scene.add(sphere);
+
+    // Cylinder（スケールアニメーション）
+    const cylinderGeometry = new THREE.CylinderGeometry(2, 2, 20, 24);
+    const cylinderMaterial = new THREE.MeshLambertMaterial({ color: 0x77ff77 });
+    const cylinder = new THREE.Mesh(cylinderGeometry, cylinderMaterial);
+
+    // 高さ20で中心が原点なので、床に乗せるなら y=10（半分の高さ）
+    cylinder.position.set(0, 10, 1);
+    cylinder.castShadow = true;
+    cylinder.receiveShadow = true;
+    scene.add(cylinder);
+
+    // 空間把握用のグリッド（見やすさのため）
+    const grid = new THREE.GridHelper(120, 24);
+    grid.material.opacity = 0.25;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    // -----------------------------
+    // 3) ライト（LambertMaterialが見えるようにする）
+    // -----------------------------
+    // ambient：全体をわずかに持ち上げる（暗部が真っ黒にならない）
+    scene.add(new THREE.AmbientLight(0xffffff, 0.18));
+
+    // spot：主光源（影も作る）
+    const spotLight = new THREE.SpotLight(0xffffff, 1.3);
+    spotLight.position.set(-40, 60, -10);
+
+    // ユーザー方針：SpotLight/PointLight の decay は 0
+    spotLight.decay = 0;
+    spotLight.distance = 0;
+
+    spotLight.castShadow = true;
+    spotLight.shadow.mapSize.set(1024, 1024);
+    spotLight.shadow.camera.near = 10;
+    spotLight.shadow.camera.far = 200;
+
+    scene.add(spotLight);
+
+    // -----------------------------
+    // 4) アニメーション状態（位相・時間）
+    // -----------------------------
+    // step：sphereのバウンス（sin/cos）の位相
+    // scalingStep：cylinderのスケール変化（sin/cos）の位相
+    let step = 0;
+    let scalingStep = 0;
+
+    // -----------------------------
+    // HUD（簡易FPS：stats.js代替）
+    // -----------------------------
+    const hud = document.getElementById("hud");
+    let lastFpsT = performance.now();
+    let frames = 0;
+
+    // -----------------------------
+    // 5) 描画ループ（requestAnimationFrame）
+    // -----------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      clearError();
+
+      // FPS計測（1秒に1回更新）
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        const fps = (frames * 1000) / (now - lastFpsT);
+        frames = 0;
+        lastFpsT = now;
+
+        const c = getControls();
+        hud.textContent =
+          "FPS: " + fps.toFixed(1) + "\n" +
+          "rotationSpeed: " + c.rotationSpeed.toFixed(3) + "\n" +
+          "bouncingSpeed: " + c.bouncingSpeed.toFixed(3) + "\n" +
+          "scalingSpeed: " + c.scalingSpeed.toFixed(3);
+      }
+
+      const controls = getControls();
+
+      // -----------------------------
+      // (A) Cube：回転
+      // rotationSpeed を各軸に加算して回すだけ。
+      // 「角速度（ラジアン/フレーム）」が大きいほど速く回る。
+      // -----------------------------
+      cube.rotation.x += controls.rotationSpeed;
+      cube.rotation.y += controls.rotationSpeed;
+      cube.rotation.z += controls.rotationSpeed;
+
+      // -----------------------------
+      // (B) Sphere：バウンス（周期運動）
+      //
+      // step を増やし続けて “時間の代わり” として使う。
+      // x方向：cos(step) で左右に往復（-1〜1）
+      // y方向：abs(sin(step)) で上下にバウンド（0〜1）
+      //
+      // abs を入れる理由：
+      //   - sin は負になる区間があるが、床の下に潜るのを防ぎたいので
+      //     絶対値にして 0〜1 の範囲にしている。
+      // -----------------------------
+      step += controls.bouncingSpeed;
+
+      sphere.position.x = 20 + (10 * Math.cos(step));
+      sphere.position.y = 4 + (10 * Math.abs(Math.sin(step))); // 基準高さ4で床を突き抜けにくく
+
+      // -----------------------------
+      // (C) Cylinder：スケール
+      //
+      // scale は 0 付近になるとオブジェクトが“潰れて消える”ので、
+      // 見やすさのために最小値を clamp する（ここでは 0.15）。
+      //
+      // 注意：
+      //  - 非等方スケール（x,y,zバラバラ）をすると見た目が伸び縮みする
+      //  - y方向（高さ）だけ伸ばす、なども簡単に作れる
+      // -----------------------------
+      scalingStep += controls.scalingSpeed;
+
+      const rawX = Math.abs(Math.sin(scalingStep / 4));
+      const rawY = Math.abs(Math.cos(scalingStep / 5));
+      const rawZ = Math.abs(Math.sin(scalingStep / 7));
+
+      const minScale = 0.15;
+      const scaleX = Math.max(rawX, minScale);
+      const scaleY = Math.max(rawY, minScale);
+      const scaleZ = Math.max(rawZ, minScale);
+
+      cylinder.scale.set(scaleX, scaleY, scaleZ);
+
+      // OrbitControls（慣性などの内部計算があるので毎フレーム update する）
+      orbit.update();
+
+      // 描画
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------------
+    // リサイズ対応
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // -----------------------------
+    // 後始末（ページ離脱時）
+    // ※ このサンプルは作り直しをしないので必須ではないが、教材として記載しておく
+    // -----------------------------
+    window.addEventListener("beforeunload", () => {
+      planeGeometry.dispose();
+      planeMaterial.dispose();
+      cubeGeometry.dispose();
+      cubeMaterial.dispose();
+      sphereGeometry.dispose();
+      sphereMaterial.dispose();
+      cylinderGeometry.dispose();
+      cylinderMaterial.dispose();
+      renderer.dispose();
+    });
+
+    // 起動
+    animate();
+  </script>
+</body>
+</html>
