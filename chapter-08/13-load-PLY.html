@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 08.13 - Load PLY model（legacy / PointCloud）</title>
+
+  <!--
+    目的：
+      旧Three.js（グローバル THREE）+ PLYLoader で .ply を読み込み、
+      「点群(Point Cloud)として表示する」サンプルを、壊れにくく・読みやすく修正する。
+      さらに “何をしているサンプルか（全体アルゴリズム）” が追えるようにコメントを増やす。
+
+    ■ 全体アルゴリズム（このファイルのコア）
+      1) Scene / Camera / Renderer を初期化して描画の土台を作る
+      2) （点群表示なのでライトは必須ではないが）見栄え用にライトを置くこともできる
+      3) PLYLoader で .ply を非同期ロードして geometry（点の集合）を取得する
+      4) PointsMaterial（スプライト付き）を作り、THREE.Points(geometry, material) を生成する
+      5) シーンへ追加し、requestAnimationFrame で回転させつつ描画し続ける
+
+    ■ 元コードの主な問題点（修正ポイント）
+      - group 変数を二重定義（var group; var group = new Group();）して混乱の元
+        → points（Points参照）に統一
+      - PLYLoaderが返す geometry が BufferGeometry の世代だと、旧プロパティが使えない
+        → “vertices をいじる”系のコメントアウトは BufferGeometry では無効なので説明を追加
+      - group.sortParticles はかなり古いAPI
+        → 削除（必要なら material.transparent / depthWrite などで視覚を調整）
+      - 影設定は点群には基本不要（Pointsは影が使えない/使っても意味が薄い）
+        → shadowMapは残しても良いが、説明を追加
+      - ロード失敗時のハンドリングが弱い
+        → onError を追加して原因を追いやすくする
+
+    ■ このサンプルの “学びどころ”
+      - Mesh（面）ではなく Points（点）で描くときの考え方
+      - 点を「ピクセル1個」ではなく「テクスチャ（スプライト）付きの粒」に見せるテクニック
+      - additive blending + depthWrite=false による “発光っぽい” 表現
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/loaders/PLYLoader.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // -----------------------------
+      // Stats（FPS表示）
+      // -----------------------------
+      var stats = initStats();
+
+      // -----------------------------
+      // Scene / Camera / Renderer
+      // -----------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0x000000));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // 点群(Points)は基本的に影を落とさない/落としても意味が薄いが、
+      // “他のサンプルと合わせて” shadowMap をONにしておくのはOK。
+      // ただし点群そのものの見た目にはほぼ関係しない。
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // カメラ：点群が原点近辺に来る想定で近めに配置
+      camera.position.set(10, 10, 10);
+      camera.lookAt(new THREE.Vector3(0, -2, 0));
+
+      // -----------------------------
+      // ライト
+      //
+      // 注意：
+      // - PointsMaterial はライトに反応しない（= ライトがあっても点は明るくならない）
+      //   → ここでのライトは「他の補助物（床やデバッグ用メッシュ）を置いたとき」に効く程度
+      // - 元コードの “spotLight for shadows” は点群では意味が薄いので、あくまでサンプルとして残す
+      // -----------------------------
+      var spotLight = new THREE.SpotLight(0xffffff, 1.0);
+      spotLight.position.set(20, 20, 20);
+      // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルト
+      if ("decay" in spotLight) spotLight.decay = 0;
+      scene.add(spotLight);
+
+      // -----------------------------
+      // dat.GUI（最小：回転速度とポイントサイズ）
+      // ※ 旧サンプルではGUIを置いているだけだったので、学習効果が出るように使う
+      // -----------------------------
+      var controls = new (function () {
+        this.rotateSpeed = 0.006;
+        this.pointSize = 0.4;
+        this.opacity = 0.6;
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(controls, "rotateSpeed", 0.0, 0.05);
+      gui.add(controls, "pointSize", 0.05, 2.0).onChange(function () {
+        if (points && points.material) {
+          points.material.size = controls.pointSize;
+          points.material.needsUpdate = true;
+        }
+      });
+      gui.add(controls, "opacity", 0.0, 1.0).onChange(function () {
+        if (points && points.material) {
+          points.material.opacity = controls.opacity;
+          points.material.needsUpdate = true;
+        }
+      });
+
+      // -----------------------------
+      // このサンプルの主役：Points（点群）
+      // - 旧コードの group という名前は「GroupかPointsか分からなくなる」ので避ける
+      // -----------------------------
+      var points = null;
+
+      // -----------------------------
+      // PLYロード
+      // -----------------------------
+      var loader = new THREE.PLYLoader();
+
+      loader.load(
+        "../assets/models/test.ply",
+        function (geometry) {
+          // ここがロード完了時に呼ばれる
+          // geometry は “点の集合” を持つジオメトリ（世代によって Geometry/BufferGeometry）
+          //
+          // 重要：
+          // - PLYは点群だけでなく面(三角形)を含む場合もある
+          // - ここでは Points として描くため “position属性（頂点座標）” があれば十分
+
+          // BufferGeometry の場合、boundingSphereが未計算だと表示が変になることがあるので計算
+          if (geometry && typeof geometry.computeBoundingSphere === "function") {
+            geometry.computeBoundingSphere();
+          }
+
+          // 点を “粒” として見せるテクスチャ（スプライト）を生成
+          var spriteTex = generateSpriteTexture();
+
+          // PointsMaterial：点の描画専用マテリアル
+          // - size: 点の大きさ（ピクセル相当）
+          // - transparent + opacity: 透過
+          // - depthWrite=false: 半透明の点群で “奥行き書き込み” を切って重なりを自然にする
+          // - AdditiveBlending: 発光っぽい重なり表現（白が重なると明るくなる）
+          // - map: 点の見た目（丸い粒に見せる）
+          var material = new THREE.PointsMaterial({
+            color: 0xffffff,
+            size: controls.pointSize,
+            opacity: controls.opacity,
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+            map: spriteTex
+          });
+
+          // すでにpointsがある場合（再ロードや差し替え）に備えて掃除
+          if (points) {
+            scene.remove(points);
+            disposePoints(points);
+            points = null;
+          }
+
+          points = new THREE.Points(geometry, material);
+          points.name = "ply_points";
+
+          // 古いAPIの名残：group.sortParticles は現代では基本不要/無効なので使わない。
+          // 半透明の順序問題は “depthWrite=false” + “AdditiveBlending” の方が効果が出やすい。
+
+          scene.add(points);
+        },
+        function (progressEvent) {
+          // 進捗（サーバが Content-Length を返す場合だけ total が入る）
+          // console.log(progressEvent.loaded, progressEvent.total);
+        },
+        function (err) {
+          // 失敗時：パス、サーバ設定、CORS、ファイル破損など
+          console.error("PLY load failed:", err);
+        }
+      );
+
+      // -----------------------------
+      // アニメーションループ
+      // -----------------------------
+      function render() {
+        stats.update();
+
+        if (points) {
+          points.rotation.y += controls.rotateSpeed;
+
+          // 元コードにあった “頂点を毎フレームいじる” 例について：
+          // - Geometry世代なら vertices を触って変形できるが、現代は BufferGeometry が主流
+          // - BufferGeometry は position属性(Float32Array)を直接触る必要がある
+          // - さらに毎フレーム全頂点を更新すると重いので、必要ならGPU側（シェーダ）でやるのが基本
+          //
+          // ここでは教材として「やるならこういう注意がある」だけコメントしておき、実処理は行わない。
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // -----------------------------
+      // resize対応
+      // -----------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // -----------------------------
+      // スプライト生成（テクスチャ）
+      // - “点を丸い光の粒”に見せるため、Canvasで放射状グラデを描いてTexture化
+      // - Three.js examples 由来の典型手法
+      // -----------------------------
+      function generateSpriteTexture() {
+        var canvas = document.createElement("canvas");
+        canvas.width = 16;
+        canvas.height = 16;
+
+        var context = canvas.getContext("2d");
+
+        // 中心が明るく、外側が暗くなる放射状グラデ
+        var gradient = context.createRadialGradient(
+          canvas.width / 2,
+          canvas.height / 2,
+          0,
+          canvas.width / 2,
+          canvas.height / 2,
+          canvas.width / 2
+        );
+
+        gradient.addColorStop(0.0, "rgba(255,255,255,1)");
+        gradient.addColorStop(0.2, "rgba(0,255,255,1)");
+        gradient.addColorStop(0.4, "rgba(0,0,64,1)");
+        gradient.addColorStop(1.0, "rgba(0,0,0,1)");
+
+        context.fillStyle = gradient;
+        context.fillRect(0, 0, canvas.width, canvas.height);
+
+        var texture = new THREE.Texture(canvas);
+        texture.needsUpdate = true;
+        return texture;
+      }
+
+      // -----------------------------
+      // 後始末（ジオメトリ/マテリアル/テクスチャを解放）
+      // - 点群の差し替えやページ離脱時に GPU メモリリークを防ぐ
+      // -----------------------------
+      function disposePoints(p) {
+        if (!p) return;
+        if (p.geometry && typeof p.geometry.dispose === "function") p.geometry.dispose();
+        if (p.material) {
+          // PointsMaterial.map(Texture) を使っているので、Textureもdisposeしておく
+          if (p.material.map && typeof p.material.map.dispose === "function") p.material.map.dispose();
+          if (typeof p.material.dispose === "function") p.material.dispose();
+        }
+      }
+
+      // -----------------------------
+      // Stats 初期化
+      // -----------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
