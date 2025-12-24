@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.07 - First Person Controls（legacy / OBJ+MTL / “街の中スポーン” 修正版）</title>
+
+  <!--
+    修正の狙い：
+      「街の中に立っていない」を、ロード後に “街のAABB(外接直方体) からスポーン位置を決める”
+      ことで確実に解消する。
+
+    うまくいっていない典型原因：
+      1) モデルは非同期ロードなので、ロード前に camera.position を決めても “街のサイズ” が分からない
+      2) FirstPersonControls は update() 内で lon/lat を使ってカメラの向きを上書きする実装が多い
+         → camera.lookAt(...) を書いても update() で消されやすい
+      3) city.obj の単位/スケールが想定と違う（巨大 or 極小）と、固定の camera.position が外側になる
+
+    ここでの解決アルゴリズム：
+      A) city.obj を読み込む
+      B) centerAndPlaceOnFloor(object) で “中心を原点に寄せる＆地面を y=0 に揃える”
+      C) Box3 で街全体のサイズ(size)を測る
+      D) size を使って “街の中” にカメラをスポーン（x/z は中心付近、y は目線高さ）
+      E) “街の中心を向く” lon/lat を計算して設定し、controls.update(0) で即反映
+
+    ※ old three.js 対応：
+      - Box3.getCenter / getSize が無い場合があるので min/max から手計算する。
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/loaders/MTLLoader.js"></script>
+  <script type="text/javascript" src="../libs/loaders/OBJLoader.js"></script>
+
+  <script type="text/javascript" src="../libs/controls/FirstPersonControls.js"></script>
+
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+  <script type="text/javascript" src="../libs/chroma.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    html, body { touch-action: none; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // 時間管理：controls.update(delta) が delta を前提にする
+      // ------------------------------------------------------------
+      var clock = new THREE.Clock();
+
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        5000
+      );
+
+      // ロード前は仮置き（ロード後に “街の中” に再配置する）
+      camera.position.set(0, 5, 30);
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0x000000));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // FirstPersonControls（主役）
+      // ------------------------------------------------------------
+      var camControls = new THREE.FirstPersonControls(camera);
+
+      // 多くの実装は domElement でマウスイベントを取るので明示する
+      camControls.domElement = renderer.domElement;
+
+      camControls.lookSpeed = 0.4;
+      camControls.movementSpeed = 20;
+
+      camControls.noFly = true;
+      camControls.lookVertical = true;
+
+      camControls.constrainVertical = true;
+      // 上下制限は “狭すぎると違和感” が出るので少し緩める
+      camControls.verticalMin = 0.6;
+      camControls.verticalMax = 2.6;
+
+      // lon/lat は “ロード後に街中心を向く値” に更新する（重要）
+      camControls.lon = 0;
+      camControls.lat = 0;
+
+      // キー入力が効かない環境対策：canvas をフォーカス可能にする
+      renderer.domElement.tabIndex = 0;
+      renderer.domElement.style.outline = "none";
+      renderer.domElement.addEventListener("pointerdown", function () {
+        try { renderer.domElement.focus(); } catch (e) {}
+      });
+
+      // ------------------------------------------------------------
+      // Light
+      // ------------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x383838));
+
+      var spotLight = new THREE.SpotLight(0xffffff, 2.0);
+      spotLight.position.set(100, 140, 130);
+      spotLight.castShadow = true;
+
+      if (spotLight.shadow && spotLight.shadow.mapSize) {
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+      }
+
+      // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルト
+      if ("decay" in spotLight) spotLight.decay = 0;
+
+      scene.add(spotLight);
+
+      // ------------------------------------------------------------
+      // 空間の目印：床・グリッド
+      //  - まずは仮サイズで置く
+      //  - 後で “街サイズ” に合わせて拡張する
+      // ------------------------------------------------------------
+      var floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(200, 200),
+        new THREE.MeshLambertMaterial({ color: 0x111111 })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = 0;
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      var grid = null;
+      if (THREE.GridHelper) {
+        grid = new THREE.GridHelper(200, 20);
+        if (grid.material) {
+          grid.material.opacity = 0.25;
+          grid.material.transparent = true;
+        }
+        scene.add(grid);
+      }
+
+      // ------------------------------------------------------------
+      // dat.GUI（FPS操作の主要パラメータ＋目線高さ）
+      // ------------------------------------------------------------
+      var params = new (function () {
+        this.lookSpeed = camControls.lookSpeed;
+        this.movementSpeed = camControls.movementSpeed;
+        this.noFly = camControls.noFly;
+        this.constrainVertical = camControls.constrainVertical;
+        this.randomizeColors = true;
+
+        // “街の中に立つ” ための目線高さ（モデル単位が不明なので後で補正もする）
+        this.eyeHeight = 40;
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(params, "lookSpeed", 0.0, 2.0).onChange(function (v) { camControls.lookSpeed = v; });
+      gui.add(params, "movementSpeed", 1, 200).onChange(function (v) { camControls.movementSpeed = v; });
+      gui.add(params, "noFly").onChange(function (v) { camControls.noFly = v; });
+      gui.add(params, "constrainVertical").onChange(function (v) { camControls.constrainVertical = v; });
+      gui.add(params, "randomizeColors");
+      gui.add(params, "eyeHeight", 0.5, 10.0);
+
+      // ------------------------------------------------------------
+      // OBJ + MTL ロード（非同期パイプライン）
+      // ------------------------------------------------------------
+      var cityModel = null;
+
+      var mtlLoader = new THREE.MTLLoader();
+      mtlLoader.setPath("../assets/models/");
+
+      mtlLoader.load("city.mtl", function (materials) {
+        materials.preload();
+
+        var objLoader = new THREE.OBJLoader();
+        objLoader.setMaterials(materials);
+        objLoader.setPath("../assets/models/");
+
+        objLoader.load("city.obj", function (object) {
+          cityModel = object;
+
+          // 影設定：castShadow/receiveShadow を揃える
+          cityModel.traverse(function (child) {
+            if (child instanceof THREE.Mesh) {
+              child.castShadow = true;
+              child.receiveShadow = true;
+            }
+          });
+
+          // 任意：建物などにランダム色を付与（MTLの意図は壊れるのでトグル）
+          if (params.randomizeColors) {
+            var scale = chroma.scale(["red", "green", "blue"]);
+            setRandomColors(cityModel, scale);
+          }
+
+          // ✅ まず “中心合わせ＆床置き”
+          centerAndPlaceOnFloor(cityModel);
+
+          scene.add(cityModel);
+
+          // ✅ 次に “街サイズ” を計測し、床・グリッドを街に合わせる
+          var box = computeBox(cityModel);
+          var size = computeSize(box);
+
+          var floorSize = Math.max(size.x, size.z) * 1.2;
+          updateFloorAndGrid(floorSize);
+
+          // ✅ 最後に “街の中にスポーン” して “街中心を見る”
+          spawnCameraInsideCity(box, size);
+        });
+      });
+
+      // ------------------------------------------------------------
+      // ランダムカラー（Object3Dツリーを走査）
+      // ------------------------------------------------------------
+      function setRandomColors(object, scale) {
+        var children = object.children;
+        if (children && children.length > 0) {
+          children.forEach(function (c) { setRandomColors(c, scale); });
+          return;
+        }
+        if (object instanceof THREE.Mesh) {
+          applyRandomColorToMaterial(object.material, scale);
+        }
+      }
+
+      function applyRandomColorToMaterial(material, scale) {
+        if (!material) return;
+
+        // 旧 MultiMaterial / materials 配列互換
+        if (material.materials && Array.isArray(material.materials)) {
+          material.materials.forEach(function (m) { applyRandomColorToMaterial(m, scale); });
+          return;
+        }
+
+        if (material.color) {
+          material.color = new THREE.Color(scale(Math.random()).hex());
+        }
+
+        if (material.name && material.name.indexOf("building") === 0) {
+          if ("emissive" in material) material.emissive = new THREE.Color(0x444444);
+          material.transparent = true;
+          material.opacity = 0.8;
+        }
+      }
+
+      // ------------------------------------------------------------
+      // Box3 ユーティリティ（互換重視）
+      // ------------------------------------------------------------
+      function computeBox(object) {
+        return new THREE.Box3().setFromObject(object);
+      }
+
+      function computeCenter(box) {
+        var c = new THREE.Vector3();
+        if (typeof box.getCenter === "function") {
+          box.getCenter(c);
+        } else {
+          c.addVectors(box.min, box.max).multiplyScalar(0.5);
+        }
+        return c;
+      }
+
+      function computeSize(box) {
+        if (typeof box.getSize === "function") {
+          var out = new THREE.Vector3();
+          box.getSize(out);
+          return out;
+        }
+        return new THREE.Vector3(
+          Math.abs(box.max.x - box.min.x),
+          Math.abs(box.max.y - box.min.y),
+          Math.abs(box.max.z - box.min.z)
+        );
+      }
+
+      // ------------------------------------------------------------
+      // 中心合わせ＆床置き
+      // 1) AABBの中心を原点へ
+      // 2) AABBの minY を 0 に合わせて “地面を揃える”
+      // ------------------------------------------------------------
+      function centerAndPlaceOnFloor(object) {
+        var box = computeBox(object);
+        var center = computeCenter(box);
+        object.position.sub(center);
+
+        var box2 = computeBox(object);
+        object.position.y -= box2.min.y;
+      }
+
+      // ------------------------------------------------------------
+      // 床・グリッドを “街サイズ” に合わせて更新
+      // ------------------------------------------------------------
+      function updateFloorAndGrid(floorSize) {
+        if (floor.geometry && typeof floor.geometry.dispose === "function") floor.geometry.dispose();
+        floor.geometry = new THREE.PlaneGeometry(floorSize, floorSize);
+
+        if (grid) {
+          scene.remove(grid);
+          var div = Math.max(10, Math.floor(floorSize / 50));
+          grid = new THREE.GridHelper(floorSize, div);
+          if (grid.material) {
+            grid.material.opacity = 0.25;
+            grid.material.transparent = true;
+          }
+          scene.add(grid);
+        }
+      }
+
+      // ------------------------------------------------------------
+      // ✅ 重要：街の中にスポーンし、街中心を見る
+      //
+      // ポイント：
+      // - 「camera.lookAt(...)」だけだと FirstPersonControls.update() で向きが上書きされることが多い
+      // - なので “lon/lat を計算してセット” し、controls.update(0) で即反映する
+      // ------------------------------------------------------------
+      function spawnCameraInsideCity(box, size) {
+        // centerAndPlaceOnFloor 済みなら、街は概ね原点中心＆床は y=0
+        // 念のため box の中心を参照する
+        var center = computeCenter(box);
+
+        // 目線高さ：
+        // - 小さすぎる街でも最低 1.7
+        // - 巨大な街なら街の高さの 2% を目線に（スケール不明対策）
+        var eye = Math.max(params.eyeHeight, size.y * 0.02);
+
+        // “街の中” のスポーン位置：
+        // - x/z は中心付近（= 外に出にくい）
+        // - z は少し前方にずらすと、中心(原点)に建物が固まっている場合でも視界が作りやすい
+        //   ※ ただし centered のとき box は [-size/2, +size/2] 付近なので、0.25*size は確実に内部
+        var spawn = new THREE.Vector3(
+          center.x,
+          eye,
+          center.z + size.z * 0.25
+        );
+
+        camera.position.copy(spawn);
+
+        // 見る先：街中心（同じ高さにすると “地平線” が安定して見やすい）
+        var target = new THREE.Vector3(center.x, eye, center.z);
+
+        // target - camera から lon/lat を逆算
+        var dir = target.clone().sub(camera.position);
+        if (dir.length() < 1e-6) dir.set(1, 0, 0);
+        dir.normalize();
+
+        // yaw（水平角）：atan2(z, x)
+        var lon = radToDeg(Math.atan2(dir.z, dir.x));
+        // pitch（上下角）：asin(y)
+        var lat = radToDeg(Math.asin(clamp(dir.y, -1, 1)));
+
+        camControls.lon = lon;
+        camControls.lat = lat;
+
+        // 即反映（delta=0でOK）
+        camControls.update(0);
+
+        // 街サイズに応じて速度も補正しておくと “歩いてる感” が出やすい
+        // - 目安：街の対角線 / 50 くらい
+        var diag = Math.sqrt(size.x * size.x + size.y * size.y + size.z * size.z);
+        camControls.movementSpeed = clamp(diag / 50, 5, 200);
+        params.movementSpeed = camControls.movementSpeed;
+
+        // クリップも街サイズに合わせる（巨大モデルで見切れないように）
+        camera.near = Math.max(0.01, diag / 10000);
+        camera.far  = Math.max(2000, diag * 10);
+        camera.updateProjectionMatrix();
+      }
+
+      function radToDeg(r) { return r * 180 / Math.PI; }
+      function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+      // ------------------------------------------------------------
+      // Render loop
+      // ------------------------------------------------------------
+      function render() {
+        stats.update();
+
+        var delta = clock.getDelta();
+        camControls.update(delta);
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize対応
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        if (typeof camControls.handleResize === "function") {
+          camControls.handleResize();
+        }
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
