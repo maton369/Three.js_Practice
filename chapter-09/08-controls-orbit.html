@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.08 - Orbit controls（legacy / 修正版）</title>
+
+  <!--
+    目的：
+      - OrbitControls（カメラを “注視点の周りに回す” 操作）を理解する。
+      - テクスチャ付きの惑星（Mars）を表示し、autoRotate で自動回転させる。
+      - 「描画ループで controls.update() を呼ぶ」ことがアルゴリズムの核。
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) Scene / Camera / Renderer を初期化して描画の土台を作る
+      2) 光源（Ambient + Directional）を置く（Phong はライト必須）
+      3) SphereGeometry + テクスチャ（color + normal/bump）で惑星Meshを作り scene に追加
+      4) OrbitControls を (camera, renderer.domElement) で作る
+         - controls.target を “注視点” として設定（ここが軌道回転の中心）
+         - autoRotate を true にすると、update() 内で勝手に回る
+      5) requestAnimationFrame で render loop を回し続ける
+         - stats.update()
+         - controls.update()（autoRotate / damping 等の反映）
+         - renderer.render(scene, camera)
+
+    元コードの主な問題点（修正ポイント）：
+      - OrbitControls に domElement が渡されていない
+        → new THREE.OrbitControls(camera, renderer.domElement) に修正（イベント取得が安定）
+      - THREE.SceneUtils.createMultiMaterialObject を使っているが、
+        - SceneUtils が読み込まれていない
+        - しかも [planetMaterial] のみで MultiMaterial の意味が薄い
+        → new THREE.Mesh(geom, material) に修正（互換性・可読性UP）
+      - wireFrameMat を作っているが未使用
+        → GUI で wireframe 切替できるようにして学習用途にする
+      - orbitControls.update(delta) の delta 引数は実装依存で不要なことが多い
+        → update() を基本形に寄せつつ、互換のため delta を渡しても壊れない形にする
+      - resize 対応がない
+        → camera/renderer/controls を追従させる
+
+    テクスチャについての注意：
+      - mars_1k_normal.jpg は “normal map” だが、MeshPhongMaterial の bumpMap は “height map” 想定。
+      - three.js の世代によって normalMap が使えない場合がある。
+      → normalMap が使えるなら normalMap、無理なら bumpMap にフォールバックする。
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/controls/OrbitControls.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0x000000));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // このサンプルは影が必須ではないが、他サンプルとの統一でONにしておく
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // ライト（MeshPhongMaterial はライトが無いとほぼ見えない）
+      // ------------------------------------------------------------
+      var ambientLight = new THREE.AmbientLight(0x111111);
+      scene.add(ambientLight);
+
+      var dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+      dirLight.position.set(-20, 30, 40);
+      scene.add(dirLight);
+
+      // ------------------------------------------------------------
+      // 惑星（Sphere + テクスチャ）
+      // ------------------------------------------------------------
+      var planet = createPlanetMesh(new THREE.SphereGeometry(20, 40, 40));
+      scene.add(planet);
+
+      // ------------------------------------------------------------
+      // カメラ初期位置
+      // OrbitControls は “target（注視点）” の周りを回すので、
+      // camera は target から十分離して配置する。
+      // ------------------------------------------------------------
+      camera.position.set(-20, 30, 40);
+
+      // ------------------------------------------------------------
+      // OrbitControls（このサンプルの主役）
+      //
+      // 重要：
+      // - domElement を渡さないと、マウスイベントが安定しない（実装差）
+      // - target が「回転中心」になる
+      // ------------------------------------------------------------
+      var orbitControls = new THREE.OrbitControls(camera, renderer.domElement);
+
+      // 注視点：惑星中心（原点）
+      orbitControls.target.set(0, 0, 0);
+
+      // 自動回転
+      orbitControls.autoRotate = true;
+      orbitControls.autoRotateSpeed = 1.0;
+
+      // 実装が対応している場合の “慣性”
+      orbitControls.enableDamping = true;
+      orbitControls.dampingFactor = 0.08;
+
+      // ズーム/回転範囲（極端に寄りすぎたり遠ざかりすぎたりを防ぐ）
+      orbitControls.minDistance = 10;
+      orbitControls.maxDistance = 200;
+
+      // 初期状態を反映（target を変えたので update しておく）
+      orbitControls.update();
+
+      // ------------------------------------------------------------
+      // GUI：学習用に「自動回転」「ワイヤーフレーム」「回転速度」を切り替え
+      // ------------------------------------------------------------
+      var params = new (function () {
+        this.autoRotate = orbitControls.autoRotate;
+        this.autoRotateSpeed = orbitControls.autoRotateSpeed;
+        this.wireframe = false;
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(params, "autoRotate").onChange(function (v) {
+        orbitControls.autoRotate = v;
+      });
+      gui.add(params, "autoRotateSpeed", 0.0, 10.0).onChange(function (v) {
+        orbitControls.autoRotateSpeed = v;
+      });
+      gui.add(params, "wireframe").onChange(function (v) {
+        // MeshPhongMaterial を後から wireframe 化する
+        setWireframe(planet, v);
+      });
+
+      // ------------------------------------------------------------
+      // Clock：OrbitControls.update(delta) が delta を取る版もあるので用意
+      // ただし多くの版は delta 不要なので、互換優先で “渡せたら渡す” 形にする。
+      // ------------------------------------------------------------
+      var clock = new THREE.Clock();
+
+      // ------------------------------------------------------------
+      // Render loop（アルゴリズムの本体）
+      // ------------------------------------------------------------
+      function render() {
+        stats.update();
+
+        var delta = clock.getDelta();
+
+        // OrbitControls は毎フレーム update する
+        // - autoRotate を有効にした場合、ここで回転が進む
+        // - enableDamping を有効にした場合、ここで減衰が適用される
+        try {
+          // delta を取る実装もあるので渡してみる（受け取らないなら無視される）
+          orbitControls.update(delta);
+        } catch (e) {
+          // 古い実装で引数がNGなら、引数無しで呼ぶ
+          orbitControls.update();
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize 対応（カメラのアスペクトとレンダラサイズを追従）
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // 惑星メッシュ生成
+      //
+      // 元コードは SceneUtils を使っていたが、
+      // このサンプルでは “普通の Mesh” で十分なので単純化する。
+      // ------------------------------------------------------------
+      function createPlanetMesh(geom) {
+        var textureLoader = new THREE.TextureLoader();
+
+        // 表面の色（albedo）
+        var planetTexture = textureLoader.load("../assets/textures/planets/mars_1k_color.jpg");
+
+        // 法線（normal） or 代替（bump）
+        var normalTexture = textureLoader.load("../assets/textures/planets/mars_1k_normal.jpg");
+
+        // Phong：光沢と凹凸表現ができ、惑星の見栄えが良い
+        var material = new THREE.MeshPhongMaterial({
+          map: planetTexture
+        });
+
+        // normalMap が使える世代なら normalMap を優先、ダメなら bumpMap へフォールバック
+        if ("normalMap" in material) {
+          material.normalMap = normalTexture;
+        } else {
+          material.bumpMap = normalTexture;
+          material.bumpScale = 0.6;
+        }
+
+        // 学習用：凹凸を強めると変化が見やすい（好みで調整）
+        if ("normalScale" in material && material.normalScale) {
+          material.normalScale.set(1, 1);
+        }
+
+        var mesh = new THREE.Mesh(geom, material);
+        return mesh;
+      }
+
+      // ------------------------------------------------------------
+      // wireframe 切り替え
+      // Mesh/Group のどちらでも動くように traverse で対応する
+      // ------------------------------------------------------------
+      function setWireframe(object3d, enabled) {
+        if (!object3d) return;
+
+        object3d.traverse(function (child) {
+          if (child instanceof THREE.Mesh && child.material) {
+            // material が配列のケース（MultiMaterial互換）にも対応
+            if (Array.isArray(child.material)) {
+              child.material.forEach(function (m) {
+                if (m) m.wireframe = enabled;
+              });
+            } else {
+              child.material.wireframe = enabled;
+            }
+          }
+        });
+      }
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
