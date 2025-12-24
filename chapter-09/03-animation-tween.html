@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Example 09.03 - Animation tween（legacy / PLY + PointCloud morph）</title>
+
+  <!--
+    目的：
+      旧Three.js（グローバルTHREE） + PLYLoader + Tween.js を使い、
+      PLYの点群(PointCloud/Points)の “頂点座標を毎フレーム書き換える” ことで
+      モーフィング（Y方向に潰す/伸ばす）アニメーションを行う。
+
+    ■ このサンプルの核心アルゴリズム
+      1) PLYLoader で点群ジオメトリを読み込む
+      2) 「基準形状（loadedGeometry）」を clone して保持する（= 元データ）
+      3) Tween.js で pos を 1 → 0 → 1 ... と往復させる
+      4) Tween の onUpdate で “表示用ジオメトリの頂点” を pos に応じて更新する
+      5) verticesNeedUpdate = true で GPU へ再アップロードを指示する
+      6) render loop 内で TWEEN.update() を毎フレーム呼び、Tween を進める
+
+    ■ 旧コードの問題点（修正ポイント）
+      - loadedGeometry/pointCloud がロード前に参照され得る（onUpdateが先に走ると落ちる）
+        → ガード（if (!loadedGeometry || !pointCloud) return;）を入れる
+      - “3.22544” がマジックナンバーで意味が伝わらない
+        → 初期状態でのバウンディングボックスから基準Y(minY)を自動計算する
+      - geometry.vertices の更新は Geometry 専用（旧Three.js向け）
+        → このファイルは legacy 前提なので OK。ただし BufferGeometry 世代では別実装が必要。
+      - window resize 対応が無い
+        → camera/renderer を更新する
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/loaders/PLYLoader.js"></script>
+
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+  <script type="text/javascript" src="../libs/Tween.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    // ------------------------------------------------------------
+    // 旧構成（グローバルTHREE）で動く “点群モーフィング + Tween” サンプル
+    // ------------------------------------------------------------
+
+    function init() {
+      // -----------------------------
+      // Stats（FPS表示）
+      // -----------------------------
+      var stats = initStats();
+
+      // -----------------------------
+      // Scene / Camera / Renderer
+      // -----------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(10, 10, 10);
+      camera.lookAt(new THREE.Vector3(0, -2, 0));
+
+      var webGLRenderer = new THREE.WebGLRenderer({ antialias: true });
+      webGLRenderer.setClearColor(new THREE.Color(0x000000));
+      webGLRenderer.setSize(window.innerWidth, window.innerHeight);
+      webGLRenderer.shadowMap.enabled = true; // ※点群自体は影に不向きだが、旧サンプル互換でON
+
+      document.getElementById("WebGL-output").appendChild(webGLRenderer.domElement);
+
+      // -----------------------------
+      // Light（点群の見え方は主に PointsMaterial 依存だが、シーン照明は残す）
+      // -----------------------------
+      var spotLight = new THREE.SpotLight(0xffffff, 1.0);
+      spotLight.position.set(20, 20, 20);
+
+      // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルト
+      // （旧three.jsでは decay が無い/効かないこともあるが、あれば明示）
+      if ("decay" in spotLight) spotLight.decay = 0;
+
+      scene.add(spotLight);
+
+      // -----------------------------
+      // 点群（Points）関連の変数
+      //  - pointCloud: 表示に使う Points（= 書き換える対象）
+      //  - baseGeometry: 元の頂点データを保持する Geometry（= 参照専用）
+      // -----------------------------
+      var pointCloud = null;
+      var baseGeometry = null;
+
+      // “潰す基準Y” をバウンディングボックスから取る（マジックナンバー排除）
+      // 旧コードは -3.22544 をベースにしていたが、モデル依存なので自動算出する。
+      var baseMinY = 0;
+
+      // -----------------------------
+      // Tween の入力（pos）
+      // pos=1 で “原形”、pos=0 で “Y方向に底面へ潰す” のイメージ
+      // -----------------------------
+      var posSrc = { pos: 1 };
+
+      // 往復Tween（1→0→1…）
+      var tween = new TWEEN.Tween(posSrc).to({ pos: 0 }, 5000);
+      tween.easing(TWEEN.Easing.Sinusoidal.InOut);
+
+      var tweenBack = new TWEEN.Tween(posSrc).to({ pos: 1 }, 5000);
+      tweenBack.easing(TWEEN.Easing.Sinusoidal.InOut);
+
+      tween.chain(tweenBack);
+      tweenBack.chain(tween);
+
+      // -----------------------------
+      // Tweenの onUpdate：頂点を書き換える処理（ここがアルゴリズムの中心）
+      //
+      // 何をしているか：
+      //  - baseGeometry（元形状）から各頂点 e を読む
+      //  - Y座標だけを pos に応じて “底面(baseMinY)へ向かって圧縮/復元”する
+      //  - 表示用 pointCloud.geometry.vertices を更新する
+      //  - verticesNeedUpdate = true で “GPUへ再送してね” と指示する
+      //
+      // なぜ baseGeometry を別に持つのか：
+      //  - 表示用 geometry を直接潰し続けると “元の形” が失われ、戻せなくなる
+      //  - なので “参照専用の元頂点” を別に保持して毎回そこから計算する
+      // -----------------------------
+      var onUpdate = function () {
+        // ロード前に onUpdate が走っても落ちないようにガード
+        if (!baseGeometry || !pointCloud || !pointCloud.geometry) return;
+
+        var pos = this.pos; // posSrc.pos
+        var count = 0;
+
+        // baseGeometry.vertices の順序と pointCloud.geometry.vertices の順序は一致している前提
+        // （= 同じgeometryを clone して使うため）
+        baseGeometry.vertices.forEach(function (e) {
+          // “底面(baseMinY)” を固定点として Y を補間する
+          //
+          // pos=1: newY = e.y（原形）
+          // pos=0: newY = baseMinY（完全に潰れて底面に貼り付く）
+          //
+          // つまり
+          //   newY = baseMinY + (e.y - baseMinY) * pos
+          // と書ける。
+          var newY = baseMinY + (e.y - baseMinY) * pos;
+
+          // 表示用頂点を書き換える
+          pointCloud.geometry.vertices[count++].set(e.x, newY, e.z);
+        });
+
+        // Geometry（旧）ではこれを true にしないと更新が反映されない
+        pointCloud.geometry.verticesNeedUpdate = true;
+      };
+
+      tween.onUpdate(onUpdate);
+      tweenBack.onUpdate(onUpdate);
+
+      // -----------------------------
+      // dat.GUI（最小限：速度・停止/再開などを付けると学習が進む）
+      // -----------------------------
+      var controls = new (function () {
+        this.durationMs = 5000;
+        this.pause = false;
+
+        this.restart = function () {
+          // duration を変更したい時は作り直すのが簡単（Tween.jsは途中変更が面倒）
+          // ここでは “すぐ再スタート” するために stop→posリセット→start の順で行う
+          tween.stop();
+          tweenBack.stop();
+          posSrc.pos = 1;
+
+          tween.to({ pos: 0 }, this.durationMs);
+          tweenBack.to({ pos: 1 }, this.durationMs);
+
+          tween.start();
+        };
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(controls, "durationMs", 500, 20000).step(100);
+      gui.add(controls, "pause");
+      gui.add(controls, "restart");
+
+      // -----------------------------
+      // PLY ロード
+      // -----------------------------
+      var loader = new THREE.PLYLoader();
+
+      loader.load(
+        "../assets/models/test.ply",
+        function (geometry) {
+          // PLYLoader の戻りは “Geometry” 世代のことが多い（旧サンプル前提）
+          // clone して “元形状” を保持する
+          baseGeometry = geometry.clone();
+
+          // baseMinY をバウンディングボックスから取得して “潰す基準” にする
+          // （マジックナンバーを排除）
+          baseGeometry.computeBoundingBox();
+          baseMinY = baseGeometry.boundingBox.min.y;
+
+          // 点群用マテリアル（発光っぽい見え方）
+          var material = new THREE.PointsMaterial({
+            color: 0xffffff,
+            size: 0.4,
+            opacity: 0.6,
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+            map: generateSprite()
+          });
+
+          pointCloud = new THREE.Points(geometry, material);
+
+          // 旧Three.jsの “sortParticles” は Points の描画順に関する古いフラグ
+          // 現代ではあまり使わないが旧サンプル互換として残す
+          pointCloud.sortParticles = true;
+
+          scene.add(pointCloud);
+
+          // 読み込み完了後に Tween を開始する
+          // （pointCloud/baseGeometry が揃う前に onUpdate を走らせないため）
+          tween.start();
+        },
+        function (progressEvent) {
+          // 進捗：必要ならHUDへ出す
+          // console.log(progressEvent);
+        },
+        function (err) {
+          console.error("PLY load failed:", err);
+        }
+      );
+
+      // -----------------------------
+      // render loop
+      // 重要：Tween を動かすには “毎フレーム TWEEN.update()” が必要
+      //
+      // Tween.js は内部で “現在時刻” を参照して補間を進める。
+      // requestAnimationFrame のループ内で update しないと、pos が変化しない。
+      // -----------------------------
+      function render() {
+        stats.update();
+
+        // pause の場合は Tween を進めない（モーフ停止）
+        if (!controls.pause) {
+          TWEEN.update();
+        }
+
+        requestAnimationFrame(render);
+        webGLRenderer.render(scene, camera);
+      }
+
+      // -----------------------------
+      // 画面リサイズ対応
+      // -----------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        webGLRenderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // -----------------------------
+      // Sprite（点のテクスチャ）生成
+      // 点を “丸いグロー” に見せるための小さな canvas を Texture にする。
+      // -----------------------------
+      function generateSprite() {
+        var canvas = document.createElement("canvas");
+        canvas.width = 16;
+        canvas.height = 16;
+
+        var context = canvas.getContext("2d");
+        var gradient = context.createRadialGradient(
+          canvas.width / 2,
+          canvas.height / 2,
+          0,
+          canvas.width / 2,
+          canvas.height / 2,
+          canvas.width / 2
+        );
+
+        gradient.addColorStop(0, "rgba(255,255,255,1)");
+        gradient.addColorStop(0.2, "rgba(0,255,255,1)");
+        gradient.addColorStop(0.4, "rgba(0,0,64,1)");
+        gradient.addColorStop(1, "rgba(0,0,0,1)");
+
+        context.fillStyle = gradient;
+        context.fillRect(0, 0, canvas.width, canvas.height);
+
+        var texture = new THREE.Texture(canvas);
+        texture.needsUpdate = true;
+        return texture;
+      }
+
+      // -----------------------------
+      // Stats 初期化
+      // -----------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
