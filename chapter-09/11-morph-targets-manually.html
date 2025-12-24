@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.11 - Manual morph targets（修正版）</title>
+
+  <!--
+    目的：
+      - morphTargets（頂点補間）を「自分で定義して」「GUIスライダーで重みを手動制御」する。
+      - AnimationMixer を使わず、morphTargetInfluences[] を直接いじる “最小のmorph理解” を作る。
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) ベース形状（cubeGeometry）を作る
+      2) 変形先の形状（target1/target2）を作る
+      3) ベース形状に morphTargets を登録する
+         - morphTargets[i] = { name, vertices }
+         - ★重要：頂点数・頂点順序がベースと一致している必要がある
+      4) morphTargets:true の Material を付けて Mesh 化
+      5) GUI で influence（重み）を [0..1] の範囲で操作
+         - cube.morphTargetInfluences[i] に反映
+      6) render loop は描画 + stats.update のみ（補間はGPU側で行われる）
+
+    元コードの不具合/危険点（修正内容）：
+      - plane.position.x = plane.position.y = 0; の行が壊れている（x が代入されない）
+      - morphTargets の順序と target の対応が分かりにくい（t1/t2 と target1/2 が逆っぽい）
+      - GUIの初期値が 0.01 で、開始直後に “ほぼ変化が見えない”
+      - 2つの influence を同時に上げると合成されて形が直感しづらい
+        → 「合計を 1 に正規化するオプション」を追加（教材的に分かりやすい）
+
+    注意：
+      - このサンプルは Geometry / vertices を使う “古い three.js 系” を前提。
+      - BufferGeometry 前提の新しい three.js では書き方が変わる。
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // 床（位置代入バグを修正）
+      // ------------------------------------------------------------
+      var planeGeometry = new THREE.PlaneGeometry(20, 20, 1, 1);
+      var planeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+      var plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+      plane.rotation.x = -0.5 * Math.PI;
+      plane.position.x = 0;  // ✅ 元コードはここが壊れていた
+      plane.position.y = 0;
+      plane.position.z = 0;
+
+      scene.add(plane);
+
+      // ------------------------------------------------------------
+      // “手動 morphTargets” の本体：ベース形状 + 変形先を自分で用意する
+      //
+      // ★重要：morphTargets は「ベースと頂点数が一致」している必要がある。
+      // 今回は BoxGeometry 同士なので、基本的に頂点構造が一致しやすい（教材向き）。
+      // ------------------------------------------------------------
+      var baseGeometry = new THREE.BoxGeometry(4, 4, 4);
+
+      // morphTargets:true が無いと morphTargetInfluences が反映されない
+      var cubeMaterial = new THREE.MeshLambertMaterial({
+        color: 0xff0000,
+        morphTargets: true
+      });
+
+      // 変形先形状（頂点配列を morphTargets に流し込む）
+      // targetTall: 縦長（背が高い）
+      // targetWide: 幅広（横に太い）
+      var targetTall = new THREE.BoxGeometry(2, 10, 2);
+      var targetWide = new THREE.BoxGeometry(8, 2, 8);
+
+      // ------------------------------------------------------------
+      // morphTargets 登録（対応関係を分かりやすくする）
+      //
+      // morphTargets[0] = tall, morphTargets[1] = wide
+      // → GUI の influence1/influence2 と対応しやすい
+      // ------------------------------------------------------------
+      baseGeometry.morphTargets = baseGeometry.morphTargets || [];
+      baseGeometry.morphTargets[0] = { name: "tall", vertices: targetTall.vertices };
+      baseGeometry.morphTargets[1] = { name: "wide", vertices: targetWide.vertices };
+
+      // Mesh 化
+      var cube = new THREE.Mesh(baseGeometry, cubeMaterial);
+      cube.position.set(0, 3, 0);
+      scene.add(cube);
+
+      // ------------------------------------------------------------
+      // Camera / Light（Lambert なのでライト必須）
+      // ------------------------------------------------------------
+      camera.position.set(-15, 15, 15);
+      camera.lookAt(scene.position);
+
+      var ambientLight = new THREE.AmbientLight(0x0c0c0c);
+      scene.add(ambientLight);
+
+      var spotLight = new THREE.SpotLight(0xffffff);
+      spotLight.position.set(-25, 25, 15);
+
+      // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルト
+      if ("decay" in spotLight) spotLight.decay = 0;
+
+      scene.add(spotLight);
+
+      // ------------------------------------------------------------
+      // dat.GUI（morphTargetInfluences を “手動で” 直接操作する）
+      //
+      // morphTargetInfluences[i] は「morphTargets[i] の重み」。
+      // 0 → 変形なし（ベース）
+      // 1 → 変形先そのもの
+      //
+      // ※ 2つを同時に上げると “合成” される。
+      //    それが分かりにくい場合に備えて normalize を用意する。
+      // ------------------------------------------------------------
+      var controls = new (function () {
+        // 初期値は分かりやすく 0 にしておく（0.01 だと変化が見えにくい）
+        this.influenceTall = 0.0;
+        this.influenceWide = 0.0;
+
+        // 合計を 1 に正規化する（教材用の補助機能）
+        this.normalizeSumToOne = false;
+
+        this.update = function () {
+          var a = controls.influenceTall;
+          var b = controls.influenceWide;
+
+          // normalize 有効なら、a+b が 1 を超えたときに比率で縮める
+          if (controls.normalizeSumToOne) {
+            var s = a + b;
+            if (s > 1e-6 && s > 1.0) {
+              a = a / s;
+              b = b / s;
+            }
+          }
+
+          // morphTargetInfluences は Mesh に生えている
+          cube.morphTargetInfluences[0] = a; // tall
+          cube.morphTargetInfluences[1] = b; // wide;
+        };
+
+        // 便利：一発で戻す
+        this.reset = function () {
+          controls.influenceTall = 0.0;
+          controls.influenceWide = 0.0;
+          controls.update();
+        };
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(controls, "influenceTall", 0, 1).onChange(controls.update);
+      gui.add(controls, "influenceWide", 0, 1).onChange(controls.update);
+      gui.add(controls, "normalizeSumToOne").onChange(controls.update);
+      gui.add(controls, "reset");
+
+      // 初期反映
+      controls.update();
+
+      // ------------------------------------------------------------
+      // Render loop
+      //
+      // このサンプルの肝は「influences の値」なので、
+      // ループ側は stats と render だけでOK。
+      // ------------------------------------------------------------
+      function render() {
+        stats.update();
+        renderer.render(scene, camera);
+        requestAnimationFrame(render);
+      }
+
+      // ------------------------------------------------------------
+      // resize 対応
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
