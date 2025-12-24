@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.10 - Working with morph targets（legacy JSONLoader）</title>
+
+  <!--
+    目的：
+      - 旧 three.js の JSONLoader で “morphTargets（頂点アニメーション）” を含むモデル（horse.js）を読み込み、
+        1) MorphTargetSequence から AnimationClip を作って自動再生する
+        2) dat.GUI で特定フレーム（形状）を切り替えて観察する
+      を同時に行う。
+
+    このサンプルの全体アルゴリズム（コア）：
+      [初期化]
+      1) Scene / Camera / Renderer を準備
+      2) ライトを置く（Lambert系はライト必須）
+      3) GUI を用意して “フレーム番号” を変更したら showFrame() を呼ぶようにする
+      4) JSONLoader で horse.js を非同期ロード
+         4-1) geometry.computeVertexNormals() で陰影を成立させる
+         4-2) morphTargets を有効化した Material を作る（morphTargets:true）
+         4-3) Mesh を作って scene に追加
+         4-4) “観察用フレーム” を用意（基準形状 + 各 morphTarget 形状）
+         4-5) AnimationMixer を作り、MorphTargetSequence から Clip を生成して action.play()
+
+      [毎フレーム]
+      5) clock.getDelta() で deltaTime を取り
+      6) mixer.update(delta) で morph animation を進める
+      7) renderer.render(scene,camera)
+
+    修正ポイント（元コードの問題）：
+      - frames 配列に push する morphMesh の position.x を push後に変更していて反映が分かりにくい
+        → position 設定は add前に行う
+      - showFrame() が frames 未構築状態でも呼べる構造になっている（GUI操作など）
+        → showFrame() 内でガード（frames.length / index 範囲）を入れる
+      - currentMesh の初期化が曖昧（clone しただけで scene 追加の整合が取りづらい）
+        → “観察用の表示枠” は専用にし、最初に showFrame(0) で確定させる
+      - mesh.rotation を mixer の有無に依存させるのは意図が混ざる
+        → 回転は “再生対象（mesh）” の存在チェックで分岐
+      - webGLRenderer.clear() はデフォで clear されるのでノイズ（multi-pass でない限り不要）
+        → 削除（必要ならコメント付きで残す）
+      - 使っていない変数（step / prevTime）が残っている
+        → 削除して教材としての見通しを上げる
+
+    重要な理解ポイント（morphTargets の仕組み）：
+      - morphTargets は “同じトポロジ（頂点数・並びが同じ）” の形状差分を重みで混ぜて形状を作る
+      - AnimationMixer + ClipAction は “各 morphTargetInfluences を時間で変化させる” ことで走る
+      - GUI で frame を表示するのは “実際の morphTargets を単体で見たい” というデバッグ用途
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+      // 馬を少し斜め上から見下ろす配置（モデル座標に依存するがサンプルとして見やすい）
+      camera.position.set(250, 250, 350);
+      camera.lookAt(new THREE.Vector3(100, 50, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // ライト（LambertMaterial はライトが必須）
+      // ------------------------------------------------------------
+      var keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
+      keyLight.position.set(300, 200, 300);
+      scene.add(keyLight);
+
+      // 影の成立条件を揃えるなら castShadow / receiveShadow / floor が要るが、
+      // このサンプルは morphTargets の学習が主目的なので “ライト最小構成” に留める。
+
+      // ------------------------------------------------------------
+      // GUI（キーとなる “観察用フレーム” を切り替える）
+      // ------------------------------------------------------------
+      var controls = new (function () {
+        this.keyframe = 0;
+      })();
+
+      var gui = new dat.GUI();
+      // frames の数はロード後に確定するため、GUI の onChange は showFrame がガードする
+      gui.add(controls, "keyframe", 0, 15).step(1).onChange(function (v) {
+        showFrame(v);
+      });
+
+      // ------------------------------------------------------------
+      // Morph animation 用の状態
+      // ------------------------------------------------------------
+      var clock = new THREE.Clock();
+
+      // 実際にアニメーション再生される Mesh（morphTargets を持つ）
+      var animatedMesh = null;
+
+      // AnimationMixer（morphTargetInfluences を時間で更新する制御器）
+      var mixer = null;
+
+      // “観察用フレーム” を並べた配列（0: base 以降: morphTarget 形状）
+      var frames = [];
+
+      // 現在 scene に表示している観察用フレームの Mesh
+      var currentFrameMesh = null;
+
+      // ------------------------------------------------------------
+      // JSONLoader（legacy）でモデルをロード
+      // ------------------------------------------------------------
+      var loader = new THREE.JSONLoader();
+      loader.load(
+        "../assets/models/horse.js",
+        function (geometry /*, materialsFromFile */) {
+          // --------------------------------------------------------
+          // 1) 形状の陰影のために法線計算
+          // --------------------------------------------------------
+          if (typeof geometry.computeVertexNormals === "function") {
+            geometry.computeVertexNormals();
+          }
+
+          // --------------------------------------------------------
+          // 2) morphTargets を使う Material（ここが重要）
+          //
+          // morphTargets:true を付けると、renderer が morphTargetInfluences を参照して
+          // 頂点を補間するシェーダに切り替える（旧three.jsの仕組み）
+          // --------------------------------------------------------
+          var morphMaterial = new THREE.MeshLambertMaterial({
+            morphTargets: true,
+            vertexColors: THREE.FaceColors
+          });
+
+          // 観察用（単体フレーム表示）では morphTargets は不要なので普通の Lambert を使う
+          var frameMaterial = new THREE.MeshLambertMaterial({
+            color: 0xffffff,
+            vertexColors: THREE.FaceColors
+          });
+
+          // --------------------------------------------------------
+          // 3) アニメーション対象 Mesh を作って scene に追加
+          // --------------------------------------------------------
+          animatedMesh = new THREE.Mesh(geometry, morphMaterial);
+          animatedMesh.position.x = 200;
+          scene.add(animatedMesh);
+
+          // --------------------------------------------------------
+          // 4) 観察用フレーム群を用意
+          //
+          // frames[0] = base geometry（元の形状）
+          // frames[1..] = 各 morphTarget を “単体形状” として Mesh 化したもの
+          //
+          // 注意：
+          // 旧 JSONLoader の morphTargets は geometry.morphTargets に入り、
+          // それぞれが { name, vertices } を持つことが多い。
+          // vertices は “その morph の頂点位置配列”。
+          // --------------------------------------------------------
+          frames = []; // 念のため初期化し直す（再ロード時にも安全）
+
+          // base（元形状）を frames[0] に
+          var baseFrame = animatedMesh.clone();
+          baseFrame.material = frameMaterial;
+          baseFrame.position.x = -100;
+          frames.push(baseFrame);
+
+          // morphTargets を 1つずつ可視化用 Mesh にする
+          if (geometry.morphTargets && geometry.morphTargets.length > 0) {
+            geometry.morphTargets.forEach(function (mt) {
+              // mt.vertices は morph の頂点配列（THREE.Vector3 の配列想定）
+              var g = new THREE.Geometry();
+              g.vertices = mt.vertices;
+              g.faces = geometry.faces; // faces は元形状と同じトポロジを共有する
+              // 法線が必要なら computeVertexNormals。軽量化優先で省略してもよいが、見栄えのために計算。
+              if (typeof g.computeVertexNormals === "function") g.computeVertexNormals();
+
+              var frameMesh = new THREE.Mesh(g, frameMaterial);
+              frameMesh.position.x = -100;
+              frames.push(frameMesh);
+            });
+          }
+
+          // --------------------------------------------------------
+          // 5) AnimationMixer + MorphTargetSequence
+          //
+          // アルゴリズム：
+          // - geometry.morphTargets を “連番フレーム” とみなして Clip を生成
+          // - mixer.clipAction(clip) で再生アクションを作り play()
+          //
+          // CreateFromMorphTargetSequence(name, morphTargets, fps)
+          // - fps=30 なら 1秒間に 30フレーム進むイメージ
+          // - setDuration(1) で 1秒で一周するように縮めて “ギャロップ感” を強くする
+          // --------------------------------------------------------
+          mixer = new THREE.AnimationMixer(animatedMesh);
+
+          var clip = THREE.AnimationClip.CreateFromMorphTargetSequence(
+            "gallop",
+            geometry.morphTargets,
+            30
+          );
+
+          var action = mixer.clipAction(clip);
+          action.setDuration(1).play();
+
+          // --------------------------------------------------------
+          // 6) 最初の観察フレーム表示
+          // --------------------------------------------------------
+          showFrame(0);
+
+          // GUI の最大値を “frames の数に合わせて” 調整すると親切
+          // （dat.GUI の内部 API に依存するので安全な範囲で）
+          try {
+            // gui.__controllers[0] が keyframe コントローラである前提（サンプル用途）
+            var c = gui.__controllers[0];
+            if (c) {
+              c.__max = Math.max(0, frames.length - 1);
+              c.updateDisplay();
+            }
+          } catch (e) {}
+        },
+        "../assets/models"
+      );
+
+      // ------------------------------------------------------------
+      // 観察用：frames[n] を scene に出す
+      //
+      // 注意：
+      // - frames はロード完了後に構築される（非同期）
+      // - そのため GUI 操作が先に来ても壊れないようにガードする
+      // ------------------------------------------------------------
+      function showFrame(index) {
+        if (!frames || frames.length === 0) return;
+
+        var i = Math.max(0, Math.min(frames.length - 1, index | 0));
+
+        if (currentFrameMesh) {
+          scene.remove(currentFrameMesh);
+        }
+
+        currentFrameMesh = frames[i];
+        scene.add(currentFrameMesh);
+      }
+
+      // ------------------------------------------------------------
+      // resize 対応（学習サンプルでも必須）
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      // ------------------------------------------------------------
+      // Render loop（morphTargets は mixer.update(delta) が心臓部）
+      // ------------------------------------------------------------
+      function render() {
+        stats.update();
+
+        var delta = clock.getDelta();
+
+        // mixer が存在する＝ロード完了後なので、ここで morph animation が進む
+        if (mixer) {
+          mixer.update(delta);
+        }
+
+        // 見た目の変化を分かりやすくするために、モデル全体をゆっくり回転させる
+        // ※ アニメ再生とは独立の “演出” なので、animatedMesh の存在で判定する
+        if (animatedMesh) {
+          animatedMesh.rotation.y += 0.01;
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      render();
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
