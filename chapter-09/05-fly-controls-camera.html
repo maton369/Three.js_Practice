@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.05 - FlyControls（legacy / OBJ+MTL）</title>
+
+  <!--
+    目的：
+      FlyControls（FPS/フライト系のカメラ操作）で「空を飛ぶように」視点移動しながら、
+      OBJ+MTL（city.obj / city.mtl）を読み込んで表示する。
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) Scene / Camera / Renderer を初期化して描画の土台を作る
+      2) FlyControls を (camera, renderer.domElement) に紐付ける
+         - delta 時間を渡し、毎フレーム update(delta) する
+      3) ライトを置く（Lambert/Phong系はライト必須）
+      4) MTLLoader -> OBJLoader の順に非同期ロードし、読み込んだ Object3D を scene.add
+      5) requestAnimationFrame で render loop を回す
+         - stats.update()
+         - delta = clock.getDelta()
+         - flyControls.update(delta)
+         - renderer.render(scene, camera)
+
+    元コードの問題点（修正ポイント）：
+      - FlyControls の domElement の指定が不安定
+        元：flyControls.domElement = document.querySelector("#WebGL-output")
+        問題：controls は「イベントを拾う要素」が重要で、canvas（renderer.domElement）に紐付けるのが安全。
+        → new THREE.FlyControls(camera, renderer.domElement) に寄せる（実装差分にも強い）
+      - renderer.domElement を DOM に append する前に controls を触っていた
+        → 先に append してから controls を作るほうが事故が少ない
+      - texture を読み込んでいるがどこにも適用していない（教材としてノイズ）
+        → このサンプルは FlyControls が主題なので削除
+      - MultiMaterial 前提は three.js の世代差分で壊れやすい
+        → material.materials 配列を持つかどうかで安全に処理
+      - resize 対応がない
+        → camera/renderer の追従を追加
+      - shadowMap.enabled=true だけでは影が出ない
+        → light.castShadow / mesh.castShadow / floor.receiveShadow を揃える
+      - autoForward=true は “勝手に前進し続ける” ので酔いやすい
+        → GUI で切り替えられるようにする（教材としても良い）
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/loaders/MTLLoader.js"></script>
+  <script type="text/javascript" src="../libs/loaders/OBJLoader.js"></script>
+
+  <script type="text/javascript" src="../libs/controls/FlyControls.js"></script>
+
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+  <script type="text/javascript" src="../libs/chroma.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #hint {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre;
+      user-select: none;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+  <div id="hint">
+操作の目安（FlyControlsの典型）：
+- W/S : 前後移動   - A/D : 左右移動
+- R/F : 上下移動   - マウス移動 : 視点回転（dragToLook=falseのとき）
+※ 実装世代によってキー割り当ては多少異なる
+  </div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // 時間管理：FlyControls.update(delta) に渡すための Clock
+      // delta は「前フレームからの経過秒」で、フレームレート差を吸収する。
+      // ------------------------------------------------------------
+      var clock = new THREE.Clock();
+
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        3000
+      );
+
+      // FlyControls は「カメラを動かす」ので、初期位置は少し引いたところに置く
+      camera.position.set(100, 100, 300);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0x000000));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      // Canvas を DOM に追加（controls のイベント先が確定する）
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // FlyControls（このサンプルの主役）
+      //
+      // 重要：
+      // - FlyControls は入力（キー/マウス）を受けて camera の姿勢・位置を更新する
+      // - そのため「毎フレーム update(delta)」が必須
+      // - イベントを拾う要素は renderer.domElement（canvas）に寄せるのが安全
+      // ------------------------------------------------------------
+      // 旧実装の差分で (camera) しか受けない版もあるため、
+      // “両対応”にする：第2引数が使えるなら渡し、無理なら後で domElement をセットする。
+      var flyControls;
+      try {
+        flyControls = new THREE.FlyControls(camera, renderer.domElement);
+      } catch (e) {
+        flyControls = new THREE.FlyControls(camera);
+        flyControls.domElement = renderer.domElement;
+      }
+
+      // パラメータ（GUIから変更できるように後で参照する）
+      flyControls.movementSpeed = 25;           // 移動速度
+      flyControls.rollSpeed = Math.PI / 24;     // ロール（横回転）速度
+      flyControls.autoForward = false;          // 自動前進（酔いやすいのでデフォルトOFF推奨）
+      flyControls.dragToLook = true;            // ドラッグ中だけ視点変更（意図しない回転を減らす）
+
+      // ------------------------------------------------------------
+      // 照明（Lambert/Phong系はライト必須）
+      // ------------------------------------------------------------
+      var ambientLight = new THREE.AmbientLight(0x383838);
+      scene.add(ambientLight);
+
+      // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルト
+      var spotLight = new THREE.SpotLight(0xffffff, 1.6);
+      spotLight.position.set(100, 140, 130);
+      if ("decay" in spotLight) spotLight.decay = 0;
+
+      // 影：ライト側 castShadow が必要
+      spotLight.castShadow = true;
+      if (spotLight.shadow && spotLight.shadow.mapSize) {
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+      }
+      scene.add(spotLight);
+
+      // 影が確認できる床（receiveShadow=true）
+      var floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(1200, 1200),
+        new THREE.MeshLambertMaterial({ color: 0x111111 })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = -1;
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // ------------------------------------------------------------
+      // dat.GUI（FlyControlsのパラメータを可視化・調整できるようにする）
+      // ------------------------------------------------------------
+      var controls = new (function () {
+        this.movementSpeed = flyControls.movementSpeed;
+        this.rollSpeed = flyControls.rollSpeed;
+        this.autoForward = flyControls.autoForward;
+        this.dragToLook = flyControls.dragToLook;
+        this.randomizeColors = true;
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(controls, "movementSpeed", 1, 200).onChange(function (v) { flyControls.movementSpeed = v; });
+      gui.add(controls, "rollSpeed", 0.01, Math.PI / 4).onChange(function (v) { flyControls.rollSpeed = v; });
+      gui.add(controls, "autoForward").onChange(function (v) { flyControls.autoForward = v; });
+      gui.add(controls, "dragToLook").onChange(function (v) { flyControls.dragToLook = v; });
+      gui.add(controls, "randomizeColors");
+
+      // ------------------------------------------------------------
+      // モデル参照（ロード完了後に入る）
+      // ------------------------------------------------------------
+      var cityModel = null;
+
+      // ------------------------------------------------------------
+      // OBJ + MTL のロード（非同期）
+      //
+      // アルゴリズム：
+      //   1) MTLLoader で .mtl を読み、materials を生成
+      //   2) OBJLoader に materials を渡して .obj を読み、Object3D を生成
+      //   3) traverse で Mesh を加工（影、色など）
+      //   4) 位置調整（中心合わせ＆床合わせ）
+      //   5) scene.add
+      // ------------------------------------------------------------
+      var mtlLoader = new THREE.MTLLoader();
+      mtlLoader.setPath("../assets/models/");
+
+      // setBaseUrl は実装差分があるので “あれば使う” で安全に
+      if (typeof mtlLoader.setBaseUrl === "function") {
+        mtlLoader.setBaseUrl("../assets/models/");
+      }
+
+      mtlLoader.load("city.mtl", function (materials) {
+        materials.preload();
+
+        var objLoader = new THREE.OBJLoader();
+        objLoader.setMaterials(materials);
+        objLoader.setPath("../assets/models/");
+
+        objLoader.load(
+          "city.obj",
+          function (object) {
+            cityModel = object;
+
+            // 影設定（モデル側）
+            cityModel.traverse(function (child) {
+              if (child instanceof THREE.Mesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+              }
+            });
+
+            // 見た目演出：ランダムカラー
+            if (controls.randomizeColors) {
+              var scale = chroma.scale(["red", "green", "blue"]);
+              setRandomColors(cityModel, scale);
+            }
+
+            // 操作しやすいように中心を原点へ寄せて床に置く
+            centerAndPlaceOnFloorCompat(cityModel);
+
+            scene.add(cityModel);
+          },
+          function onProgress(evt) {
+            // 必要なら進捗表示用（教材では省略してOK）
+          },
+          function onError(err) {
+            console.error("OBJ load failed:", err);
+          }
+        );
+      }, undefined, function (err) {
+        console.error("MTL load failed:", err);
+      });
+
+      // ------------------------------------------------------------
+      // 色のランダム化（葉まで潜って Mesh.material を加工）
+      // MultiMaterial / materials配列の世代差分を吸収する
+      // ------------------------------------------------------------
+      function setRandomColors(object, scale) {
+        var children = object.children;
+
+        if (children && children.length > 0) {
+          children.forEach(function (c) { setRandomColors(c, scale); });
+          return;
+        }
+
+        if (object instanceof THREE.Mesh) {
+          applyRandomColorToMaterial(object.material, scale);
+        }
+      }
+
+      function applyRandomColorToMaterial(material, scale) {
+        if (!material) return;
+
+        // 旧 MultiMaterial / materials配列互換
+        if (material.materials && Array.isArray(material.materials)) {
+          material.materials.forEach(function (m) {
+            applyRandomColorToMaterial(m, scale);
+          });
+          return;
+        }
+
+        // 通常の単一 Material
+        if (material.color) {
+          material.color = new THREE.Color(scale(Math.random()).hex());
+        }
+
+        // building... は “少し発光 + 半透明” の演出
+        if (material.name && material.name.indexOf("building") === 0) {
+          if ("emissive" in material) material.emissive = new THREE.Color(0x444444);
+          material.transparent = true;
+          material.opacity = 0.8;
+        }
+      }
+
+      // ------------------------------------------------------------
+      // 中心合わせ＆床置き（Box3 API 互換）
+      //
+      // 元の TrackballControls サンプルで出ていた：
+      //   box.getCenter is not a function
+      // を避けるため、旧版では box.center() を使うなど互換を入れる。
+      //
+      // アルゴリズム：
+      //  1) setFromObject で AABB(Box3) を求める
+      //  2) center を取得して position -= center（回転中心が自然になる）
+      //  3) 再度 AABB を取り直し、min.y を 0 に合わせて床に置く
+      // ------------------------------------------------------------
+      function getBoxCenterCompat(box) {
+        // 新：getCenter(target)
+        if (typeof box.getCenter === "function") {
+          var c = new THREE.Vector3();
+          box.getCenter(c);
+          return c;
+        }
+
+        // 旧：center(target) or center()
+        if (typeof box.center === "function") {
+          // 実装により center() が Vector3 を返す/targetに書くが分かれるので両対応
+          var out = new THREE.Vector3();
+          var r = box.center(out);
+          return r && r.isVector3 ? r : out;
+        }
+
+        // 最終手段：min/max の平均
+        return new THREE.Vector3(
+          (box.min.x + box.max.x) / 2,
+          (box.min.y + box.max.y) / 2,
+          (box.min.z + box.max.z) / 2
+        );
+      }
+
+      function centerAndPlaceOnFloorCompat(object) {
+        var box = new THREE.Box3().setFromObject(object);
+        var center = getBoxCenterCompat(box);
+
+        object.position.sub(center);
+
+        var box2 = new THREE.Box3().setFromObject(object);
+        object.position.y -= box2.min.y;
+      }
+
+      // ------------------------------------------------------------
+      // Render loop（毎フレーム実行）
+      //
+      // FlyControls の本質：
+      //  - 入力を読み取り、カメラを更新するのは flyControls.update(delta)
+      //  - その後に renderer.render(scene,camera) で “更新されたカメラ” で描画する
+      // ------------------------------------------------------------
+      function render() {
+        stats.update();
+
+        var delta = clock.getDelta();
+        flyControls.update(delta);
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize 対応
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        // FlyControls 側に resize がある実装もあるので、安全に呼ぶ
+        if (flyControls && typeof flyControls.handleResize === "function") {
+          flyControls.handleResize();
+        }
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
