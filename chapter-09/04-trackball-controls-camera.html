@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.04 - Trackball controls（legacy / OBJ+MTL）</title>
+
+  <!--
+    いま出ているエラー：
+      Uncaught TypeError: box.getCenter is not a function
+
+    原因：
+      あなたが使っている ../libs/three.js はかなり古いバージョン（ログに “THREE.WebGLRenderer 78” が出ているので r78 付近）で、
+      Box3 の API が現行と違う。
+
+      - 現行：box.getCenter(target)
+      - 旧版(r78あたり)：box.center(target)
+
+    解決方針：
+      “互換レイヤ” を作り、getCenter が無ければ center を呼ぶ。
+      （同様に getSize / size の差分にも備えると安全）
+
+    このサンプルのアルゴリズム（要点）：
+      1) Scene / Camera / Renderer 初期化
+      2) TrackballControls を (camera, renderer.domElement) に紐付ける
+      3) MTLLoader → OBJLoader で非同期ロードして Object3D を得る
+      4) traverse で Mesh を見つけ、影やマテリアルの調整を行う
+      5) Box3 でバウンディングを取り、中心合わせ＆床置き（←今回ここが壊れていた）
+      6) requestAnimationFrame で描画ループを回し、TrackballControls.update(delta) を毎フレーム呼ぶ
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/loaders/MTLLoader.js"></script>
+  <script type="text/javascript" src="../libs/loaders/OBJLoader.js"></script>
+
+  <script type="text/javascript" src="../libs/controls/TrackballControls.js"></script>
+
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+  <script type="text/javascript" src="../libs/chroma.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      var clock = new THREE.Clock();
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+      camera.position.set(100, 100, 300);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0x000000));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // TrackballControls（主役）
+      // 旧実装でも “domElement を渡す” のが基本。これが無いとイベントが拾えないことがある。
+      // ------------------------------------------------------------
+      var trackballControls = new THREE.TrackballControls(camera, renderer.domElement);
+      trackballControls.rotateSpeed = 1.0;
+      trackballControls.zoomSpeed = 1.0;
+      trackballControls.panSpeed = 1.0;
+      trackballControls.staticMoving = true;
+
+      // ------------------------------------------------------------
+      // 照明（Lambert/Phong系はライト必須）
+      // ------------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x383838));
+
+      var spotLight = new THREE.SpotLight(0xffffff, 1.0);
+      spotLight.position.set(300, 300, 300);
+      spotLight.castShadow = true;
+
+      if (spotLight.shadow && spotLight.shadow.mapSize) {
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+      }
+
+      // ユーザー方針：SpotLight/PointLight の decay は 0
+      // ※ r78 では decay が存在しないこともあるので “あれば設定”
+      if ("decay" in spotLight) spotLight.decay = 0;
+
+      scene.add(spotLight);
+
+      // 影の受け皿（床）
+      var floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(800, 800),
+        new THREE.MeshLambertMaterial({ color: 0x111111 })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = -1;
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // ------------------------------------------------------------
+      // dat.GUI（操作パラメータ）
+      // ------------------------------------------------------------
+      var controls = new (function () {
+        this.rotateSpeed = trackballControls.rotateSpeed;
+        this.zoomSpeed = trackballControls.zoomSpeed;
+        this.panSpeed = trackballControls.panSpeed;
+        this.randomizeColors = true;
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(controls, "rotateSpeed", 0.1, 5.0).onChange(function (v) { trackballControls.rotateSpeed = v; });
+      gui.add(controls, "zoomSpeed", 0.1, 5.0).onChange(function (v) { trackballControls.zoomSpeed = v; });
+      gui.add(controls, "panSpeed", 0.1, 5.0).onChange(function (v) { trackballControls.panSpeed = v; });
+      gui.add(controls, "randomizeColors");
+
+      // ------------------------------------------------------------
+      // モデル参照（ロード後に入る）
+      // ------------------------------------------------------------
+      var cityModel = null;
+
+      // ------------------------------------------------------------
+      // OBJ + MTL のロード（非同期）
+      // ------------------------------------------------------------
+      var mtlLoader = new THREE.MTLLoader();
+      mtlLoader.setPath("../assets/models/");
+
+      mtlLoader.load("city.mtl", function (materials) {
+        materials.preload();
+
+        var objLoader = new THREE.OBJLoader();
+        objLoader.setMaterials(materials);
+        objLoader.setPath("../assets/models/");
+
+        objLoader.load("city.obj", function (object) {
+          cityModel = object;
+
+          // 影設定（影を落とす/受ける）
+          cityModel.traverse(function (child) {
+            if (child instanceof THREE.Mesh) {
+              child.castShadow = true;
+              child.receiveShadow = true;
+            }
+          });
+
+          // ランダムカラー付与（演出）
+          if (controls.randomizeColors) {
+            var scale = chroma.scale(["red", "green", "blue"]);
+            setRandomColors(cityModel, scale);
+          }
+
+          // スケール（必要に応じて調整）
+          cityModel.scale.set(1, 1, 1);
+
+          // ★ここが今回の修正ポイント：Box3 API差分を吸収して中心合わせ＆床置き
+          centerAndPlaceOnFloor(cityModel);
+
+          scene.add(cityModel);
+        });
+      });
+
+      // ------------------------------------------------------------
+      // Object3D を走査して、末端 Mesh の material に色を付ける
+      // ------------------------------------------------------------
+      function setRandomColors(object, scale) {
+        var children = object.children;
+        if (children && children.length > 0) {
+          children.forEach(function (c) { setRandomColors(c, scale); });
+          return;
+        }
+        if (object instanceof THREE.Mesh) {
+          applyRandomColorToMaterial(object.material, scale);
+        }
+      }
+
+      function applyRandomColorToMaterial(material, scale) {
+        if (!material) return;
+
+        // 旧MultiMaterial互換：material.materials が配列なら個別に処理
+        if (material.materials && Array.isArray(material.materials)) {
+          material.materials.forEach(function (m) { applyRandomColorToMaterial(m, scale); });
+          return;
+        }
+
+        if (material.color) {
+          material.color = new THREE.Color(scale(Math.random()).hex());
+        }
+
+        if (material.name && material.name.indexOf("building") === 0) {
+          if ("emissive" in material) material.emissive = new THREE.Color(0x444444);
+          material.transparent = true;
+          material.opacity = 0.8;
+        }
+      }
+
+      // ------------------------------------------------------------
+      // ★互換中心合わせ＆床置き（r78 〜 現行まで動かす）
+      //
+      // アルゴリズム：
+      //   1) Box3.setFromObject(object) で AABB（軸平行バウンディング）計算
+      //   2) AABB の中心を求めて、object.position -= center（原点へ移動）
+      //   3) AABB を取り直し、min.y を 0 に合わせて床へ置く
+      //
+      // 互換ポイント：
+      //   - 現行: box.getCenter(target)
+      //   - 旧版: box.center(target)
+      // ------------------------------------------------------------
+      function getBoxCenterCompat(box, target) {
+        // 現行Three.js
+        if (typeof box.getCenter === "function") return box.getCenter(target);
+        // r78 付近
+        if (typeof box.center === "function") return box.center(target);
+        // 最悪ケース（どっちも無い場合）：min/max から手計算
+        target.set(
+          (box.min.x + box.max.x) / 2,
+          (box.min.y + box.max.y) / 2,
+          (box.min.z + box.max.z) / 2
+        );
+        return target;
+      }
+
+      function centerAndPlaceOnFloor(object) {
+        var box = new THREE.Box3().setFromObject(object);
+
+        var center = new THREE.Vector3();
+        getBoxCenterCompat(box, center);
+
+        object.position.sub(center);
+
+        // 床置き：もう一回バウンディングを取り直す（position変更を反映）
+        var box2 = new THREE.Box3().setFromObject(object);
+
+        // box2.min は Vector3（旧版でも存在する）
+        object.position.y -= box2.min.y;
+      }
+
+      // ------------------------------------------------------------
+      // 描画ループ：TrackballControls.update(delta) を毎フレーム呼ぶのが最重要
+      // ------------------------------------------------------------
+      function render() {
+        stats.update();
+
+        var delta = clock.getDelta();
+        trackballControls.update(delta);
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize対応
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        // TrackballControls はサイズ依存の内部値を持つ実装があるので、あれば呼ぶ
+        if (typeof trackballControls.handleResize === "function") {
+          trackballControls.handleResize();
+        }
+      });
+
+      render();
+
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0);
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
