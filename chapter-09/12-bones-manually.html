@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.12 - Load blender model（legacy / JSONLoader + SkinnedMesh）</title>
+
+  <!--
+    ✅ GitHubレビュー（アルゴリズム中心）
+
+    このサンプルの狙い：
+      - Blender由来の「スキニング付きモデル（hand-1.js）」を JSONLoader で読み込み、
+        SkinnedMesh（ボーンで変形できるメッシュ）として表示する。
+      - TWEEN.js を使い、時間に応じて「指を曲げる」ボーン回転を周期的に適用し、
+        “スキニング（骨→頂点変形）”の最小構成を理解する。
+
+    全体アルゴリズム（コアの流れ）：
+      1) Scene / Camera / Renderer を初期化（描画の土台）
+      2) 照明と床を配置（陰影・距離感・影の確認ができるようにする）
+      3) JSONLoader で geometry（bones/skinWeights/skinIndices などを含む）をロード
+      4) SkinnedMesh を生成し scene に追加
+      5) Box3(AABB) でモデルのサイズを測り、カメラを“必ず見える”位置へ自動配置
+      6) TWEEN で pos(0..1) を往復させる（時間→値の補間）
+      7) tween.onUpdate で pos に応じてボーン回転を更新（値→骨の姿勢）
+      8) 描画ループで stats.update / TWEEN.update / renderer.render を毎フレーム実行
+
+    重要ポイント（理解の要）：
+      - TWEEN.js は「値を補間」するだけで、メッシュ変形は onUpdate 内で骨を回すことで起きる。
+      - FirstPersonControls 等と違い、ここでは「入力」ではなく「時間」によって姿勢を変える。
+      - スキニングは “骨の回転 → skinning shader → 頂点が追従” のパイプライン。
+      - 影は renderer.shadowMap + light.castShadow + mesh.castShadow + floor.receiveShadow が揃って初めて見える。
+
+    元コードからの改善点（修正の意図）：
+      - callback引数 mat を var mat = ... で再定義していた → 変数衝突を解消
+      - onUpdate 内の console.log(mesh.skeleton) が毎フレーム大量出力 → 性能劣化を防ぐため削除
+      - tween の開始タイミングと mesh 未ロード時の参照をガード（非同期ロード事故を回避）
+      - モデルが見えない事故対策として AABB からカメラを自動フレーミング
+      - resize 対応を追加（アスペクト比とレンダラサイズ更新）
+      - ユーザー方針：SpotLight の decay は 0 をデフォルトに設定
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+  <script type="text/javascript" src="../libs/Tween.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      'use strict';
+
+      // ------------------------------------------------------------
+      // 時間管理：このサンプルは「入力」ではなく「時間」によりアニメを進める
+      // ------------------------------------------------------------
+      var clock = new THREE.Clock();
+
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+
+      // モデルロード前は仮置き。ロード後にAABBから自動で決める
+      camera.position.set(0, 0, 6);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // 高DPIでも綺麗に（重ければ削ってOK）
+      if (renderer.setPixelRatio) renderer.setPixelRatio(window.devicePixelRatio || 1);
+
+      // 影の有効化（これだけでは影は出ない。light/mesh/floorの設定も必要）
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Light（Lambert はライト必須）
+      // ------------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x333333));
+
+      var spotLight = new THREE.SpotLight(0xffffff, 2.0);
+      spotLight.position.set(0, 50, 30);
+
+      // 影の生成には light.castShadow が必須
+      spotLight.castShadow = true;
+
+      // 影品質（重ければ下げる）
+      if (spotLight.shadow && spotLight.shadow.mapSize) {
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+      }
+
+      // ユーザー方針：SpotLight/PointLight の decay は 0
+      if ("decay" in spotLight) spotLight.decay = 0;
+
+      scene.add(spotLight);
+
+      // ------------------------------------------------------------
+      // 床（影の受け皿 + 空間の手がかり）
+      // ------------------------------------------------------------
+      var floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(30, 30),
+        new THREE.MeshLambertMaterial({ color: 0xffffff })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = -2;
+
+      // 影を受けるには receiveShadow が必須
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // ------------------------------------------------------------
+      // dat.GUI：アニメの強さ・速度を弄れるようにする
+      // ------------------------------------------------------------
+      var params = new (function () {
+        this.durationMs = 3000; // 片道時間（往復で2倍）
+        this.fingerMax = 1.0;   // 指の最大カール量（rad）
+        this.wristMax  = 0.6;   // 手首の最大回転（rad）
+        this.autoPlay  = true;  // 自動再生
+        this.debugOnce = false; // ボーン名を一度だけ出力（ログ爆発防止）
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(params, "durationMs", 200, 8000).step(50).onChange(rebuildTween);
+      gui.add(params, "fingerMax", 0.0, 2.0);
+      gui.add(params, "wristMax", 0.0, 1.5);
+      gui.add(params, "autoPlay").onChange(function (v) {
+        if (!tween) return;
+        if (v) tween.start();
+        else tween.stop();
+      });
+      gui.add(params, "debugOnce");
+
+      // ------------------------------------------------------------
+      // SkinnedMesh（ロード完了後に入る）
+      // ------------------------------------------------------------
+      var mesh = null;
+
+      // ------------------------------------------------------------
+      // ボーン操作対象
+      // 注意：番号は hand-1.js 固有。モデル差し替え時は debugOnce で確認して調整する
+      // ------------------------------------------------------------
+      var fingerBoneIndices = [5, 6, 10, 11, 15, 16, 20, 21];
+      var wristBoneIndex = 1;
+
+      // ------------------------------------------------------------
+      // Tween（pos: 0..1 を時間で往復させる）
+      //
+      // アルゴリズム上の役割：
+      // - “時間 → pos(0..1)” の補間を担当（値の生成器）
+      // - “pos → ボーン回転” は onUpdate(applyPose) が担当（変形適用器）
+      // ------------------------------------------------------------
+      var tween = null;
+      var tweenState = { pos: 0 };
+
+      rebuildTween();
+
+      function rebuildTween() {
+        // 既存tweenがあれば停止（重複実行防止）
+        if (tween && typeof tween.stop === "function") tween.stop();
+
+        tweenState.pos = 0;
+
+        tween = new TWEEN.Tween(tweenState)
+          .to({ pos: 1 }, params.durationMs)
+          .easing(TWEEN.Easing.Cubic.InOut)
+          .yoyo(true)
+          .repeat(Infinity)
+          .onUpdate(applyPose);
+
+        if (params.autoPlay) tween.start();
+      }
+
+      // ------------------------------------------------------------
+      // JSONLoader（旧Three.jsのJSON形式モデルをロード）
+      //
+      // アルゴリズムの核心：
+      // - geometry 内に bones/skinWeights/skinIndices が含まれている → SkinnedMesh が成立する
+      // - SkinnedMesh は skeleton を持ち、bones の回転を shader 側で頂点に反映する
+      // ------------------------------------------------------------
+      var loader = new THREE.JSONLoader();
+      loader.load(
+        "../assets/models/hand-1.js",
+        function (geometry /*, materials */) {
+          // 法線を計算（陰影が崩れる事故を減らす）
+          if (geometry && typeof geometry.computeVertexNormals === "function") {
+            geometry.computeVertexNormals();
+          }
+
+          // skinning:true がないと骨で変形できない
+          var material = new THREE.MeshLambertMaterial({
+            color: 0xF0C8C9,
+            skinning: true
+          });
+
+          mesh = new THREE.SkinnedMesh(geometry, material);
+
+          // 影：メッシュ側 castShadow が必須
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+
+          // 見栄え用の回転（モデル座標系の都合で最初から回しておく）
+          mesh.rotation.x = 0.5 * Math.PI;
+          mesh.rotation.z = 0.7 * Math.PI;
+
+          scene.add(mesh);
+
+          // モデルが“見える位置”にカメラを自動配置（AABBベース）
+          frameCameraToObject(mesh);
+
+          // 一度だけボーン配列を確認したい場合に使う（デバッグ用）
+          if (params.debugOnce && mesh.skeleton && mesh.skeleton.bones) {
+            console.log("=== Bones (index:name) ===");
+            mesh.skeleton.bones.forEach(function (b, i) {
+              console.log(i + " : " + (b.name || "(no name)"));
+            });
+            params.debugOnce = false;
+          }
+
+          // mesh ロード直後にも一度姿勢を適用（初期値の反映）
+          applyPose();
+        },
+        "../assets/models"
+      );
+
+      // ------------------------------------------------------------
+      // pos(0..1) を “ボーン回転” に変換して適用する
+      //
+      // アルゴリズム：
+      //   1) tweenState.pos を 0..1 にクランプ
+      //   2) 指の回転角 = -pos * fingerMax（曲げ方向はモデル依存）
+      //   3) 手首の回転角 =  pos * wristMax
+      //   4) 指のボーン群へ回転を適用
+      //   5) 手首ボーンへ回転を適用
+      // ------------------------------------------------------------
+      function applyPose() {
+        if (!mesh || !mesh.skeleton || !mesh.skeleton.bones) return;
+
+        var pos = clamp(tweenState.pos, 0, 1);
+
+        var fingerAngle = -pos * params.fingerMax;
+        var wristAngle  =  pos * params.wristMax;
+
+        // 指を曲げる（z軸回転を想定。モデルによっては軸が違う）
+        for (var i = 0; i < fingerBoneIndices.length; i++) {
+          var idx = fingerBoneIndices[i];
+          var b = mesh.skeleton.bones[idx];
+          if (!b) continue;
+          b.rotation.set(0, 0, fingerAngle);
+        }
+
+        // 手首を回す（x軸回転を想定）
+        var wrist = mesh.skeleton.bones[wristBoneIndex];
+        if (wrist) wrist.rotation.set(wristAngle, 0, 0);
+      }
+
+      function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+      // ------------------------------------------------------------
+      // AABB(Box3) からカメラを “必ず見える” 位置へ置く
+      //
+      // アルゴリズム：
+      //   1) Box3.setFromObject(object) で外接直方体（AABB）を取る
+      //   2) center = (min+max)/2（互換のため手計算フォールバック）
+      //   3) size = max-min（互換のため手計算フォールバック）
+      //   4) 最大辺を基準に距離を決める（FOVの厳密解ではなく教材用の堅牢な近似）
+      //   5) camera.position を center から斜め上後方へ
+      //   6) camera.lookAt(center)
+      // ------------------------------------------------------------
+      function frameCameraToObject(object3d) {
+        var box = new THREE.Box3().setFromObject(object3d);
+
+        var center = new THREE.Vector3();
+        if (typeof box.getCenter === "function") {
+          box.getCenter(center);
+        } else {
+          center.addVectors(box.min, box.max).multiplyScalar(0.5);
+        }
+
+        var size = new THREE.Vector3();
+        if (typeof box.getSize === "function") {
+          box.getSize(size);
+        } else {
+          size.set(
+            Math.abs(box.max.x - box.min.x),
+            Math.abs(box.max.y - box.min.y),
+            Math.abs(box.max.z - box.min.z)
+          );
+        }
+
+        var maxDim = Math.max(size.x, size.y, size.z);
+        var distance = maxDim * 2.2 + 1.0; // ざっくり見切れない距離（安全側）
+
+        camera.position.set(
+          center.x,
+          center.y + maxDim * 0.6,
+          center.z + distance
+        );
+
+        // 近すぎてクリップされる事故を避ける（モデルが大きい時の保険）
+        camera.near = Math.max(0.01, distance / 200);
+        camera.far  = Math.max(2000, distance * 10);
+        camera.updateProjectionMatrix();
+
+        camera.lookAt(center);
+      }
+
+      // ------------------------------------------------------------
+      // render loop：このサンプルの“時間駆動アニメ”の中心
+      //
+      // アルゴリズム：
+      //   - stats.update()
+      //   - TWEEN.update() で tweenState.pos を更新
+      //   - （applyPose は tween.onUpdate で呼ばれる）
+      //   - renderer.render(scene, camera)
+      // ------------------------------------------------------------
+      function render() {
+        stats.update();
+
+        // delta はここでは必須ではないが、将来の拡張（Mixer等）で使えるので取る
+        var delta = clock.getDelta();
+
+        // TWEEN は内部で Date.now() を使う実装が多いので update() だけでOK
+        TWEEN.update();
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize 対応：アスペクト比とレンダラサイズ更新
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
