@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.01 - Basic textures（PVR版 / 修正版）</title>
+
+  <!--
+    目的：
+      - PVR（PowerVR系の圧縮テクスチャ）を PVRLoader で読み込み、MeshPhongMaterial.map に貼る。
+      - DDS版と同じく「ローダが違うだけで、シーン構築→テクスチャ貼り→描画ループ」というアルゴリズムは同じ。
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) Scene / Camera / Renderer を初期化
+      2) Light（Ambient + Directional）を置く（Phong はライトが無いと真っ黒になりやすい）
+      3) createMesh(geometry) を3回呼んで Mesh を生成し、scene に配置
+         - PVRLoader.load(url, onLoad, onProgress, onError) で Texture を作る
+         - Material.map にセットし、Mesh(geom, mat) を返す
+      4) requestAnimationFrame で render loop を回し、回転アニメで “貼れているか” を確認
+      5) resize 対応で camera/renderer を追従
+
+    PVR 利用時の注意（かなり重要）：
+      - PVR は「端末/GPU が対応している圧縮フォーマット」かどうかで表示できないことがある。
+        その場合はロードは成功しても、描画が想定通りにならない／真っ黒／警告が出ることがある。
+      - three.js の PVRLoader は “全PVRを万能に表示する” というより
+        「特定のPVRコンテナ/内部フォーマットを想定したローダ」であることが多い。
+        うまくいかない場合は KTX/KTX2（Basis Universal）へ移行するのが現代的な解決策。
+
+    元コードからの修正ポイント：
+      - createMesh(geom, imageFile) の imageFile が未使用 → 引数削除して意図を明確化
+      - DirectionalLight の色/強度が未指定 → 明示
+      - renderer に antialias を付与
+      - UVログが geometry 形式差で壊れやすい → 安全チェックに変更
+      - PVRロード失敗時の onError を追加（原因追跡が楽）
+      - wrap/repeat/offset/anisotropy 等を GUI で調整可能にする（貼れてる確認が早い）
+      - resize 対応追加
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+  <script type="text/javascript" src="../libs/loaders/PVRLoader.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(0, 12, 28);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Light（Phong はライト必須）
+      // ------------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x141414));
+
+      var light = new THREE.DirectionalLight(0xffffff, 1.0);
+      light.position.set(0, 30, 20);
+      scene.add(light);
+
+      // ------------------------------------------------------------
+      // Mesh（3つ並べて “同じテクスチャが別ジオメトリにどう貼れるか” を確認）
+      // ------------------------------------------------------------
+      var polyhedron = createMesh(new THREE.IcosahedronGeometry(5, 0));
+      polyhedron.position.x = 12;
+      scene.add(polyhedron);
+
+      var sphere = createMesh(new THREE.SphereGeometry(5, 20, 20));
+      sphere.position.x = 0;
+      scene.add(sphere);
+
+      var cube = createMesh(new THREE.BoxGeometry(5, 5, 5));
+      cube.position.x = -12;
+      scene.add(cube);
+
+      // UV が存在するか “安全に” 確認（Geometry/BufferGeometry 差分対策）
+      try {
+        var hasUV =
+          (cube.geometry && cube.geometry.attributes && cube.geometry.attributes.uv) ||
+          (cube.geometry && cube.geometry.faceVertexUvs && cube.geometry.faceVertexUvs[0] && cube.geometry.faceVertexUvs[0].length > 0);
+        console.log("Cube has UV:", !!hasUV);
+      } catch (e) {
+        console.log("UV check skipped (legacy geometry format difference).");
+      }
+
+      // ------------------------------------------------------------
+      // GUI：テクスチャの見え方調整（wrap/repeat/offset 等）
+      // ------------------------------------------------------------
+      var texTargets = [polyhedron, sphere, cube];
+
+      // anisotropy は renderer.capabilities から上限を取れる
+      var maxAniso = renderer.capabilities.getMaxAnisotropy();
+
+      var controls = new (function () {
+        this.rotate = true;
+
+        this.wrapRepeat = true;
+        this.repeatX = 1;
+        this.repeatY = 1;
+        this.offsetX = 0;
+        this.offsetY = 0;
+
+        // rotation があるTexture実装なら回転も可能
+        this.rotation = 0;
+
+        this.anisotropy = Math.min(4, maxAniso);
+
+        this.applyTextureParams = function () {
+          texTargets.forEach(function (m) {
+            var tex = m.material && m.material.map;
+            if (!tex) return;
+
+            if (controls.wrapRepeat) {
+              tex.wrapS = THREE.RepeatWrapping;
+              tex.wrapT = THREE.RepeatWrapping;
+            } else {
+              tex.wrapS = THREE.ClampToEdgeWrapping;
+              tex.wrapT = THREE.ClampToEdgeWrapping;
+            }
+
+            if (tex.repeat && tex.repeat.set) tex.repeat.set(controls.repeatX, controls.repeatY);
+            if (tex.offset && tex.offset.set) tex.offset.set(controls.offsetX, controls.offsetY);
+
+            if ("rotation" in tex) tex.rotation = controls.rotation;
+            if ("anisotropy" in tex) tex.anisotropy = controls.anisotropy;
+
+            tex.needsUpdate = true;
+          });
+        };
+
+        this.reset = function () {
+          this.wrapRepeat = true;
+          this.repeatX = 1;
+          this.repeatY = 1;
+          this.offsetX = 0;
+          this.offsetY = 0;
+          this.rotation = 0;
+          this.anisotropy = Math.min(4, maxAniso);
+          this.applyTextureParams();
+        };
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(controls, "rotate");
+      gui.add(controls, "wrapRepeat").onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "repeatX", 1, 8).step(1).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "repeatY", 1, 8).step(1).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "offsetX", 0, 1).step(0.01).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "offsetY", 0, 1).step(0.01).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "rotation", -Math.PI, Math.PI).step(0.01).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "anisotropy", 1, Math.max(1, maxAniso)).step(1).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "reset");
+
+      // 初期反映
+      controls.applyTextureParams();
+
+      // ------------------------------------------------------------
+      // Render loop：回転アニメで “貼れてる感” を確認
+      // ------------------------------------------------------------
+      var step = 0;
+
+      function render() {
+        stats.update();
+
+        if (controls.rotate) {
+          step += 0.01;
+
+          polyhedron.rotation.y = step;
+          polyhedron.rotation.x = step;
+
+          cube.rotation.y = step;
+          cube.rotation.x = step;
+
+          sphere.rotation.y = step;
+          sphere.rotation.x = step;
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize 対応
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // PVR で Mesh を作る（このサンプルの主題）
+      //
+      // アルゴリズム：
+      //  1) PVRLoader.load(url, onLoad, onProgress, onError) で Texture を得る（非同期）
+      //  2) Material.map にセット
+      //  3) Mesh(geom, mat) を返す
+      //
+      // 実務的なデバッグ観点：
+      //  - onError を入れて “ファイルが無い/パスが違う/サーバが返してない” を切り分ける
+      //  - PVR がGPU非対応の場合、ロード成功でも描画が崩れることがある
+      // ------------------------------------------------------------
+      function createMesh(geom) {
+        var loader = new THREE.PVRLoader();
+
+        var url = "../assets/textures/tex_base.pvr";
+
+        var texture = loader.load(
+          url,
+          function () {
+            // 読み込み成功（必要ならログ）
+            // console.log("PVR loaded:", url);
+          },
+          undefined,
+          function (err) {
+            console.log("PVR load failed:", url, err);
+          }
+        );
+
+        var mat = new THREE.MeshPhongMaterial({
+          map: texture
+        });
+
+        return new THREE.Mesh(geom, mat);
+      }
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0);
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>

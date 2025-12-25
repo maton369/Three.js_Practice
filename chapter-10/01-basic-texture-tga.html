@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.01 - Basic textures（TGA版 / 修正版）</title>
+
+  <!--
+    目的：
+      - TGALoader で .tga（Targa）画像を読み込み、MeshPhongMaterial.map として貼る。
+      - “ローダが違うだけで、シーン構築→テクスチャ貼り→描画ループ” という全体アルゴリズムは同じ。
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) Scene / Camera / Renderer を初期化
+      2) Light（Ambient + Directional）を置く（Phong はライト依存）
+      3) createMesh(geometry) を3回呼び、同じテクスチャを別形状に貼って並べる
+         - TGALoader.load(url, onLoad, onProgress, onError) で Texture を生成（非同期）
+         - Material.map にセット
+         - Mesh(geom, mat) を作って返す
+      4) requestAnimationFrame で render loop を回し、回転させて貼れているか確認
+      5) resize で camera/renderer を追従
+
+    元コードからの修正ポイント：
+      - createMesh(geom, imageFile) の imageFile が未使用 → 引数を削除して意図を明確化
+      - DirectionalLight の色/強度が未指定 → 明示して “真っ黒” を避ける
+      - renderer に antialias を付与
+      - TGALoader の onError を追加（パス違い/404/サーバ設定などの切り分け用）
+      - Texture の wrap/repeat/offset/anisotropy を GUI で調整できるように（デバッグが速い）
+      - resize 対応を追加
+
+    TGA 利用時の注意：
+      - tga は PNG/JPEG より “ブラウザでの直接表示/デバッグ” がしにくいので、
+        ロード失敗時のログ（onError）を入れておくと原因追跡が楽。
+      - tga のアルファ（透過）を使う場合は material.transparent / alphaTest などが絡むことがある。
+        今回は単純なカラーテクスチャとして扱う。
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+  <script type="text/javascript" src="../libs/loaders/TGALoader.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(0, 12, 28);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Light（Phong はライト必須）
+      // ------------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x141414));
+
+      // “色/強度” を明示：古い three.js だとデフォルトが読みづらいので固定する
+      var light = new THREE.DirectionalLight(0xffffff, 1.0);
+      light.position.set(0, 30, 20);
+      scene.add(light);
+
+      // ------------------------------------------------------------
+      // Mesh（3つ並べて比較）
+      // ------------------------------------------------------------
+      var polyhedron = createMesh(new THREE.IcosahedronGeometry(5, 0));
+      polyhedron.position.x = 12;
+      scene.add(polyhedron);
+
+      var sphere = createMesh(new THREE.SphereGeometry(5, 20, 20));
+      sphere.position.x = 0;
+      scene.add(sphere);
+
+      var cube = createMesh(new THREE.BoxGeometry(5, 5, 5));
+      cube.position.x = -12;
+      scene.add(cube);
+
+      // ------------------------------------------------------------
+      // GUI：テクスチャの見え方調整（wrap/repeat/offset 等）
+      // - “読み込めているか” と “UVがどう貼られているか” の確認が速くなる
+      // ------------------------------------------------------------
+      var targets = [polyhedron, sphere, cube];
+      var maxAniso = renderer.capabilities.getMaxAnisotropy();
+
+      var controls = new (function () {
+        this.rotate = true;
+
+        this.wrapRepeat = true;
+        this.repeatX = 1;
+        this.repeatY = 1;
+        this.offsetX = 0;
+        this.offsetY = 0;
+
+        this.rotation = 0; // Texture.rotation がある実装なら使える
+        this.anisotropy = Math.min(4, maxAniso);
+
+        this.applyTextureParams = function () {
+          targets.forEach(function (m) {
+            var tex = m.material && m.material.map;
+            if (!tex) return;
+
+            // wrap の指定（繰り返し or 端固定）
+            tex.wrapS = controls.wrapRepeat ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+            tex.wrapT = controls.wrapRepeat ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+
+            // repeat/offset（UV空間での拡大縮小・平行移動）
+            if (tex.repeat && tex.repeat.set) tex.repeat.set(controls.repeatX, controls.repeatY);
+            if (tex.offset && tex.offset.set) tex.offset.set(controls.offsetX, controls.offsetY);
+
+            // 回転（Texture.center も絡むが、古い実装だと rotation だけでも雰囲気確認できる）
+            if ("rotation" in tex) tex.rotation = controls.rotation;
+
+            // 斜め方向のサンプリング改善（特に地面・遠景で効く）
+            if ("anisotropy" in tex) tex.anisotropy = controls.anisotropy;
+
+            tex.needsUpdate = true;
+          });
+        };
+
+        this.reset = function () {
+          this.wrapRepeat = true;
+          this.repeatX = 1;
+          this.repeatY = 1;
+          this.offsetX = 0;
+          this.offsetY = 0;
+          this.rotation = 0;
+          this.anisotropy = Math.min(4, maxAniso);
+          this.applyTextureParams();
+        };
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(controls, "rotate");
+      gui.add(controls, "wrapRepeat").onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "repeatX", 1, 8).step(1).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "repeatY", 1, 8).step(1).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "offsetX", 0, 1).step(0.01).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "offsetY", 0, 1).step(0.01).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "rotation", -Math.PI, Math.PI).step(0.01).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "anisotropy", 1, Math.max(1, maxAniso)).step(1).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "reset");
+
+      // 初期反映
+      controls.applyTextureParams();
+
+      // ------------------------------------------------------------
+      // Render loop：回転させて貼れているか確認
+      // ------------------------------------------------------------
+      var step = 0;
+
+      function render() {
+        stats.update();
+
+        if (controls.rotate) {
+          step += 0.01;
+
+          polyhedron.rotation.y = step;
+          polyhedron.rotation.x = step;
+
+          cube.rotation.y = step;
+          cube.rotation.x = step;
+
+          sphere.rotation.y = step;
+          sphere.rotation.x = step;
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize 対応
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // TGALoader で Mesh を作る（このサンプルの主題）
+      //
+      // アルゴリズム：
+      //  1) TGALoader.load(url, onLoad, onProgress, onError) で Texture を得る（非同期）
+      //  2) Material.map にセット
+      //  3) Mesh(geom, mat) を返す
+      //
+      // 実務的なデバッグ観点：
+      //  - 404 や CORS、パスミスは onError を入れると一撃で分かる
+      //  - “表示が真っ黒” の原因が「ロード失敗」なのか「ライト不足」なのかの切り分けにもなる
+      // ------------------------------------------------------------
+      function createMesh(geom) {
+        var loader = new THREE.TGALoader();
+        var url = "../assets/textures/crate_color8.tga";
+
+        var texture = loader.load(
+          url,
+          function () {
+            // console.log("TGA loaded:", url);
+          },
+          undefined,
+          function (err) {
+            console.log("TGA load failed:", url, err);
+          }
+        );
+
+        // Texture 側の基本設定（必要ならここで追加）
+        // texture.flipY = false; // ローダ/three.jsの世代で必要になることがある（上下反転したらここを疑う）
+        // texture.minFilter = THREE.LinearMipMapLinearFilter; // mipsがある想定なら
+        // texture.magFilter = THREE.LinearFilter;
+
+        var mat = new THREE.MeshPhongMaterial({ map: texture });
+        return new THREE.Mesh(geom, mat);
+      }
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0);
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
