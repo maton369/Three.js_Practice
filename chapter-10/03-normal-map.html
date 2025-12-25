@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.03 - Normal maps（legacy修正版 / 初期化順バグ修正）</title>
+
+  <!--
+    直近のエラー：
+      Uncaught TypeError: Cannot read properties of undefined (reading 'normalScale')
+      → createMesh() の中で params.normalScale を参照していたが、
+        params は「後で」作っているため、createMesh 実行時点では params が undefined だった。
+
+    修正方針（依存関係の整理）：
+      - createMesh() は “Material を作るだけ” に責務を限定し、GUI(params)に依存させない
+      - GUI(params) 側は、mesh が生成された後に material を更新する（updateNormalScaleなど）
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) Scene / Camera / Renderer を初期化
+      2) テクスチャローダを用意
+      3) 比較用メッシュを2枚作成
+         - 右：mapのみ（フラット）
+         - 左：map + normalMap（凹凸風）
+      4) ライト（Ambient + Spot + Point）を配置
+         - PointLight を “小さな球(sphereLightMesh)” に追従させて動かし、陰影変化を強調
+      5) dat.GUI で material パラメータを変更できるようにする
+         - normalScale：normalMap の効き
+         - textureSet：map/normalMap の差し替え
+         - rotate：比較対象を回して見やすくする
+      6) requestAnimationFrame でループ
+         - stats.update()
+         - ライト球を周回
+         - renderer.render()
+
+    重要ポイント（Three.js学習的に）：
+      - normalMap は “形状(Geometry)の頂点を変える” のではなく、
+        “ピクセル単位で法線方向を擬似的に変える” ことで陰影を変化させる
+      - したがって、ライトを動かすと差が分かりやすい（このサンプルの狙い）
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      var renderer = new THREE.WebGLRenderer();
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // TextureLoader（1つに集約して使い回す）
+      // ------------------------------------------------------------
+      var textureLoader = new THREE.TextureLoader();
+
+      // ------------------------------------------------------------
+      // createMesh：map / normalMap を持つ MeshPhongMaterial を作る
+      //
+      // 修正点：
+      // - params など外部状態に依存しない（初期化順の事故を防ぐ）
+      // - normalScale は「とりあえず (1,1) を入れておく」
+      //   → GUI からの更新は後段（params.updateNormalScale）で行う
+      // ------------------------------------------------------------
+      function createMesh(geom, imageFile, normalFile) {
+        var mapTex = textureLoader.load("../assets/textures/general/" + imageFile);
+
+        var mat = new THREE.MeshPhongMaterial({
+          map: mapTex
+        });
+
+        if (normalFile) {
+          var nTex = textureLoader.load("../assets/textures/general/" + normalFile);
+          mat.normalMap = nTex;
+
+          // legacy/実装差に備えて normalScale を必ず用意しておく
+          if (mat.normalScale && typeof mat.normalScale.set === "function") {
+            mat.normalScale.set(1, 1);
+          } else {
+            mat.normalScale = new THREE.Vector2(1, 1);
+          }
+        }
+
+        return new THREE.Mesh(geom, mat);
+      }
+
+      // ------------------------------------------------------------
+      // 比較用メッシュ生成
+      // 右：mapのみ（フラット）
+      // 左：map + normalMap（陰影が変わる）
+      // ------------------------------------------------------------
+      var flatMesh = createMesh(
+        new THREE.BoxGeometry(15, 15, 15),
+        "plaster.jpg",
+        null
+      );
+      flatMesh.rotation.y = -0.5;
+      flatMesh.position.x = 12;
+      scene.add(flatMesh);
+
+      var normalMesh = createMesh(
+        new THREE.BoxGeometry(15, 15, 15),
+        "plaster.jpg",
+        "plaster-normal.jpg"
+      );
+      normalMesh.rotation.y = 0.5;
+      normalMesh.position.x = -12;
+      scene.add(normalMesh);
+
+      // ------------------------------------------------------------
+      // 床（距離感の目印）
+      // ------------------------------------------------------------
+      var floorTex = textureLoader.load("../assets/textures/general/floor-wood.jpg");
+      var floor = new THREE.Mesh(
+        new THREE.BoxGeometry(200, 100, 0.1, 30),
+        new THREE.MeshPhongMaterial({ color: 0x3c3c3c, map: floorTex })
+      );
+      floor.position.y = -7.5;
+      floor.rotation.x = -0.5 * Math.PI;
+      scene.add(floor);
+
+      // ------------------------------------------------------------
+      // Camera（比較対象が両方見える位置）
+      // ------------------------------------------------------------
+      camera.position.set(0, 12, 38);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      // ------------------------------------------------------------
+      // Light（normalMap の差は “光” があって初めて見える）
+      // ------------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x242424));
+
+      // ① SpotLight：全体を明るくして最低限見える状態に
+      var spotLight = new THREE.SpotLight(0xffffff, 1.2);
+      spotLight.position.set(0, 30, 30);
+      // ユーザー方針：SpotLight/PointLight の decay は 0
+      if ("decay" in spotLight) spotLight.decay = 0;
+      scene.add(spotLight);
+
+      // ② PointLight：動かして陰影差を強調する（ここがデモの肝）
+      var pointLight = new THREE.PointLight(0xff5808, 1.0);
+      if ("decay" in pointLight) pointLight.decay = 0;
+      scene.add(pointLight);
+
+      // ③ 光源位置の可視化（ライト球）
+      var sphereLightMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.2, 16, 16),
+        new THREE.MeshBasicMaterial({ color: 0xac6c25 })
+      );
+      sphereLightMesh.position.set(3, 3, 3);
+      scene.add(sphereLightMesh);
+
+      // ------------------------------------------------------------
+      // dat.GUI（操作パラメータ）
+      //
+      // 重要：
+      // - ここで mesh が既に存在するので、material を安全に更新できる
+      // - “初期化順” を意識して依存関係を片方向にする（GUI → mesh更新）
+      // ------------------------------------------------------------
+      var params = new (function () {
+        this.normalScale = 1.0;
+        this.textureSet = "plaster";
+        this.rotate = false;
+
+        // テクスチャセットの適用：map/normalMap をまとめて差し替える
+        this.applyTextureSet = function (setName) {
+          var mapTex = textureLoader.load("../assets/textures/general/" + setName + ".jpg");
+          flatMesh.material.map = mapTex;
+          normalMesh.material.map = mapTex;
+
+          var nTex = textureLoader.load("../assets/textures/general/" + setName + "-normal.jpg");
+          normalMesh.material.normalMap = nTex;
+
+          // 差し替え後、反映を促す（実装差対策）
+          flatMesh.material.needsUpdate = true;
+          normalMesh.material.needsUpdate = true;
+        };
+
+        // normalScale 更新：normalScale(Vector2) を (s,s) にする
+        this.updateNormalScale = function (s) {
+          if (!normalMesh || !normalMesh.material) return;
+
+          // legacy差対策：normalScale が無いなら作る
+          if (!normalMesh.material.normalScale) {
+            normalMesh.material.normalScale = new THREE.Vector2(1, 1);
+          }
+
+          if (typeof normalMesh.material.normalScale.set === "function") {
+            normalMesh.material.normalScale.set(s, s);
+          } else {
+            normalMesh.material.normalScale = new THREE.Vector2(s, s);
+          }
+
+          normalMesh.material.needsUpdate = true;
+        };
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(params, "normalScale", -2, 2).onChange(params.updateNormalScale);
+      gui.add(params, "textureSet", ["plaster", "bathroom", "metal-floor"]).onChange(params.applyTextureSet);
+      gui.add(params, "rotate");
+
+      // GUI初期値を material に反映（ここは mesh 生成後なので安全）
+      params.updateNormalScale(params.normalScale);
+
+      // ------------------------------------------------------------
+      // render loop 状態（ライト周回用）
+      // ------------------------------------------------------------
+      var phase = 0;
+      var invert = 1;
+
+      render();
+
+      // ------------------------------------------------------------
+      // Render loop
+      //
+      // アルゴリズム：
+      //  1) stats.update()
+      //  2) rotate がONならメッシュを回す（見やすさ）
+      //  3) ライト球を円運動させる（sin/cos）
+      //  4) pointLight をライト球に追従させる
+      //  5) renderer.render()
+      // ------------------------------------------------------------
+      function render() {
+        stats.update();
+
+        if (params.rotate) {
+          flatMesh.rotation.y -= 0.01;
+          normalMesh.rotation.y += 0.01;
+        }
+
+        // ライトを動かす：陰影差（normalMapの効果）が一番分かりやすい
+        if (phase > 2 * Math.PI) {
+          invert *= -1;
+          phase -= 2 * Math.PI;
+        } else {
+          phase += 0.03;
+        }
+
+        sphereLightMesh.position.z = 21 * Math.sin(phase);
+        sphereLightMesh.position.x = -14 + (14 * Math.cos(phase));
+
+        if (invert < 0) {
+          var pivot = 0;
+          sphereLightMesh.position.x = (invert * (sphereLightMesh.position.x - pivot)) + pivot;
+        }
+
+        pointLight.position.copy(sphereLightMesh.position);
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize対応（見切れ/歪み防止）
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var s = new Stats();
+        s.setMode(0);
+        s.domElement.style.position = "absolute";
+        s.domElement.style.left = "0px";
+        s.domElement.style.top = "0px";
+        document.getElementById("Stats-output").appendChild(s.domElement);
+        return s;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
