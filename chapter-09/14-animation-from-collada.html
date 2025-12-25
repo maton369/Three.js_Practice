@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.14 - Animation from collada（legacy / DAE / AnimationHandler）</title>
+
+  <!--
+    目的：
+      - Collada(.dae) で書き出した “スキニング付きモデル＋アニメーション” を読み込み、
+        旧来の three.js (Animation / AnimationHandler) で再生する。
+      - コアは「ロード後に Animation を作って play → render loop で AnimationHandler.update(delta)」。
+
+    全体アルゴリズム（このサンプルの中核）：
+      1) Scene / Camera / Renderer を初期化（描画の土台）
+      2) Light を配置（Lambert/Phong などはライト必須）
+      3) ColladaLoader で .dae を非同期ロード
+      4) collada から “表示対象の Object3D” を取り出して scene に追加
+      5) 取り出したオブジェクトに紐づく “animation データ” を取り出す
+      6) new THREE.Animation(...) を生成し play()
+      7) render loop:
+           - delta = clock.getDelta()
+           - THREE.AnimationHandler.update(delta) で “全Animation” を進める
+           - renderer.render(scene, camera)
+
+    元コードのよくある落とし穴と修正方針：
+      - collada.skins[0] が必ず存在するとは限らない
+        → skins が無ければ collada.scene を使う fallback を入れる
+      - child.geometry.animation が必ずあるとは限らない
+        → child.geometry && child.geometry.animation をチェックし、無ければ警告
+      - SpotLight/影設定が中途半端（shadowMap.enabled だけでは影は出ない）
+        → spotLight.castShadow / mesh.castShadow / floor.receiveShadow を揃える
+      - resize 対応が無い
+        → camera/renderer を追従させる
+
+    注意：
+      - このサンプルは “古い three.js の Collada + AnimationHandler 系” を前提としている。
+        現行 three.js では AnimationMixer を使うのが通常だが、ここでは legacy API に合わせる。
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+
+  <!-- legacy collada animation stack -->
+  <script type="text/javascript" src="../libs/loaders/collada/Animation.js"></script>
+  <script type="text/javascript" src="../libs/loaders/collada/AnimationHandler.js"></script>
+  <script type="text/javascript" src="../libs/loaders/collada/KeyFrameAnimation.js"></script>
+
+  <script type="text/javascript" src="../libs/loaders/ColladaLoader.js"></script>
+
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #111; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        5000
+      );
+      camera.position.set(400, 50, 150);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Light（Lambert/Phong 系はライトが必須）
+      // ------------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x222222));
+
+      var spotLight = new THREE.SpotLight(0xffffff, 3.0);
+      spotLight.position.set(300, 500, 100);
+
+      // 影を使うならライト側の castShadow が必須
+      spotLight.castShadow = true;
+
+      // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルト
+      if ("decay" in spotLight) spotLight.decay = 0;
+
+      scene.add(spotLight);
+
+      // 影を確認しやすい “床” を用意（必須ではないがデバッグに効く）
+      var floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(2000, 2000),
+        new THREE.MeshLambertMaterial({ color: 0xdddddd })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = -60;   // モデルの position.y=-60 と整合を取りやすい
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // ------------------------------------------------------------
+      // 時間管理（AnimationHandler.update(delta) 用）
+      // ------------------------------------------------------------
+      var clock = new THREE.Clock();
+
+      // ------------------------------------------------------------
+      // ロードしたモデル参照（必要ならGUIで触れるように）
+      // ------------------------------------------------------------
+      var modelRoot = null;
+      var activeAnimation = null;
+
+      // ------------------------------------------------------------
+      // dat.GUI（最低限：アニメのON/OFF）
+      // ------------------------------------------------------------
+      var params = new (function () {
+        this.playing = true;
+        this.speed = 1.0; // AnimationHandler の update に掛ける倍率
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(params, "playing");
+      gui.add(params, "speed", 0.0, 3.0);
+
+      // ------------------------------------------------------------
+      // Collada(.dae) ロード（非同期パイプライン）
+      // ------------------------------------------------------------
+      var loader = new THREE.ColladaLoader();
+
+      loader.load(
+        "../assets/models/monster.dae",
+        function (collada) {
+          /*
+            ColladaLoader の返す構造は three.js の版で揺れる。
+            よくあるパターン：
+              - collada.scene : シーンルート（Object3D）
+              - collada.skins : スキンメッシュ配列（存在する場合）
+            元コードは collada.skins[0] 前提だったが、無い場合があるので fallback を入れる。
+          */
+
+          // 1) 表示対象の Object3D を決める（skins があれば skins[0]、無ければ scene）
+          var child = null;
+
+          if (collada && collada.skins && collada.skins.length > 0) {
+            child = collada.skins[0];
+          } else if (collada && collada.scene) {
+            child = collada.scene;
+          }
+
+          if (!child) {
+            console.warn("[Collada] モデルのルートが見つからない。dae の内容/loader の互換を確認。", collada);
+            return;
+          }
+
+          modelRoot = child;
+
+          // 2) 影の設定（Mesh を traverse して cast/receive を揃える）
+          modelRoot.traverse(function (node) {
+            if (node instanceof THREE.Mesh) {
+              node.castShadow = true;
+              node.receiveShadow = true;
+            }
+          });
+
+          // 3) Transform（見やすいように調整）
+          //    ※ この値はモデル依存。monster.dae の “見える化” に寄せた例。
+          modelRoot.scale.set(0.15, 0.15, 0.15);
+          modelRoot.rotation.x = -0.5 * Math.PI;
+          modelRoot.position.set(-100, -60, 0);
+
+          scene.add(modelRoot);
+
+          // 4) アニメーションの取得（legacy: child.geometry.animation）
+          //    ここが最大の不安定ポイント：geometry.animation が無いこともある。
+          //    無い場合は「再生できない」ので、ログを出して終了する。
+          var animData = null;
+
+          // modelRoot が Mesh でない可能性もあるので、Mesh を探す
+          // （skins[0] の場合は Mesh のことが多いが、scene の場合は Group になりがち）
+          var meshWithAnim = null;
+          modelRoot.traverse(function (node) {
+            if (meshWithAnim) return;
+            if (node && node.geometry && node.geometry.animation) {
+              meshWithAnim = node;
+            }
+          });
+
+          if (meshWithAnim && meshWithAnim.geometry && meshWithAnim.geometry.animation) {
+            animData = meshWithAnim.geometry.animation;
+          }
+
+          if (!animData) {
+            console.warn(
+              "[Collada] legacy animation (geometry.animation) が見つからない。dae の出力形式か loader 互換を確認。",
+              collada
+            );
+            return;
+          }
+
+          // 5) Animation を生成して再生開始
+          //    THREE.Animation は “対象オブジェクト + animationデータ” で構築する。
+          activeAnimation = new THREE.Animation(meshWithAnim, animData);
+          activeAnimation.play();
+        },
+        function (xhr) {
+          // progress（必要なら）
+          // console.log((xhr.loaded / xhr.total) * 100 + "% loaded");
+        },
+        function (err) {
+          console.error("[Collada] load error:", err);
+        }
+      );
+
+      // ------------------------------------------------------------
+      // Render loop（このサンプルの主戦場）
+      // ------------------------------------------------------------
+      function render() {
+        stats.update();
+
+        // delta を取って AnimationHandler を進める
+        var delta = clock.getDelta();
+
+        /*
+          legacy three.js では AnimationHandler が “全アニメーションの時間” を管理する。
+          そのため、AnimationMixer のように “mixer.update(delta)” ではなく
+          THREE.AnimationHandler.update(delta) が必要になる。
+        */
+        if (params.playing) {
+          THREE.AnimationHandler.update(delta * params.speed);
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize 対応
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
