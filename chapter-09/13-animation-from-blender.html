@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.13 - Animation from blender（legacy / JSON + SkinnedMesh）</title>
+
+  <!--
+    目的：
+      - Blender 等で作った「スケルトン（ボーン）付きアニメーション」を three.js で再生する。
+      - JSONLoader で “SkinnedMesh + animations” を読み込み、AnimationMixer でクリップを回す。
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) Scene / Camera / Renderer を作る（描画の土台）
+      2) Light を置く（Lambert/Phong 系はライトがないと真っ黒）
+      3) JSONLoader で hand-2.js を非同期ロードする
+      4) geometry から SkinnedMesh を作る（skinning:true が重要）
+      5) SkeletonHelper を必要に応じて表示（ボーン可視化）
+      6) AnimationMixer(mesh) を作り、geometry.animations[0] を clipAction で再生
+      7) requestAnimationFrame のループ内で mixer.update(delta) を毎フレーム呼ぶ
+         → delta は Clock で計測（時間駆動でアニメが進む）
+
+    元コードの問題点（修正ポイント）：
+      - dat.GUI の showHelper が「0〜0.5」になっている（boolなのにrange）
+        → gui.add(controls, 'showHelper') の boolean トグルに修正
+      - helper が未生成のうちに GUI onChange が走ると落ち得る
+        → helper が存在する時だけ visible を触るようにガード
+      - loader コールバック引数 mat を var mat で上書きしている（混乱）
+        → 変数名を整理（material など）
+      - SpotLight で影を出したいなら castShadow が必要
+        → spotLight.castShadow / mesh.castShadow / floor.receiveShadow などを揃える
+        （このサンプルは「アニメ理解」が主目的なので最低限の床を追加）
+      - resize 対応がない
+        → camera/renderer を追従させる
+
+    注意：
+      - geometry.animations が存在するかは “手元の three.js / exporter / JSONフォーマット” に依存する。
+      - 古い three.js だと THREE.AnimationClip / AnimationMixer 周りが現行と差分がある。
+        このサンプルは「あなたの libs/three.js（legacy）」で動く前提で、可能な範囲で安全に書いている。
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+
+      // 初期カメラ：モデルが原点近辺に来る想定で仮置き
+      camera.position.set(0, 0, 4);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // 影を使う場合は enabled だけでなく “ライト/メッシュ側の設定” も必要
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Light（Lambert 系はライト必須）
+      // ------------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x222222));
+
+      var spotLight = new THREE.SpotLight(0xffffff, 2.0);
+      spotLight.position.set(0, 50, 30);
+
+      // 影を出すならライト側 castShadow が必要
+      spotLight.castShadow = true;
+
+      // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルト
+      if ("decay" in spotLight) spotLight.decay = 0;
+
+      scene.add(spotLight);
+
+      // 影や高さ感を確認しやすいように床を置く（最低限）
+      var floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(20, 20),
+        new THREE.MeshLambertMaterial({ color: 0xffffff })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = -2;
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // ------------------------------------------------------------
+      // アニメ制御用の変数
+      // ------------------------------------------------------------
+      var mesh = null;          // SkinnedMesh（ロード後に入る）
+      var helper = null;        // SkeletonHelper（ロード後に作る）
+      var mixer = null;         // AnimationMixer（ロード後に作る）
+
+      // アニメは「時間差分」で進めるので Clock を使う
+      var clock = new THREE.Clock();
+
+      // ------------------------------------------------------------
+      // dat.GUI（SkeletonHelper の表示切替）
+      // ------------------------------------------------------------
+      var controls = new (function () {
+        this.showHelper = false;
+      })();
+
+      var gui = new dat.GUI();
+      // bool なので range ではなく “トグル” にする
+      gui.add(controls, "showHelper").onChange(function (state) {
+        // helper はロード後に生成されるので、存在チェックしてから触る
+        if (helper) helper.visible = state;
+      });
+
+      // ------------------------------------------------------------
+      // JSONLoader：Blender等から出した “ボーン付きJSON” をロード
+      //
+      // 重要：
+      // - 非同期なので、mesh/mixer/helper は “ロード後” にしか作れない
+      // - geometry.animations にクリップが入っている前提
+      // ------------------------------------------------------------
+      var loader = new THREE.JSONLoader();
+      loader.load(
+        "../assets/models/hand-2.js",
+        function (geometry /*, materialsFromFile */) {
+          // 形状のシェーディングが破綻しないように法線を計算
+          if (geometry && typeof geometry.computeVertexNormals === "function") {
+            geometry.computeVertexNormals();
+          }
+
+          // skinning:true が無いとボーン変形が効かない
+          var material = new THREE.MeshLambertMaterial({
+            color: 0xF0C8C9,
+            skinning: true
+          });
+
+          // SkinnedMesh を作成
+          mesh = new THREE.SkinnedMesh(geometry, material);
+
+          // 表示しやすいように回転（hand-2.js の前提座標に合わせた調整）
+          mesh.rotation.x = 0.5 * Math.PI;
+          mesh.rotation.z = 0.7 * Math.PI;
+
+          // 影を落とす（必要なら）
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+
+          scene.add(mesh);
+
+          // SkeletonHelper：ボーンを線で可視化
+          helper = new THREE.SkeletonHelper(mesh);
+          // linewidth は環境によって効かないことがある（WebGLの制約）
+          if (helper.material) helper.material.linewidth = 2;
+
+          helper.visible = controls.showHelper;
+          scene.add(helper);
+
+          // --------------------------------------------------------
+          // ✅ ここが “Blenderアニメ再生” の本体アルゴリズム
+          //
+          // 1) AnimationMixer(mesh) を作る
+          // 2) geometry.animations から clip を取り出す
+          // 3) mixer.clipAction(clip).play() で再生開始
+          // 4) render loop で mixer.update(delta) を呼び続ける
+          // --------------------------------------------------------
+          mixer = new THREE.AnimationMixer(mesh);
+
+          // animations が無い場合もあるので安全にチェック
+          var clip = null;
+          if (geometry && geometry.animations && geometry.animations.length > 0) {
+            clip = geometry.animations[0];
+          }
+
+          if (clip) {
+            var action = mixer.clipAction(clip);
+            action.play();
+          } else {
+            // クリップが無いなら “ロードは成功したがアニメが無い” 状態
+            // ここで fallback を入れるなら、TWEEN等で手動ボーン操作に切り替える設計になる
+            console.warn("No animations found in geometry.animations. Model loaded but animation clip is missing.");
+          }
+
+          // ロード後にフレームを合わせる（モデルが大きすぎ/小さすぎ対策）
+          frameCameraToObject(mesh);
+        },
+        "../assets/models"
+      );
+
+      // ------------------------------------------------------------
+      // AABB（Box3）でカメラを自動調整
+      // - モデルのスケールが不明でも “とりあえず見える” 方向に寄せる
+      // ------------------------------------------------------------
+      function frameCameraToObject(object) {
+        if (!object) return;
+
+        var box = new THREE.Box3().setFromObject(object);
+
+        // legacy three.js では getCenter/getSize が無い可能性があるので手計算も持つ
+        var center = new THREE.Vector3();
+        if (typeof box.getCenter === "function") {
+          box.getCenter(center);
+        } else {
+          center.addVectors(box.min, box.max).multiplyScalar(0.5);
+        }
+
+        var size = new THREE.Vector3();
+        if (typeof box.getSize === "function") {
+          box.getSize(size);
+        } else {
+          size.set(
+            Math.abs(box.max.x - box.min.x),
+            Math.abs(box.max.y - box.min.y),
+            Math.abs(box.max.z - box.min.z)
+          );
+        }
+
+        var maxDim = Math.max(size.x, size.y, size.z);
+        var fov = camera.fov * (Math.PI / 180);
+
+        // “収まる距離” の目安
+        var distance = (maxDim / 2) / Math.tan(fov / 2);
+        distance *= 1.6;
+
+        camera.position.set(center.x, center.y, center.z + distance);
+        camera.lookAt(center);
+
+        // クリップ面もスケールに合わせて更新（巨大モデルの見切れ対策）
+        camera.near = Math.max(0.01, distance / 100);
+        camera.far  = Math.max(2000, distance * 10);
+        camera.updateProjectionMatrix();
+      }
+
+      // ------------------------------------------------------------
+      // Render loop（毎フレームやること）
+      //
+      // アルゴリズム：
+      //  1) stats.update()
+      //  2) delta = clock.getDelta()
+      //  3) mixer.update(delta) でアニメ時間を進める
+      //  4) helper.update() でボーン表示を追従（表示しているとき）
+      //  5) renderer.render(scene, camera)
+      // ------------------------------------------------------------
+      function render() {
+        stats.update();
+
+        var delta = clock.getDelta();
+
+        if (mixer) {
+          mixer.update(delta);
+        }
+
+        // helper はスケルトン追従の更新が必要（実装によっては不要だが安全側）
+        if (helper && helper.visible && typeof helper.update === "function") {
+          helper.update();
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize 対応
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
