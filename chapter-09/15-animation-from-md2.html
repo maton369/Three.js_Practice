@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 09.15 - Animation from MD2（legacy / MD2Character）</title>
+
+  <!--
+    目的：
+      - MD2（Quake2系）の頂点アニメーションを、three.js legacy の MD2Character で再生する。
+      - “ロード完了後にアニメ一覧を作って GUI に反映し、render loop で character.update(delta) を回す”
+        という全体アルゴリズムを理解する。
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) Scene / Camera / Renderer / Light を初期化（描画の土台）
+      2) MD2Character を生成し、loadParts() で (body.md2 + skin.jpg) を非同期ロード
+      3) ロード完了（onLoadComplete）で：
+         - geometry.animations を走査して “選択可能なアニメ名” を抽出
+         - dat.GUI を構築し、選択変更で character.setAnimation() を呼ぶ
+         - 再生速度変更で character.setPlaybackRate() を呼ぶ
+      4) requestAnimationFrame の render loop で：
+         - delta = clock.getDelta()
+         - character.update(delta) でアニメを進める
+         - renderer.render(scene, camera)
+
+    修正ポイント（元コードからの改善）：
+      - SpotLight の shadow が有効になっていない（shadowMap.enabled だけでは影が出ない）
+        → spotLight.castShadow / floor.receiveShadow / model.castShadow を追加
+      - 参照していない変数（mesh/step）が残っている
+        → 削除して意図を明確化
+      - GUI を onLoadComplete 内で組むのは正しいが、複数回呼ばれる可能性を想定してガード
+      - resize 対応が無い
+        → camera.aspect と renderer.setSize を追従
+      - MD2Character の root を scene に足す前後の順序を明確化し、初期位置/向きもコメント化
+
+    注意：
+      - MD2Character / MD2Loader は古い three.js 向けの補助クラスであり、
+        現行three.jsでは標準的にはGLTF + AnimationMixer が主流。
+      - ここでは “legacy教材としてのアルゴリズム理解” を優先する。
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+  <script type="text/javascript" src="../libs/loaders/MD2Loader.js"></script>
+  <script type="text/javascript" src="../libs/MD2Character.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #ddd; }
+  </style>
+</head>
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+
+      // “上から斜め” の固定視点（MD2キャラを見下ろして確認しやすい）
+      camera.position.set(-50, 40, 60);
+      camera.lookAt(new THREE.Vector3(0, 25, 0));
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xdddddd));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // 影を使う場合は renderer 側で shadowMap を有効にする必要がある
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Light（Lambert/Phong系はライト必須）
+      // ------------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x404040));
+
+      var spotLight = new THREE.SpotLight(0xffffff, 1.0);
+      spotLight.position.set(-50, 70, 60);
+
+      // 影を出すには “ライト側” の castShadow が必須
+      spotLight.castShadow = true;
+
+      // 影の品質（重ければ下げる）
+      if (spotLight.shadow && spotLight.shadow.mapSize) {
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+      }
+
+      // ユーザー方針：SpotLight/PointLight の decay は 0 をデフォルト
+      if ("decay" in spotLight) spotLight.decay = 0;
+
+      scene.add(spotLight);
+
+      // ------------------------------------------------------------
+      // 床（影の見え方を確認するための基準面）
+      // ------------------------------------------------------------
+      var floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(300, 300),
+        new THREE.MeshLambertMaterial({ color: 0xcfcfcf })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = 0;
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // ------------------------------------------------------------
+      // Clock（delta を取る＝アニメを “時間ベース” で進める）
+      // ------------------------------------------------------------
+      var clock = new THREE.Clock();
+
+      // ------------------------------------------------------------
+      // GUIで操作するパラメータ
+      // ------------------------------------------------------------
+      var controls = new (function () {
+        // 初期アニメ名（モデル側に存在しない可能性があるため、ロード後に補正する）
+        this.animations = "crattack";
+
+        // 再生速度（MD2Character が内部で参照するレート）
+        this.playbackrate = 10;
+      })();
+
+      var gui = new dat.GUI();
+      var guiBuilt = false; // onLoadComplete が複数回走るケースに備えてガード
+
+      // ------------------------------------------------------------
+      // MD2Character（このサンプルの主役）
+      //
+      // MD2Character は以下を内包する“便利ラッパ”：
+      // - ロードした body(md2) を meshBody として保持
+      // - skins を適用
+      // - root(Object3D) に body/weapon をまとめてぶら下げる
+      // - update(delta) でアニメを進める
+      // ------------------------------------------------------------
+      var character = new THREE.MD2Character();
+
+      // ロード完了後に呼ばれる（MD2/skin を読み終えた時点）
+      character.onLoadComplete = function () {
+        // meshBody が用意できていない場合は何もしない（念のため）
+        if (!character.meshBody || !character.meshBody.geometry) return;
+
+        // 影設定：モデル側の castShadow/receiveShadow を有効化（床に影を落とす）
+        character.root.traverse(function (child) {
+          if (child instanceof THREE.Mesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+          }
+        });
+
+        // --------------------------------------------------------
+        // アニメ一覧を geometry.animations から抽出
+        //
+        // MD2Character では、MD2のフレーム名からアニメクリップが生成され、
+        // geometry.animations に並ぶことが多い。
+        // ただし “xxx001f” のような末尾のフレーム表記を含む名前は
+        // UI上はノイズになりやすいのでフィルタする。
+        // --------------------------------------------------------
+        var animations = character.meshBody.geometry.animations || [];
+        var animLabels = [];
+
+        animations.forEach(function (anim) {
+          // anim.name が無いケースを避ける
+          if (!anim || !anim.name) return;
+
+          // 末尾が “000f” のようなものは除外（教材サンプル由来のフィルタ）
+          if (!anim.name.match(/\d{3}f$/)) {
+            animLabels.push(anim.name);
+          }
+        });
+
+        // もしフィルタで何も残らなかったら、全部見せる（フェイルセーフ）
+        if (animLabels.length === 0) {
+          animations.forEach(function (anim) {
+            if (anim && anim.name) animLabels.push(anim.name);
+          });
+        }
+
+        // “初期アニメ名” が実在しない場合、最初の候補に差し替える
+        if (animLabels.length > 0 && animLabels.indexOf(controls.animations) === -1) {
+          controls.animations = animLabels[0];
+        }
+
+        // GUIは一度だけ組む（複数回 load が走った時に項目が増殖しないように）
+        if (!guiBuilt) {
+          gui.add(controls, "animations", animLabels).onChange(function () {
+            character.setAnimation(controls.animations);
+          });
+
+          gui.add(controls, "playbackrate", 1, 20).step(1).onChange(function () {
+            character.setPlaybackRate(controls.playbackrate);
+          });
+
+          guiBuilt = true;
+        }
+
+        // 初期状態を適用（ロード完了後に確定させるのが重要）
+        character.setAnimation(controls.animations);
+        character.setPlaybackRate(controls.playbackrate);
+
+        // モデルの初期位置（床の上に立たせる）
+        // MD2モデルは原点が足元とは限らないので、必要ならここで微調整する
+        character.root.position.set(0, 0, 0);
+        character.root.rotation.y = 0;
+
+        // ここで camera.lookAt をやり直しても良いが、今回は固定視点なので省略
+      };
+
+      // ------------------------------------------------------------
+      // MD2 の読み込み（非同期）
+      //
+      // loadParts の引数で “モデル一式” を指定する。
+      // baseUrl 配下に:
+      //  - ogro.md2
+      //  - skin.jpg
+      // が存在する前提。
+      // ------------------------------------------------------------
+      character.loadParts({
+        baseUrl: "../assets/models/ogre/",
+        body: "ogro.md2",
+        skins: ["skin.jpg"],
+        weapons: []
+      });
+
+      // root を scene に追加（ロード前でも root は空のObject3Dとして存在する）
+      scene.add(character.root);
+
+      // ------------------------------------------------------------
+      // Render loop（このサンプルの核）
+      //
+      // アルゴリズム：
+      //  1) delta = clock.getDelta()
+      //  2) character.update(delta) でアニメを進める
+      //  3) renderer.render(scene, camera) で描画
+      // ------------------------------------------------------------
+      function render() {
+        stats.update();
+
+        var delta = clock.getDelta();
+
+        // ロード中でも update は呼んでOKな実装が多い（内部で guard されている想定）
+        character.update(delta);
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize 対応（カメラとレンダラの追従）
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
