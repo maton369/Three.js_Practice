@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.04 - LightMap（legacy修正版）</title>
+
+  <!--
+    目的：
+      - lightMap（焼き込み光：ベイクした明るさ/影）を使って、
+        「リアルタイム照明が無くても、明暗の情報をテクスチャとして貼れる」ことを理解する。
+      - map（木目テクスチャ）と lightMap（明暗テクスチャ）を別UVで使う、というアルゴリズムを掴む。
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) Scene / Camera / Renderer を初期化
+      2) 床(PlaneGeometry)を作る
+         - map: ふつうのテクスチャ（木目）
+         - lightMap: 焼き込み光のテクスチャ（lm-1.png）
+         - ★重要：lightMap は「第2UV（uv2）」を使う（または faceVertexUvs[1]）
+      3) 立方体を置く（シーンに奥行き感を出す）
+      4) render loop で毎フレーム描画（stats.update → renderer.render）
+
+    元コードの典型問題点（今回の修正ポイント）：
+      - MeshStandardMaterial は PBR 系なので、本来はライトが無いと真っ暗になりやすい
+        → このサンプルでは “lightMap を見せる” のが主題なので、意図を明確にしつつ
+           AmbientLight を残し、必要なら DirectionalLight も足せるようにする
+      - 「lightMap 用UVの設定」が legacy 実装依存で壊れやすい
+        → (A) 現行寄り：geometry.attributes.uv2 を uv から複製
+           (B) legacy：faceVertexUvs[1] に faceVertexUvs[0] をコピー
+         という “両対応” にして堅牢化
+      - renderer 変数が二重で分かりづらい
+        → renderer に統一
+      - テクスチャの設定（wrap / repeat / encoding 等）が無い
+        → legacy前提で壊さない範囲で、repeat と anisotropy を設定
+      - resize 対応がない
+        → camera/renderer を追従
+
+    LightMap の重要ポイント：
+      - lightMap は「影や明るさ」を “テクスチャとして事前計算して焼き込む” ので、
+        リアルタイムの影計算をしなくても、雰囲気のある陰影を表現できる。
+      - ただし lightMap は普通の map と同じUVを使うとは限らない。
+        “低解像度でも良い” ので、別のUV（第2UV）を持たせるのが定番。
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // lightMap 自体は影計算ではないが、他サンプルとの統一で残しておく
+      // （このサンプルは “焼き込み光” が主題なので castShadow は必須ではない）
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // TextureLoader（使い回し）
+      // ------------------------------------------------------------
+      var textureLoader = new THREE.TextureLoader();
+
+      // ------------------------------------------------------------
+      // 床：map（木目）+ lightMap（焼き込み光）
+      // ------------------------------------------------------------
+      var groundGeom = new THREE.PlaneGeometry(95, 95, 1, 1);
+
+      // ふつうのテクスチャ（木目）
+      var wood = textureLoader.load("../assets/textures/general/floor-wood.jpg");
+
+      // lightMap：明暗が baked されたテクスチャ（影・ハイライトなど）
+      var lm = textureLoader.load("../assets/textures/lightmap/lm-1.png");
+
+      // 木目は大きい面積に貼るので、繰り返し表示すると見た目が自然になる
+      if (wood) {
+        if ("wrapS" in wood) wood.wrapS = THREE.RepeatWrapping;
+        if ("wrapT" in wood) wood.wrapT = THREE.RepeatWrapping;
+        if (wood.repeat && typeof wood.repeat.set === "function") wood.repeat.set(2, 2);
+
+        // 斜め方向のテクスチャのギザギザ軽減（対応していれば）
+        if (renderer.capabilities && renderer.capabilities.getMaxAnisotropy) {
+          wood.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        }
+      }
+
+      // lightMap は基本 “繰り返さない” 前提のことが多いが、
+      // サンプルとしてはデフォルト設定のまま（必要なら RepeatWrapping にする）
+      // lm.wrapS = lm.wrapT = THREE.ClampToEdgeWrapping;
+
+      // ------------------------------------------------------------
+      // ★重要：lightMap 用のUV（第2UV）を用意する
+      //
+      // 仕組み：
+      // - three.js の lightMap は「uv2」を参照するのが基本。
+      // - legacy な Geometry の場合は faceVertexUvs[1] を参照する実装があった。
+      //
+      // このサンプルは “両対応” して、環境差で壊れないようにする。
+      // ------------------------------------------------------------
+      ensureSecondUV(groundGeom);
+
+      // MeshStandardMaterial は PBR 系。
+      // lightMap の効果が見えやすいように metalness/roughness を調整しておく。
+      var groundMaterial = new THREE.MeshStandardMaterial({
+        color: 0x777777,
+        map: wood,
+        lightMap: lm,
+
+        // ここは “見やすさ” のための無難な値
+        metalness: 0.0,
+        roughness: 1.0,
+
+        // lightMap の強さ（効き具合）
+        lightMapIntensity: 1.0
+      });
+
+      var groundMesh = new THREE.Mesh(groundGeom, groundMaterial);
+      groundMesh.rotation.x = -Math.PI / 2;
+      groundMesh.position.y = 0;
+      scene.add(groundMesh);
+
+      // ------------------------------------------------------------
+      // 立方体：シーンに奥行きを作る（lightMapの比較対象として）
+      // ------------------------------------------------------------
+      var cubeGeometry = new THREE.BoxGeometry(12, 12, 12);
+      var cubeGeometry2 = new THREE.BoxGeometry(6, 6, 6);
+
+      // ※ MeshBasicMaterial は “ライトの影響を受けない” ので明るさが一定になる。
+      // lightMap の説明を主目的にするなら、箱は影響を受けない方が比較しやすいので OK。
+      // ただし「ライトも効かせたい」なら MeshLambert/Phong/Standard に変える。
+      var cubeMat = new THREE.MeshBasicMaterial({
+        map: textureLoader.load("../assets/textures/general/stone.jpg")
+      });
+
+      var cube1 = new THREE.Mesh(cubeGeometry, cubeMat);
+      var cube2 = new THREE.Mesh(cubeGeometry2, cubeMat);
+
+      cube1.position.set(0.9, 6, -12);
+      cube2.position.set(-13.2, 3, -6);
+
+      scene.add(cube1);
+      scene.add(cube2);
+
+      // ------------------------------------------------------------
+      // Camera：床全体が見える位置に配置
+      // ------------------------------------------------------------
+      camera.position.set(-20, 20, 30);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      // ------------------------------------------------------------
+      // Light：
+      // - lightMap は “焼き込み光” なので、必ずしもライトは要らない。
+      // - ただし MeshStandardMaterial はライトが無いと暗くなりやすいので Ambient を置く。
+      // - さらに分かりやすさのため、弱い DirectionalLight を追加してもよい（任意）。
+      // ------------------------------------------------------------
+      var ambientLight = new THREE.AmbientLight(0xcccccc);
+      scene.add(ambientLight);
+
+      // 任意：PBR系を少し見やすくする補助ライト
+      var dirLight = new THREE.DirectionalLight(0xffffff, 0.35);
+      dirLight.position.set(30, 60, 20);
+      scene.add(dirLight);
+
+      // ------------------------------------------------------------
+      // dat.GUI：lightMapIntensity と texture repeat を操作できるようにする
+      // （教材として “値を変えると見た目が変わる” を体験しやすくする）
+      // ------------------------------------------------------------
+      var params = new (function () {
+        this.lightMapIntensity = 1.0;
+        this.woodRepeat = 2.0;
+
+        this.apply = function () {
+          groundMaterial.lightMapIntensity = params.lightMapIntensity;
+
+          if (wood && wood.repeat && typeof wood.repeat.set === "function") {
+            wood.repeat.set(params.woodRepeat, params.woodRepeat);
+            wood.needsUpdate = true;
+          }
+
+          groundMaterial.needsUpdate = true;
+        };
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(params, "lightMapIntensity", 0.0, 3.0).onChange(params.apply);
+      gui.add(params, "woodRepeat", 0.5, 8.0).onChange(params.apply);
+
+      // 初期値を反映
+      params.apply();
+
+      // ------------------------------------------------------------
+      // Render loop：
+      // - stats.update()
+      // - renderer.render()
+      // ------------------------------------------------------------
+      render();
+
+      function render() {
+        stats.update();
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize対応：見切れ/歪み防止
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      // ------------------------------------------------------------
+      // ensureSecondUV：
+      // lightMap 用のUV（uv2 or faceVertexUvs[1]）を用意する
+      //
+      // アルゴリズム：
+      //  - BufferGeometry（現行寄り）
+      //      uv があるなら uv2 にコピー
+      //  - Geometry（legacy）
+      //      faceVertexUvs[1] に faceVertexUvs[0] をコピー
+      // ------------------------------------------------------------
+      function ensureSecondUV(geom) {
+        // BufferGeometry 系（attributes がある）
+        if (geom && geom.attributes && geom.attributes.uv) {
+          // uv2 が無ければ uv を複製して作る
+          if (!geom.attributes.uv2) {
+            geom.setAttribute("uv2", geom.attributes.uv.clone());
+          }
+          return;
+        }
+
+        // Geometry 系（faceVertexUvs がある）
+        if (geom && geom.faceVertexUvs && geom.faceVertexUvs[0]) {
+          // lightmaps use own mapping of uvs (faceVertexUvs[1])
+          // なので、とりあえず第1UVを第2UVにコピーする
+          geom.faceVertexUvs[1] = geom.faceVertexUvs[0];
+          geom.uvsNeedUpdate = true;
+        }
+      }
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0); // 0: fps, 1: ms
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
