@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.01 - Basic textures（DDS版 / 修正版）</title>
+
+  <!--
+    目的：
+      - DDS（DirectDraw Surface）テクスチャを DDSLoader で読み込み、MeshPhongMaterial.map に貼る。
+      - “画像系(TextureLoader) と同じアルゴリズムで、ローダだけ DDSLoader に置き換わる” ことを理解する。
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) Scene / Camera / Renderer を初期化して描画の土台を作る
+      2) Light（Ambient + Directional）を置いて Phong の陰影を成立させる
+      3) createMesh(geometry) で
+         - DDSLoader で .dds を読む（非同期）
+         - Material.map にセットする
+         - Mesh を生成する
+      4) 3つの Mesh を scene に配置し、回転アニメで “貼れてるか” を確認
+      5) requestAnimationFrame の render loop を回す
+      6) resize 対応で camera/renderer を追従させる
+
+    DDS 利用時の注意点（よくハマる）：
+      - DDS は主に圧縮テクスチャ（DXT1/3/5 等）で、ブラウザが直接読むのではなく three.js 側でデコードする。
+      - DDSLoader.load は TextureLoader.load と同じく「非同期」なので、読み込み失敗時のログを入れておくと原因追跡が早い。
+      - テクスチャの wrap/repeat を効かせるには wrapS/wrapT を RepeatWrapping にする必要がある。
+
+    元コードからの修正ポイント：
+      - createMesh(geom, imageFile) の imageFile が未使用 → 引数削除して意図を明確化
+      - new DirectionalLight() の引数不明瞭 → 色/強度を明示
+      - renderer に antialias を付与 → 見た目改善
+      - DDS テクスチャに repeat/offset/rotation/anisotropy を GUI で調整可能にする
+      - console.log(cube.geometry.faceVertexUvs) は geometry 形式差で壊れやすい → “UVがあるか” の安全チェックへ
+      - resize 対応追加
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+  <script type="text/javascript" src="../libs/loaders/DDSLoader.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(0, 12, 28);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      // antialias: ジャギー抑制
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // Light（Phong はライト必須）
+      // ------------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x141414));
+
+      // 色/強度を明示（読みやすさ重視）
+      var light = new THREE.DirectionalLight(0xffffff, 1.0);
+      light.position.set(0, 30, 20);
+      scene.add(light);
+
+      // ------------------------------------------------------------
+      // DDS テクスチャを使う Mesh を生成して配置
+      // ------------------------------------------------------------
+      var polyhedron = createMesh(new THREE.IcosahedronGeometry(5, 0));
+      polyhedron.position.x = 12;
+      scene.add(polyhedron);
+
+      var sphere = createMesh(new THREE.SphereGeometry(5, 20, 20));
+      sphere.position.x = 0;
+      scene.add(sphere);
+
+      var cube = createMesh(new THREE.BoxGeometry(5, 5, 5));
+      cube.position.x = -12;
+      scene.add(cube);
+
+      // UV が存在するか “安全に” 確認（Geometry/BufferGeometry 差分対策）
+      try {
+        var hasUV =
+          (cube.geometry && cube.geometry.attributes && cube.geometry.attributes.uv) ||
+          (cube.geometry && cube.geometry.faceVertexUvs && cube.geometry.faceVertexUvs[0] && cube.geometry.faceVertexUvs[0].length > 0);
+        console.log("Cube has UV:", !!hasUV);
+      } catch (e) {
+        console.log("UV check skipped (legacy geometry format difference).");
+      }
+
+      // ------------------------------------------------------------
+      // GUI：DDSテクスチャの見え方を動的に変える
+      // ------------------------------------------------------------
+      var texTargets = [polyhedron, sphere, cube];
+
+      // renderer の anisotropy 上限（GPU/環境依存）
+      var maxAniso = renderer.capabilities.getMaxAnisotropy();
+
+      var controls = new (function () {
+        this.rotate = true;
+
+        // wrap/repeat を動かすなら RepeatWrapping が基本
+        this.wrapRepeat = true;
+        this.repeatX = 1;
+        this.repeatY = 1;
+        this.offsetX = 0;
+        this.offsetY = 0;
+        this.rotation = 0;
+
+        // 斜めから見た時のにじみを減らす（重くなることもある）
+        this.anisotropy = Math.min(4, maxAniso);
+
+        this.applyTextureParams = function () {
+          texTargets.forEach(function (m) {
+            var tex = m.material && m.material.map;
+            if (!tex) return;
+
+            if (controls.wrapRepeat) {
+              tex.wrapS = THREE.RepeatWrapping;
+              tex.wrapT = THREE.RepeatWrapping;
+            } else {
+              tex.wrapS = THREE.ClampToEdgeWrapping;
+              tex.wrapT = THREE.ClampToEdgeWrapping;
+            }
+
+            if (tex.repeat && tex.repeat.set) tex.repeat.set(controls.repeatX, controls.repeatY);
+            if (tex.offset && tex.offset.set) tex.offset.set(controls.offsetX, controls.offsetY);
+
+            // rotation は Texture に存在する版が多い（無い場合は無視）
+            if ("rotation" in tex) tex.rotation = controls.rotation;
+
+            if ("anisotropy" in tex) tex.anisotropy = controls.anisotropy;
+
+            tex.needsUpdate = true;
+          });
+        };
+
+        this.reset = function () {
+          this.wrapRepeat = true;
+          this.repeatX = 1;
+          this.repeatY = 1;
+          this.offsetX = 0;
+          this.offsetY = 0;
+          this.rotation = 0;
+          this.anisotropy = Math.min(4, maxAniso);
+          this.applyTextureParams();
+        };
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(controls, "rotate");
+      gui.add(controls, "wrapRepeat").onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "repeatX", 1, 8).step(1).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "repeatY", 1, 8).step(1).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "offsetX", 0, 1).step(0.01).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "offsetY", 0, 1).step(0.01).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "rotation", -Math.PI, Math.PI).step(0.01).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "anisotropy", 1, Math.max(1, maxAniso)).step(1).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "reset");
+
+      // 初期設定適用
+      controls.applyTextureParams();
+
+      // ------------------------------------------------------------
+      // render loop：回転させながら描画
+      // ------------------------------------------------------------
+      var step = 0;
+
+      function render() {
+        stats.update();
+
+        if (controls.rotate) {
+          step += 0.01;
+
+          polyhedron.rotation.y = step;
+          polyhedron.rotation.x = step;
+
+          cube.rotation.y = step;
+          cube.rotation.x = step;
+
+          sphere.rotation.y = step;
+          sphere.rotation.x = step;
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // resize 対応
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // DDS で Mesh を作る（このサンプルの主題）
+      //
+      // アルゴリズム：
+      //  1) DDSLoader.load(url, onLoad, onProgress, onError) で Texture を得る
+      //  2) MeshPhongMaterial.map にセット
+      //  3) Mesh(geom, mat) を返す
+      //
+      // 注意：
+      //  - DDSLoader.load は TextureLoader.load と同様に非同期。
+      //  - onError を入れると「パス違い/サーバ設定/ファイル欠損」の切り分けが早い。
+      // ------------------------------------------------------------
+      function createMesh(geom) {
+        var loader = new THREE.DDSLoader();
+
+        var url = "../assets/textures/seafloor.dds";
+
+        // DDS 読み込み（非同期）
+        var texture = loader.load(
+          url,
+          function () {
+            // 読み込み成功
+            // console.log("DDS loaded:", url);
+          },
+          undefined,
+          function (err) {
+            console.log("DDS load failed:", url, err);
+          }
+        );
+
+        // Phong はライトに反応してテクスチャが “立体的” に見える
+        var mat = new THREE.MeshPhongMaterial({
+          map: texture
+        });
+
+        return new THREE.Mesh(geom, mat);
+      }
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0);
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>

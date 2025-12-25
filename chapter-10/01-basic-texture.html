@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.01 - Basic textures（修正版）</title>
+
+  <!--
+    目的：
+      - TextureLoader で画像を読み込み、MeshPhongMaterial.map に貼ることで「基本的なテクスチャ描画」を理解する。
+      - “UV（テクスチャ座標）” があるジオメトリに対し、同じ手順で画像が貼れることを確認する。
+
+    全体アルゴリズム（このサンプルのコア）：
+      1) Scene / Camera / Renderer を初期化して描画の土台を作る
+      2) Light（Ambient + Directional）を置いて Phong の陰影を成立させる
+      3) createMesh(geometry, imageFile) で
+         - TextureLoader で画像を読む
+         - Material.map にセットする
+         - Mesh(Geometry, Material) を生成する
+      4) Mesh をシーンに配置する（x方向にずらして見やすくする）
+      5) requestAnimationFrame の render loop で回転させつつ描画する
+
+    元コードからの修正ポイント：
+      - dat.GUI が空で意味がない → テクスチャの典型パラメータ（repeat/offset/rotation、anisotropy）を操作できるように追加
+      - TextureLoader.load は非同期 → “読み込み中に真っ黒/未表示” の原因を追いやすいよう onLoad/onError を入れる
+      - renderer に antialias を付与 → テクスチャの見た目（ギザギザ）を軽減
+      - リサイズ対応が無い → camera.aspect / renderer.setSize を更新
+      - DirectionalLight の引数不足（色/強度が不明瞭）→ 明示して可読性UP
+      - console.log(cube.geometry.faceVertexUvs) は legacy 依存が強い → “UVがあるか確認する” 目的で安全にログる
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // 1) Stats（FPS表示）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // 2) Scene / Camera / Renderer（描画の土台）
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(0, 12, 28);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      // antialias: ジャギーを抑える（テクスチャの見た目が少し良くなる）
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // 3) Light（Phong はライトが無いと意味がない）
+      // ------------------------------------------------------------
+      scene.add(new THREE.AmbientLight(0x141414));
+
+      // DirectionalLight は「太陽光」っぽい平行光
+      var light = new THREE.DirectionalLight(0xffffff, 1.0);
+      light.position.set(0, 30, 20);
+      scene.add(light);
+
+      // ------------------------------------------------------------
+      // 4) テクスチャ貼り Mesh を生成して配置
+      //
+      // ここがサンプルの主題：
+      //   - TextureLoader で画像を読む
+      //   - Material.map に入れる
+      //   - Mesh を作って Scene に置く
+      // ------------------------------------------------------------
+      var polyhedron = createMesh(new THREE.IcosahedronGeometry(5, 0), "metal-rust.jpg");
+      polyhedron.position.x = 12;
+      scene.add(polyhedron);
+
+      var sphere = createMesh(new THREE.SphereGeometry(5, 20, 20), "floor-wood.jpg");
+      sphere.position.x = 0;
+      scene.add(sphere);
+
+      var cube = createMesh(new THREE.BoxGeometry(5, 5, 5), "brick-wall.jpg");
+      cube.position.x = -12;
+      scene.add(cube);
+
+      // UV が存在するかを “安全に” 確認（legacy表現に寄らない）
+      // - BufferGeometry / Geometry の差分があるため、存在確認で落ちないようにする
+      try {
+        var hasUV =
+          (cube.geometry && cube.geometry.attributes && cube.geometry.attributes.uv) ||
+          (cube.geometry && cube.geometry.faceVertexUvs && cube.geometry.faceVertexUvs[0] && cube.geometry.faceVertexUvs[0].length > 0);
+        console.log("Cube has UV:", !!hasUV);
+      } catch (e) {
+        console.log("UV check skipped (legacy geometry format difference).");
+      }
+
+      // ------------------------------------------------------------
+      // 5) dat.GUI：テクスチャの典型パラメータを操作できるようにする
+      //
+      // “テクスチャの見え方” を変える頻出パラメータ：
+      //   - wrapS / wrapT（繰り返し可能にするか）
+      //   - repeat（何回繰り返すか）
+      //   - offset（ずらし）
+      //   - rotation（回転）
+      //   - anisotropy（斜めから見た時のボケ改善：性能と相談）
+      //
+      // 注意：
+      //   repeat / offset を効かせるには wrapS/T を RepeatWrapping にする必要がある。
+      // ------------------------------------------------------------
+      var texTargets = [polyhedron, sphere, cube];
+
+      var controls = new (function () {
+        this.rotate = true;
+
+        // テクスチャ共通操作（簡単のため3つまとめて同設定にする）
+        this.wrapRepeat = true;
+        this.repeatX = 1;
+        this.repeatY = 1;
+        this.offsetX = 0;
+        this.offsetY = 0;
+        this.rotation = 0;
+
+        // anisotropy は GPU により上限が違う（renderer.capabilities.getMaxAnisotropy()）
+        this.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+
+        this.applyTextureParams = function () {
+          texTargets.forEach(function (m) {
+            var tex = m.material && m.material.map;
+            if (!tex) return;
+
+            // wrap（繰り返しを効かせるか）
+            if (controls.wrapRepeat) {
+              tex.wrapS = THREE.RepeatWrapping;
+              tex.wrapT = THREE.RepeatWrapping;
+            } else {
+              tex.wrapS = THREE.ClampToEdgeWrapping;
+              tex.wrapT = THREE.ClampToEdgeWrapping;
+            }
+
+            // repeat / offset / rotation
+            if (tex.repeat && tex.repeat.set) tex.repeat.set(controls.repeatX, controls.repeatY);
+            if (tex.offset && tex.offset.set) tex.offset.set(controls.offsetX, controls.offsetY);
+            if ("rotation" in tex) tex.rotation = controls.rotation;
+
+            // anisotropy（斜めのにじみ改善）
+            if ("anisotropy" in tex) tex.anisotropy = controls.anisotropy;
+
+            // 設定変更を反映
+            tex.needsUpdate = true;
+          });
+        };
+
+        this.reset = function () {
+          this.wrapRepeat = true;
+          this.repeatX = 1;
+          this.repeatY = 1;
+          this.offsetX = 0;
+          this.offsetY = 0;
+          this.rotation = 0;
+          this.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+          this.applyTextureParams();
+        };
+      })();
+
+      var gui = new dat.GUI();
+      gui.add(controls, "rotate");
+      gui.add(controls, "wrapRepeat").onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "repeatX", 1, 8).step(1).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "repeatY", 1, 8).step(1).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "offsetX", 0, 1).step(0.01).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "offsetY", 0, 1).step(0.01).onChange(function () { controls.applyTextureParams(); });
+      gui.add(controls, "rotation", -Math.PI, Math.PI).step(0.01).onChange(function () { controls.applyTextureParams(); });
+
+      var maxAniso = renderer.capabilities.getMaxAnisotropy();
+      gui.add(controls, "anisotropy", 1, Math.max(1, maxAniso)).step(1).onChange(function () { controls.applyTextureParams(); });
+
+      gui.add(controls, "reset");
+
+      // 初期値を適用（wrapRepeat=true など）
+      controls.applyTextureParams();
+
+      // ------------------------------------------------------------
+      // 6) render loop：回転させながら描画
+      // ------------------------------------------------------------
+      var step = 0;
+
+      function render() {
+        stats.update();
+
+        if (controls.rotate) {
+          step += 0.01;
+
+          polyhedron.rotation.y = step;
+          polyhedron.rotation.x = step;
+
+          cube.rotation.y = step;
+          cube.rotation.x = step;
+
+          sphere.rotation.y = step;
+          sphere.rotation.x = step;
+        }
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+
+      // ------------------------------------------------------------
+      // 7) resize 対応（縦横比とレンダラサイズを更新）
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      render();
+
+      // ------------------------------------------------------------
+      // テクスチャ + Mesh生成（画像ロードは非同期）
+      //
+      // アルゴリズム：
+      //  1) TextureLoader.load(url, onLoad, onProgress, onError)
+      //  2) MeshPhongMaterial.map に貼る
+      //  3) Mesh(geom, mat) を返す
+      // ------------------------------------------------------------
+      function createMesh(geom, imageFile) {
+        var textureLoader = new THREE.TextureLoader();
+
+        var url = "../assets/textures/general/" + imageFile;
+
+        // load は非同期。返る mesh 自体は即作れるが、画像が来るまで map は未完成状態になり得る。
+        var texture = textureLoader.load(
+          url,
+          function () {
+            // 読み込み完了：必要ならログや初期パラメータ調整を書く
+            // console.log("Texture loaded:", url);
+          },
+          undefined,
+          function (err) {
+            console.log("Texture load failed:", url, err);
+          }
+        );
+
+        var mat = new THREE.MeshPhongMaterial({
+          map: texture
+        });
+
+        var mesh = new THREE.Mesh(geom, mat);
+        return mesh;
+      }
+
+      // ------------------------------------------------------------
+      // Stats 初期化
+      // ------------------------------------------------------------
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0);
+
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
