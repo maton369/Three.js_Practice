@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.06 - Specular map（importmapで"three"解決）</title>
+
+  <!-- dat.gui（グローバル: dat.GUI） -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+
+  <!--
+    ✅ ここが今回の本質的な修正点（超重要）
+    OrbitControls.js は内部で `import { ... } from "three";` のような "bare specifier" を使う。
+    ブラウザは bare specifier をそのままだと解決できないので、
+
+      Failed to resolve module specifier "three"
+
+    になる。
+
+    対策は2つ：
+      A) esm.sh / skypack など “bare specifier を解決してくれるCDN” を使う
+      B) importmap で "three" -> 実URL を割り当てる（このHTMLはB）
+
+    importmap は「module scriptより前」に書く必要がある。
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.158.0/build/three.module.js"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #WebGL-output { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+  </style>
+</head>
+
+<body>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 10.06 - Specular map（Specular/Normal のアルゴリズム）
+      ============================================================
+
+      目的：
+        - specularMap（鏡面反射の強さ分布）で “光る場所/光らない場所” を制御する。
+        - normalMap（法線の擬似凹凸）でハイライト形状が細かく歪むのを観察する。
+        - dat.gui でパラメータを変え、「material状態 → 見た目」の因果を確認する。
+
+      全体の処理フロー：
+        1) Renderer / Scene / Camera を初期化
+        2) テクスチャ（base/spec/normal）をロード
+        3) MeshPhongMaterial に map/specularMap/normalMap をセット
+        4) 球体メッシュを生成して scene に追加
+        5) 光源（Ambient + Directional）を置く
+        6) GUIから material パラメータを更新（needsUpdate も適宜）
+        7) rAF ループで orbit.update() → 回転 → render
+
+      元コードの典型問題点（ここで直しているところ）：
+        - SceneUtils.createMultiMaterialObject（現代threeでは使わない/使えないことが多い）
+        - AmbientLight の色 0x3300000（桁がズレてる）→ 0x330000 に修正
+        - module import の解決（OrbitControlsが "three" を import して落ちる）→ importmapで解決
+    */
+
+    // ✅ importmap により "three" が解決される
+    import * as THREE from "three";
+    // OrbitControls は内部で "three" を import するので importmap が効く
+    import { OrbitControls } from "https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js";
+
+    // ------------------------------------------------------------
+    // 1) Renderer / Scene / Camera
+    // ------------------------------------------------------------
+    const container = document.getElementById("WebGL-output");
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0x000000, 1.0);
+
+    // 出力色空間（存在する方を使う）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(15, 15, 15);
+    camera.lookAt(0, 0, 0);
+
+    // ------------------------------------------------------------
+    // 2) OrbitControls
+    // ------------------------------------------------------------
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.autoRotate = false;
+    orbit.autoRotateSpeed = 1.0;
+
+    // ------------------------------------------------------------
+    // 3) Textures（base/specular/normal）
+    // ------------------------------------------------------------
+    const loader = new THREE.TextureLoader();
+
+    const baseMap = loader.load("../assets/textures/planets/Earth.png");
+    const specMap = loader.load("../assets/textures/planets/EarthSpec.png");
+    const normMap = loader.load("../assets/textures/planets/EarthNormal.png");
+
+    // baseMap は色テクスチャなので sRGB 扱いにする（見た目が正しくなりやすい）
+    if ("colorSpace" in baseMap) baseMap.colorSpace = THREE.SRGBColorSpace;
+    else if ("encoding" in baseMap) baseMap.encoding = THREE.sRGBEncoding;
+
+    // ------------------------------------------------------------
+    // 4) Material（SpecularMap + NormalMap）
+    // ------------------------------------------------------------
+    const material = new THREE.MeshPhongMaterial({
+      map: baseMap,
+      specularMap: specMap,
+      normalMap: normMap,
+      specular: new THREE.Color(0xffffff),
+      shininess: 30
+    });
+
+    // normalScale は Vector2（陰影の“凹凸の強さ”）
+    material.normalScale.set(1.0, 1.0);
+
+    // ------------------------------------------------------------
+    // 5) Mesh
+    // ------------------------------------------------------------
+    const geometry = new THREE.SphereGeometry(10, 64, 64);
+    const sphere = new THREE.Mesh(geometry, material);
+    scene.add(sphere);
+
+    // ------------------------------------------------------------
+    // 6) Lights（Phongのハイライトはライトが無いと見えない）
+    // ------------------------------------------------------------
+    // 元コードの 0x3300000 は桁ズレなので 0x330000 に修正
+    const ambient = new THREE.AmbientLight(0x330000, 0.35);
+    scene.add(ambient);
+
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(350, 350, 150);
+    scene.add(dir);
+
+    // ------------------------------------------------------------
+    // 7) dat.gui（操作UI）
+    // ------------------------------------------------------------
+    const params = {
+      rotationSpeed: 0.005,
+
+      useBaseMap: true,
+      useSpecularMap: true,
+      useNormalMap: true,
+
+      shininess: material.shininess,
+      specularColor: "#ffffff",
+      normalScale: 1.0,
+
+      ambientIntensity: ambient.intensity,
+      dirLightIntensity: dir.intensity,
+
+      autoRotate: orbit.autoRotate,
+      autoRotateSpeed: orbit.autoRotateSpeed
+    };
+
+    const gui = new dat.GUI();
+    gui.width = 340;
+
+    const fAnim = gui.addFolder("Animation");
+    fAnim.add(params, "rotationSpeed", -0.05, 0.05, 0.001);
+
+    const fMaps = gui.addFolder("Maps (ON/OFF)");
+    fMaps.add(params, "useBaseMap").onChange(() => {
+      material.map = params.useBaseMap ? baseMap : null;
+      material.needsUpdate = true;
+    });
+    fMaps.add(params, "useSpecularMap").onChange(() => {
+      material.specularMap = params.useSpecularMap ? specMap : null;
+      material.needsUpdate = true;
+    });
+    fMaps.add(params, "useNormalMap").onChange(() => {
+      material.normalMap = params.useNormalMap ? normMap : null;
+      material.needsUpdate = true;
+    });
+
+    const fMat = gui.addFolder("Material");
+    fMat.add(params, "shininess", 0, 200, 1).onChange(() => {
+      material.shininess = params.shininess;
+      material.needsUpdate = true;
+    });
+    fMat.addColor(params, "specularColor").onChange(() => {
+      material.specular.set(params.specularColor);
+      material.needsUpdate = true;
+    });
+    fMat.add(params, "normalScale", 0, 3, 0.01).onChange(() => {
+      material.normalScale.set(params.normalScale, params.normalScale);
+      material.needsUpdate = true;
+    });
+
+    const fLight = gui.addFolder("Lights");
+    fLight.add(params, "ambientIntensity", 0, 2, 0.01).onChange(() => {
+      ambient.intensity = params.ambientIntensity;
+    });
+    fLight.add(params, "dirLightIntensity", 0, 5, 0.01).onChange(() => {
+      dir.intensity = params.dirLightIntensity;
+    });
+
+    const fCtrl = gui.addFolder("OrbitControls");
+    fCtrl.add(params, "autoRotate").onChange(() => {
+      orbit.autoRotate = params.autoRotate;
+    });
+    fCtrl.add(params, "autoRotateSpeed", 0, 10, 0.1).onChange(() => {
+      orbit.autoRotateSpeed = params.autoRotateSpeed;
+    });
+
+    fAnim.open();
+    fMaps.open();
+
+    // ------------------------------------------------------------
+    // 8) Render loop
+    // ------------------------------------------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+
+      orbit.update();                 // damping/autoRotate 反映
+      sphere.rotation.y += params.rotationSpeed;
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // 9) Resize
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    });
+  </script>
+</body>
+</html>
