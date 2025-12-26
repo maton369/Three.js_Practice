@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.10 - Canvas texture bumpmap（libsなし / 詳細コメント付き）</title>
+
+  <!-- ✅「../libs/〜」は一切使わない（CDNから読み込む） -->
+  <!-- dat.gui（グローバル: dat.GUI） -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <!-- stats.js（グローバル: Stats） -->
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; }
+    #WebGL-output canvas { display: block; }
+
+    /* 右下に「バンプ用Canvas（凹凸の元画像）」を表示して観察できるようにする */
+    #canvas-panel {
+      position: fixed;
+      right: 12px;
+      bottom: 12px;
+      width: 256px;
+      height: 256px;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #111;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+      user-select: none;
+    }
+    #canvas-panel canvas {
+      display: block;
+      width: 256px;
+      height: 256px;
+      image-rendering: pixelated; /* ノイズの粒が分かりやすい */
+    }
+
+    #hint {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.65);
+      color: #fff;
+      font: 12px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+      max-width: 560px;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="WebGL-output"></div>
+  <div id="canvas-panel"></div>
+  <div id="hint">
+    「Canvasで生成したノイズ画像」→ bumpMap（凹凸）に変換してキューブへ適用します。<br>
+    bumpScale を上げると凹凸が強くなり、noiseScale を上げるとノイズが粗くなります。
+  </div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 10.10 - Canvas texture bumpmap（libsなし）全体アルゴリズム
+      ============================================================
+
+      目的：
+        - 2D Canvas に生成した “グレースケール画像” を bumpMap として使用し、
+          明暗が凹凸（法線の擬似変化）に変換される様子を確認する。
+
+      全体アルゴリズム（重要な順序）：
+        1) Canvas（256x256）を用意して、ノイズ画像を描画する
+        2) Canvas を THREE.CanvasTexture にして bumpMap として material.bumpMap に設定
+        3) ライト（Ambient + Directional）を置く
+           - bumpMap は “光の当たり方の差” で凹凸が見えるのでライト必須
+        4) dat.gui で
+           - bumpScale（凹凸強度）
+           - noiseScale（ノイズの粗さ）
+           - octaves（フラクタル段数）
+           - regenerate（再生成）
+           - rotate（回転）
+          を操作できるようにする
+        5) ノイズを描き直した時だけ bumpTexture.needsUpdate = true にしてGPUへ再アップロード
+           - 毎フレーム needsUpdate を立てるのは無駄なので避ける（ここが大事）
+
+      旧コード（perlin.js）に依存していた点：
+        - 今回は外部 perlin.js を使わず、ファイル内で「軽量Perlin風ノイズ」を実装する
+          （完全なPerlin実装にこだわらず、教材として十分な “凹凸” を作るのが目的）
+    */
+
+    // ✅ three.js 本体は ES Modules を CDN から import（../libs は使わない）
+    import * as THREE from "https://unpkg.com/three@0.158.0/build/three.module.js";
+
+    // ------------------------------------------------------------
+    // 0) Stats（FPS）
+    // ------------------------------------------------------------
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    document.body.appendChild(stats.dom);
+
+    // ------------------------------------------------------------
+    // 1) Canvas（bumpMap の入力元）
+    // ------------------------------------------------------------
+    const CANVAS_SIZE = 256;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = CANVAS_SIZE;
+    canvas.height = CANVAS_SIZE;
+
+    document.getElementById("canvas-panel").appendChild(canvas);
+
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    // Canvas → three.js のテクスチャへ（CanvasTexture の方が意図が明確）
+    // ※ 描き直したら bumpTexture.needsUpdate = true を立てる
+    const bumpTexture = new THREE.CanvasTexture(canvas);
+
+    // ------------------------------------------------------------
+    // 2) ノイズ生成（外部 perlin.js なし）
+    // ------------------------------------------------------------
+    /*
+      ここでは「2D Gradient Noise（Perlinっぽい）」を最小実装する。
+
+      仕組み（ざっくり）：
+        - 格子点ごとに “ランダムな勾配ベクトル” を割り当てる
+        - ピクセル位置の周囲4格子点から
+          (勾配ベクトル)・(格子点→ピクセルへのベクトル) の内積を取り
+        - フェード関数で滑らかに補間する
+        - これで “連続的な” ノイズが得られる
+
+      さらに octaves を重ねる（FBM）ことで、より自然な凹凸っぽさを作る。
+    */
+
+    // 乱数（seed対応）：xorshift系の超軽量なやつ
+    function makeRng(seedStr) {
+      let x = 2166136261 >>> 0;
+      for (let i = 0; i < seedStr.length; i++) {
+        x ^= seedStr.charCodeAt(i);
+        x = Math.imul(x, 16777619);
+      }
+      return function rand() {
+        // xorshift32
+        x ^= x << 13; x >>>= 0;
+        x ^= x >> 17; x >>>= 0;
+        x ^= x << 5;  x >>>= 0;
+        return (x >>> 0) / 4294967296; // [0,1)
+      };
+    }
+
+    function fade(t) {
+      // Perlin の有名なフェード関数：6t^5 - 15t^4 + 10t^3
+      return t * t * t * (t * (t * 6 - 15) + 10);
+    }
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    // 格子点(i,j)の勾配ベクトルを seed から決定（テーブル無しの簡易版）
+    function grad2(i, j, rand) {
+      // 角度を乱数で決める
+      const a = rand() * Math.PI * 2;
+      return { x: Math.cos(a), y: Math.sin(a) };
+    }
+
+    function perlin2(x, y, seed) {
+      // 1) 周囲の格子点（整数座標）を求める
+      const x0 = Math.floor(x);
+      const y0 = Math.floor(y);
+      const x1 = x0 + 1;
+      const y1 = y0 + 1;
+
+      // 2) 格子内の相対位置
+      const sx = x - x0;
+      const sy = y - y0;
+
+      // 3) seed から “座標依存” の乱数を生成し、勾配を決める
+      //    - 本格実装は permutation table を使うが、教材用途ならこれで十分
+      const r00 = makeRng(seed + `:${x0},${y0}`);
+      const r10 = makeRng(seed + `:${x1},${y0}`);
+      const r01 = makeRng(seed + `:${x0},${y1}`);
+      const r11 = makeRng(seed + `:${x1},${y1}`);
+
+      const g00 = grad2(x0, y0, r00);
+      const g10 = grad2(x1, y0, r10);
+      const g01 = grad2(x0, y1, r01);
+      const g11 = grad2(x1, y1, r11);
+
+      // 4) 内積（勾配ベクトルと、格子点→点 のベクトル）
+      const dx0 = sx,     dy0 = sy;
+      const dx1 = sx - 1, dy1 = sy;
+
+      const n00 = g00.x * dx0 + g00.y * dy0;
+      const n10 = g10.x * dx1 + g10.y * dy0;
+      const n01 = g01.x * dx0 + g01.y * dy1;
+      const n11 = g11.x * dx1 + g11.y * dy1;
+
+      // 5) フェードして補間
+      const u = fade(sx);
+      const v = fade(sy);
+
+      const nx0 = lerp(n00, n10, u);
+      const nx1 = lerp(n01, n11, u);
+      const nxy = lerp(nx0, nx1, v);
+
+      // おおむね [-1,1] くらいのレンジになる
+      return nxy;
+    }
+
+    // FBM（Fractal Brownian Motion）：ノイズを多段重ねして “それっぽさ” を出す
+    function fbm2(x, y, seed, octaves, lacunarity, gain) {
+      let amp = 0.5;
+      let freq = 1.0;
+      let sum = 0.0;
+      let norm = 0.0;
+
+      for (let o = 0; o < octaves; o++) {
+        sum += amp * perlin2(x * freq, y * freq, seed + `:o${o}`);
+        norm += amp;
+        freq *= lacunarity;
+        amp *= gain;
+      }
+
+      return sum / (norm || 1);
+    }
+
+    // Canvas へノイズを書き込む（ImageDataで高速に）
+    function drawNoiseToCanvas(opts) {
+      const w = canvas.width;
+      const h = canvas.height;
+      const img = ctx.createImageData(w, h);
+      const data = img.data;
+
+      const seed = opts.seed;
+      const noiseScale = opts.noiseScale; // 大きいほど粗い
+      const octaves = opts.octaves;
+      const lacunarity = opts.lacunarity;
+      const gain = opts.gain;
+
+      let i = 0;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          // noiseScale で “座標の伸縮” を調整（＝粒の大きさ）
+          const nx = x / noiseScale;
+          const ny = y / noiseScale;
+
+          // [-1,1] 付近 → [0,1] へ
+          let v = fbm2(nx, ny, seed, octaves, lacunarity, gain);
+          v = (v + 1) * 0.5;
+          if (v < 0) v = 0;
+          if (v > 1) v = 1;
+
+          // bumpMap はグレースケールが分かりやすい
+          const c = (v * 255) | 0;
+          data[i++] = c;
+          data[i++] = c;
+          data[i++] = c;
+          data[i++] = 255;
+        }
+      }
+
+      ctx.putImageData(img, 0, 0);
+
+      // ✅ CanvasTexture を GPU に再転送する合図
+      bumpTexture.needsUpdate = true;
+    }
+
+    // ------------------------------------------------------------
+    // 3) three.js：Renderer / Scene / Camera
+    // ------------------------------------------------------------
+    const container = document.getElementById("WebGL-output");
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(0xEEEEEE, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+    // 色空間（環境によりプロパティ名が異なるので分岐）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 12, 28);
+    camera.lookAt(0, 0, 0);
+
+    // ------------------------------------------------------------
+    // 4) オブジェクト（bumpMap を適用するキューブ）
+    // ------------------------------------------------------------
+    const geometry = new THREE.BoxGeometry(12, 12, 12);
+
+    // bumpMap を活かすため MeshPhongMaterial（ライトが効く）
+    const material = new THREE.MeshPhongMaterial({
+      color: 0x77ff77,
+      bumpMap: bumpTexture,
+      bumpScale: 1.0,
+    });
+
+    const cube = new THREE.Mesh(geometry, material);
+    cube.position.x = 3;
+    scene.add(cube);
+
+    // ------------------------------------------------------------
+    // 5) ライト（凹凸の陰影を見るために必須）
+    // ------------------------------------------------------------
+    scene.add(new THREE.AmbientLight(0x141414, 1.0));
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(0, 30, 20);
+    scene.add(dirLight);
+
+    // ------------------------------------------------------------
+    // 6) dat.gui（操作UI）
+    // ------------------------------------------------------------
+    const params = {
+      // bump
+      bumpScale: material.bumpScale,
+
+      // noise parameters
+      seed: "rnd-initial",
+      noiseScale: 10,     // 大きいほど粗い（粒が大きい）
+      octaves: 4,
+      lacunarity: 2.0,
+      gain: 0.5,
+
+      // view
+      rotate: true,
+      rotateSpeed: 0.01,
+      baseColor: "#77ff77",
+
+      regenerate: () => {
+        // seed を時間で変える（毎回違う模様）
+        params.seed = "rnd-" + Date.now();
+        drawNoiseToCanvas(params);
+      },
+
+      applyNoise: () => {
+        // seedは維持して、パラメータ変更を反映
+        drawNoiseToCanvas(params);
+      },
+    };
+
+    const gui = new dat.GUI();
+    gui.width = 360;
+
+    const fNoise = gui.addFolder("Noise (Canvas -> bumpMap)");
+    fNoise.add(params, "regenerate").name("Regenerate");
+    fNoise.add(params, "noiseScale", 3, 40, 1).name("Noise Scale").onFinishChange(params.applyNoise);
+    fNoise.add(params, "octaves", 1, 8, 1).name("Octaves").onFinishChange(params.applyNoise);
+    fNoise.add(params, "lacunarity", 1.0, 4.0, 0.01).name("Lacunarity").onFinishChange(params.applyNoise);
+    fNoise.add(params, "gain", 0.1, 0.9, 0.01).name("Gain").onFinishChange(params.applyNoise);
+    fNoise.open();
+
+    const fBump = gui.addFolder("Bump");
+    fBump.add(params, "bumpScale", -2, 2, 0.01).name("bumpScale").onChange(() => {
+      material.bumpScale = params.bumpScale;
+    });
+    fBump.open();
+
+    const fView = gui.addFolder("View");
+    fView.add(params, "rotate").name("Rotate");
+    fView.add(params, "rotateSpeed", 0, 0.05, 0.001).name("Rotate Speed");
+    fView.addColor(params, "baseColor").name("Base Color").onChange(() => {
+      material.color.set(params.baseColor);
+    });
+
+    // ------------------------------------------------------------
+    // 7) 初期ノイズ描画（最初に1回だけ）
+    // ------------------------------------------------------------
+    drawNoiseToCanvas(params);
+
+    // ------------------------------------------------------------
+    // 8) render loop
+    // ------------------------------------------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      stats.begin();
+
+      if (params.rotate) {
+        cube.rotation.y += params.rotateSpeed;
+        cube.rotation.x += params.rotateSpeed;
+      }
+
+      renderer.render(scene, camera);
+
+      stats.end();
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // 9) resize
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    });
+  </script>
+</body>
+</html>
