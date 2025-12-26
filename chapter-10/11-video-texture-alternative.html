@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.11 - Video texture（.ogvのみ / 404排除 + 原因可視化 + 安全に貼る）</title>
+
+  <!-- dat.gui / stats.js は CDN（グローバル）で利用 -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; }
+    #WebGL-output { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+
+    /*
+      重要：video を display:none にすると、ブラウザによっては
+      フレーム供給が止まって VideoTexture が黒のままになることがある。
+      → opacity/visibility で “見えなくする” だけにする
+    */
+    #video {
+      position: fixed;
+      left: 15px;
+      top: 75px;
+      width: 360px;
+      max-width: 48vw;
+      border-radius: 10px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.25);
+      background: #000;
+      z-index: 10;
+
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+    }
+
+    #playOverlay {
+      position: fixed;
+      left: 15px;
+      top: 75px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.72);
+      color: #fff;
+      font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+      display: none;
+      cursor: pointer;
+      user-select: none;
+      z-index: 11;
+    }
+
+    /* いま何が起きてるかを“数値”で切り分ける */
+    #debug {
+      position: fixed;
+      left: 15px;
+      top: 12px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.68);
+      color: #fff;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      z-index: 12;
+      white-space: pre;
+      user-select: none;
+      pointer-events: none;
+      max-width: min(820px, 92vw);
+    }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="debug"></div>
+
+  <!--
+    ✅ .ogv しか無い前提なら、mp4/webm の <source> を置かない
+       （置くと 404 ログが出てノイズになる）
+    ✅ type は "video/ogg" でOKだが、切り分け用途で codecs を明示しておくと分かりやすい
+  -->
+  <video
+    id="video"
+    controls
+    muted
+    playsinline
+    loop
+    preload="auto"
+  >
+    <source src="../assets/movies/Big_Buck_Bunny_small.ogv" type='video/ogg; codecs="theora, vorbis"' />
+  </video>
+
+  <div id="playOverlay">▶ クリックして動画を再生（自動再生がブロックされた場合）</div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.158.0/build/three.module.js";
+
+    // ------------------------------------------------------------
+    // 0) DOM
+    // ------------------------------------------------------------
+    const container = document.getElementById("WebGL-output");
+    const video = document.getElementById("video");
+    const playOverlay = document.getElementById("playOverlay");
+    const debugEl = document.getElementById("debug");
+
+    // ------------------------------------------------------------
+    // 1) Stats
+    // ------------------------------------------------------------
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    document.getElementById("Stats-output").appendChild(stats.dom);
+
+    // ------------------------------------------------------------
+    // 2) Renderer / Scene / Camera
+    // ------------------------------------------------------------
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0xeeeeee, 1.0);
+    container.appendChild(renderer.domElement);
+
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 1, 28);
+    camera.lookAt(0, 0, 0);
+    scene.add(new THREE.AxesHelper(10));
+
+    // ------------------------------------------------------------
+    // 3) ダミーテクスチャ（動画が貼れるまで黒を回避）
+    // ------------------------------------------------------------
+    const dummyCanvas = document.createElement("canvas");
+    dummyCanvas.width = 2;
+    dummyCanvas.height = 2;
+    const dctx = dummyCanvas.getContext("2d");
+    dctx.fillStyle = "#222"; dctx.fillRect(0, 0, 2, 2);
+    dctx.fillStyle = "#777"; dctx.fillRect(0, 0, 1, 1);
+    const dummyTexture = new THREE.CanvasTexture(dummyCanvas);
+    if ("colorSpace" in dummyTexture) dummyTexture.colorSpace = THREE.SRGBColorSpace;
+
+    // ------------------------------------------------------------
+    // 4) Mesh（動画を貼る“面”をGUIで切替できるようにする）
+    // ------------------------------------------------------------
+    const geom = new THREE.BoxGeometry(22, 16, 0.2);
+
+    const baseMats = [
+      new THREE.MeshBasicMaterial({ color: 0x2b7bff, side: THREE.DoubleSide }),
+      new THREE.MeshBasicMaterial({ color: 0x2b7bff, side: THREE.DoubleSide }),
+      new THREE.MeshBasicMaterial({ color: 0x2b7bff, side: THREE.DoubleSide }),
+      new THREE.MeshBasicMaterial({ color: 0x2b7bff, side: THREE.DoubleSide }),
+      new THREE.MeshBasicMaterial({ color: 0x2b7bff, side: THREE.DoubleSide }),
+      new THREE.MeshBasicMaterial({ color: 0xff4db8, side: THREE.DoubleSide }),
+    ];
+
+    // “動画面”は後で VideoTexture に差し替えるため参照を保持
+    const videoFaceMaterial = new THREE.MeshBasicMaterial({
+      map: dummyTexture,
+      side: THREE.DoubleSide,
+    });
+
+    let videoFaceIndex = 4;
+    const materials = baseMats.slice();
+    materials[videoFaceIndex] = videoFaceMaterial;
+
+    const cube = new THREE.Mesh(geom, materials);
+    cube.position.y = 2;
+    scene.add(cube);
+
+    // ------------------------------------------------------------
+    // 5) VideoTexture を“フレームが取れる時だけ”生成/更新する
+    // ------------------------------------------------------------
+    let videoTexture = null;
+
+    // ここが最重要：
+    // readyState=4 でも videoWidth/videoHeight が 0 のままなら、
+    // その動画は「映像フレームがデコードできていない」= WebGL へ渡せない
+    function canUseVideoFrames() {
+      return (
+        video.readyState >= video.HAVE_CURRENT_DATA &&
+        video.videoWidth > 0 &&
+        video.videoHeight > 0
+      );
+    }
+
+    function attachVideoTextureIfReady() {
+      if (videoTexture) return;
+      if (!canUseVideoFrames()) return;
+
+      // ✅ 映像フレームが取れるのを確認してから生成
+      videoTexture = new THREE.VideoTexture(video);
+      videoTexture.minFilter = THREE.LinearFilter;
+      videoTexture.magFilter = THREE.LinearFilter;
+      videoTexture.generateMipmaps = false;
+      if ("colorSpace" in videoTexture) videoTexture.colorSpace = THREE.SRGBColorSpace;
+
+      videoFaceMaterial.map = videoTexture;
+      videoFaceMaterial.needsUpdate = true;
+    }
+
+    // requestVideoFrameCallback がある環境なら「フレームが来ているか」を確定できる
+    let gotFrameCallback = false;
+    if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
+      const onFrame = () => {
+        gotFrameCallback = true;
+        attachVideoTextureIfReady();
+        video.requestVideoFrameCallback(onFrame);
+      };
+      video.requestVideoFrameCallback(onFrame);
+    }
+
+    // 主要イベントで貼り付けを試す
+    ["loadedmetadata", "loadeddata", "canplay", "playing"].forEach((ev) => {
+      video.addEventListener(ev, attachVideoTextureIfReady);
+    });
+
+    // ------------------------------------------------------------
+    // 6) 重要な切り分け：MIME / 404 / デコード失敗を見える化する
+    // ------------------------------------------------------------
+    let fetchInfo = "fetch: (pending)";
+    async function probeFetch() {
+      try {
+        // currentSrc が確定してから呼ぶ（source選択後）
+        const url = video.currentSrc || new URL("../assets/movies/Big_Buck_Bunny_small.ogv", location.href).toString();
+        const res = await fetch(url, { method: "GET" });
+        // GETにしておくと、サーバがHEAD未対応でも確実
+        fetchInfo = `fetch: ${res.status} ${res.statusText}, content-type=${res.headers.get("content-type") || "(none)"}`;
+      } catch (e) {
+        fetchInfo = `fetch: failed (${e && e.message ? e.message : e})`;
+      }
+    }
+
+    // video のエラーは “なぜ映像が取れないか” の最短手がかり
+    let lastVideoError = "errorCode=none";
+    video.addEventListener("error", () => {
+      // 1=ABORTED, 2=NETWORK, 3=DECODE, 4=SRC_NOT_SUPPORTED
+      lastVideoError = video.error ? `errorCode=${video.error.code}` : "errorCode=unknown";
+    });
+
+    // ------------------------------------------------------------
+    // 7) 自動再生ブロック対策
+    // ------------------------------------------------------------
+    async function safePlayVideo() {
+      try {
+        playOverlay.style.display = "none";
+        await video.play();
+        attachVideoTextureIfReady();
+        probeFetch(); // ネットワーク/MIMEも確認
+      } catch (e) {
+        playOverlay.style.display = "block";
+      }
+    }
+    playOverlay.addEventListener("click", () => safePlayVideo());
+    safePlayVideo();
+
+    // ------------------------------------------------------------
+    // 8) dat.gui
+    // ------------------------------------------------------------
+    const controls = {
+      rotate: false,
+      rotationSpeed: 0.01,
+      showVideo: false,
+      videoFace: 4, // 0..5
+
+      play: () => safePlayVideo(),
+      pause: () => video.pause(),
+
+      applyVisibility() {
+        if (this.showVideo) {
+          video.style.opacity = "1";
+          video.style.visibility = "visible";
+          video.style.pointerEvents = "auto";
+        } else {
+          video.style.opacity = "0";
+          video.style.visibility = "hidden";
+          video.style.pointerEvents = "none";
+        }
+      },
+
+      applyVideoFace() {
+        cube.material = baseMats.slice();
+        videoFaceIndex = Math.max(0, Math.min(5, this.videoFace | 0));
+        cube.material[videoFaceIndex] = videoFaceMaterial;
+        cube.material.needsUpdate = true;
+      },
+    };
+
+    const gui = new dat.GUI();
+    gui.width = 360;
+    gui.add(controls, "rotate").name("Rotate");
+    gui.add(controls, "rotationSpeed", -0.05, 0.05, 0.001).name("Rotation Speed");
+    gui.add(controls, "showVideo").name("Show Video Element").onChange(() => controls.applyVisibility());
+    gui.add(controls, "videoFace", 0, 5, 1).name("Video Face Index").onChange(() => controls.applyVideoFace());
+    gui.add(controls, "play").name("Play (try)");
+    gui.add(controls, "pause").name("Pause");
+    controls.applyVisibility();
+    controls.applyVideoFace();
+
+    // ------------------------------------------------------------
+    // 9) デバッグ表示（ここで原因が確定する）
+    // ------------------------------------------------------------
+    function canPlayHints() {
+      // “このブラウザが ogv/theora を形式として受け付けるか” の自己申告
+      const t1 = video.canPlayType('video/ogg');
+      const t2 = video.canPlayType('video/ogg; codecs="theora, vorbis"');
+      return `canPlayType(ogg)=${t1 || "(empty)"} / canPlayType(theora)=${t2 || "(empty)"}`;
+    }
+
+    function updateDebug() {
+      const rs = video.readyState; // 0..4
+      const src = video.currentSrc || "(none)";
+      const vw = video.videoWidth, vh = video.videoHeight;
+
+      // ▼結論：
+      // - vw/vh が 0 のままなら「映像フレームが来ていない」ので VideoTexture は絶対に黒
+      //   → ogvが“音だけ” / コーデック非対応 / 壊れてる / サーバのMIMEが変 などが原因
+      debugEl.textContent =
+        `video.readyState=${rs} (0..4)\n` +
+        `videoWidth=${vw}, videoHeight=${vh}\n` +
+        `paused=${video.paused}, ended=${video.ended}\n` +
+        `currentTime=${video.currentTime.toFixed(2)} / duration=${isFinite(video.duration) ? video.duration.toFixed(2) : "NaN"}\n` +
+        `currentSrc=${src}\n` +
+        `${lastVideoError}\n` +
+        `${canPlayHints()}\n` +
+        `${fetchInfo}\n` +
+        `gotFrameCallback=${gotFrameCallback}\n` +
+        `canUseFrames=${canUseVideoFrames()}\n` +
+        `videoTexture=${videoTexture ? "attached" : "null"}\n` +
+        `videoFaceIndex=${videoFaceIndex}`;
+    }
+
+    // ------------------------------------------------------------
+    // 10) Render loop
+    // ------------------------------------------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      stats.begin();
+
+      // 貼れていないなら毎フレーム軽く試す（環境でイベント順がズレるため）
+      attachVideoTextureIfReady();
+
+      // 貼れている場合のみ更新（videoWidth/Height が 0 なら更新しても黒のまま）
+      if (videoTexture && canUseVideoFrames()) {
+        videoTexture.needsUpdate = true;
+      }
+
+      if (controls.rotate) {
+        cube.rotation.x -= controls.rotationSpeed;
+        cube.rotation.y -= controls.rotationSpeed;
+        cube.rotation.z -= controls.rotationSpeed;
+      }
+
+      renderer.render(scene, camera);
+      updateDebug();
+      stats.end();
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // 11) Resize
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    });
+
+    /*
+      この版で “原因が確定” する見方：
+
+      1) debug の videoWidth/videoHeight が 0 のまま
+         → 3D側の問題ではなく、video が映像フレームを出せていない（=デコード不可 or 音だけ）。
+            - canPlayType(theora) が空/"" なら、そのブラウザは OGV(Theora) 非対応の可能性が高い
+            - errorCode=3(Decode) / 4(Src not supported) が出ることもある
+            - fetch の content-type が video/ogg になっているかも確認（変ならサーバ設定が怪しい）
+
+      2) videoWidth/videoHeight が 0 ではないのに3Dが黒
+         → Video Face Index を 0..5 で切替（貼ってる面が視界に無いだけを排除）
+    */
+  </script>
+</body>
+</html>
