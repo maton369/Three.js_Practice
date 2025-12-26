@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.09 - Canvas texture（libs依存を外した修正版 + 詳細コメント）</title>
+
+  <!--
+    方針（今回の修正の前提）：
+      - ../libs 配下（three.js / stats.js / dat.gui / literallycanvas / jquery / underscore）を使わない
+      - three.js は ES Modules で CDN から import
+      - dat.gui / stats は CDN から読み込み（グローバル利用）
+      - “お絵描きUI” は literallycanvas の代わりに「素の <canvas> + 自前描画」で実装する
+
+    これにより：
+      - 「canvasTexture のソースが別canvasになって反映されない」事故を根絶できる
+      - 依存関係が減り、教材として「Canvas → Texture → Material.map」の流れが明確になる
+  -->
+
+  <!-- dat.gui（グローバル dat.GUI） -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+
+  <!-- stats.js（グローバル Stats） -->
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #bbb; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+    canvas { display: block; }
+
+    /* お絵描きキャンバス（元コードの fs-container 相当） */
+    .paint-wrap {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      width: 350px;
+      height: 350px;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+      background: #000;
+      user-select: none;
+      touch-action: none; /* pointer で描くので標準ジェスチャを抑制 */
+    }
+
+    /* 軽い説明 */
+    .hint {
+      position: fixed;
+      left: 12px;
+      bottom: 374px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.88);
+      font-size: 12px;
+      line-height: 1.35;
+      color: #111;
+      max-width: 360px;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.16);
+    }
+  </style>
+</head>
+
+<body>
+  <div class="hint">
+    <b>Canvas → Texture → Cube</b><br>
+    左の黒いキャンバスに描くと、その内容が cube のテクスチャとしてリアルタイム反映されます。<br>
+    ポイント：CanvasTexture は「描画のたびに needsUpdate=true」が必要です（毎フレームは不要）。
+  </div>
+
+  <!-- お絵描き用Canvas（これ “そのもの” を Three.js の CanvasTexture に渡す） -->
+  <div class="paint-wrap" id="paintWrap">
+    <canvas id="paint" width="350" height="350"></canvas>
+  </div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 10.09 - Canvas texture（アルゴリズム中心の解説）
+      ============================================================
+
+      目的：
+        - “HTML Canvas の内容” を three.js の Texture として使う仕組みを理解する。
+        - 「2D（Canvas）で描く → 3D（Mesh）に貼られる」というデータフローを体験する。
+
+      全体アルゴリズム（コア）：
+        1) 2D描画用の <canvas>（paint）を用意
+           - ユーザのペン入力で 2D コンテキストに線を描く
+        2) three.js 側で CanvasTexture を作る
+           - new THREE.CanvasTexture(paintCanvas)
+        3) MeshPhongMaterial.map にその CanvasTexture を指定
+           - mat.map = canvasTex
+        4) “Canvasの内容が変わった瞬間” に canvasTex.needsUpdate = true
+           - これが GPU へのアップロード指示
+           - 毎フレーム更新すると重いので「dirty フラグ」で必要時のみ更新する
+        5) requestAnimationFrame で cube を回しつつ render
+
+      元コードの典型的な事故ポイント（今回の修正で潰した点）：
+        - literallycanvas が内部で別canvasを生成 → Three.js が参照している canvas と一致しない
+          → cube のテクスチャが更新されない / 意図と違う
+        - createMesh(geom, "floor-wood.jpg") の第2引数が未使用（関数定義と呼び出し不整合）
+        - cube.material.map.needsUpdate を毎フレーム true（動くが無駄が大きい）
+        - jQuery / underscore / literallycanvas 依存が教材としてノイズになりやすい
+
+      この版の設計思想：
+        - “テクスチャのソースは paint canvas 1枚だけ” に固定して混乱を無くす
+        - needsUpdate は「描画があった時だけ」立てる（dirty最適化）
+        - GUI は dat.GUI を利用して「教材らしく操作可能」にする
+    */
+
+    import * as THREE from "https://unpkg.com/three@0.158.0/build/three.module.js";
+
+    // ------------------------------------------------------------
+    // 0) Stats（FPS）
+    // ------------------------------------------------------------
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    document.body.appendChild(stats.dom);
+
+    // ------------------------------------------------------------
+    // 1) 2D Canvas（描画入力）— ここが “テクスチャの元データ”
+    // ------------------------------------------------------------
+    const paintWrap = document.getElementById("paintWrap");
+    const paintCanvas = document.getElementById("paint");
+    const ctx = paintCanvas.getContext("2d", { alpha: false });
+
+    // “見た目の線幅” がデバイスによって変わりすぎないように DPR を考慮する
+    // - 350x350 は CSS サイズ（見た目）
+    // - 実バッファは 350*DPR にして、線がボケにくいようにする
+    function resizePaintCanvas() {
+      const cssW = 350;
+      const cssH = 350;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+      paintCanvas.style.width = cssW + "px";
+      paintCanvas.style.height = cssH + "px";
+
+      paintCanvas.width = Math.floor(cssW * dpr);
+      paintCanvas.height = Math.floor(cssH * dpr);
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      // 初期背景を黒で塗る（alpha:false なので必ず塗る）
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, cssW, cssH);
+    }
+    resizePaintCanvas();
+
+    // 描画状態（ペン）
+    const pen = {
+      color: "#ffffff",
+      size: 10,
+      drawing: false,
+      lastX: 0,
+      lastY: 0
+    };
+
+    // “CanvasTexture を更新すべきか？”のフラグ
+    // - 描画が発生した時だけ true にする
+    let canvasDirty = true;
+
+    // 線を引く（最小関数）
+    function strokeLine(x0, y0, x1, y1) {
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = pen.color;
+      ctx.lineWidth = pen.size;
+
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+      ctx.stroke();
+    }
+
+    // pointer → canvas座標へ変換
+    function getLocalPos(ev) {
+      const rect = paintCanvas.getBoundingClientRect();
+      const x = (ev.clientX - rect.left);
+      const y = (ev.clientY - rect.top);
+      return { x, y };
+    }
+
+    // 描画イベント（libs禁止なので自前）
+    paintWrap.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      const p = getLocalPos(ev);
+      pen.drawing = true;
+      pen.lastX = p.x;
+      pen.lastY = p.y;
+      paintWrap.setPointerCapture(ev.pointerId);
+    });
+
+    paintWrap.addEventListener("pointermove", (ev) => {
+      if (!pen.drawing) return;
+      ev.preventDefault();
+      const p = getLocalPos(ev);
+
+      strokeLine(pen.lastX, pen.lastY, p.x, p.y);
+      pen.lastX = p.x;
+      pen.lastY = p.y;
+
+      // ここが重要：Canvasの中身が変わったので “Texture更新が必要”
+      canvasDirty = true;
+    });
+
+    paintWrap.addEventListener("pointerup", (ev) => {
+      pen.drawing = false;
+      try { paintWrap.releasePointerCapture(ev.pointerId); } catch (_) {}
+    });
+
+    paintWrap.addEventListener("pointercancel", () => {
+      pen.drawing = false;
+    });
+
+    // ------------------------------------------------------------
+    // 2) Three.js（Renderer / Scene / Camera）
+    // ------------------------------------------------------------
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(0xbbbbbb, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // 色空間（環境差分を吸収）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 12, 28);
+    camera.lookAt(0, 0, 0);
+
+    // ------------------------------------------------------------
+    // 3) Canvas → Texture（ここが “教材の核心”）
+    // ------------------------------------------------------------
+    // CanvasTexture は “canvas を直接ソースにする Texture”
+    // - canvas の内容が変わったら needsUpdate=true が必要
+    const canvasTex = new THREE.CanvasTexture(paintCanvas);
+
+    // 2Dで描く色は sRGB と解釈するのが自然（見た目が変に暗くなるのを防ぎやすい）
+    if ("colorSpace" in canvasTex) canvasTex.colorSpace = THREE.SRGBColorSpace;
+    else if ("encoding" in canvasTex) canvasTex.encoding = THREE.sRGBEncoding;
+
+    // フィルタ（拡大縮小時の見え方）
+    // - 教材なら Linear で十分（くっきりが欲しければ Nearest にしてもいい）
+    canvasTex.minFilter = THREE.LinearFilter;
+    canvasTex.magFilter = THREE.LinearFilter;
+
+    // ------------------------------------------------------------
+    // 4) Material / Mesh（CanvasTexture を map として貼る）
+    // ------------------------------------------------------------
+    const cubeGeom = new THREE.BoxGeometry(10, 10, 10);
+
+    // 元コードでは createMesh(geom, "floor-wood.jpg") など不整合があったので、
+    // ここでは「CanvasTexture を貼る」ことに集中したメッシュ生成にする。
+    const cubeMat = new THREE.MeshPhongMaterial({
+      map: canvasTex
+    });
+
+    const cube = new THREE.Mesh(cubeGeom, cubeMat);
+    scene.add(cube);
+
+    // ------------------------------------------------------------
+    // 5) Light（Phongでテクスチャ+陰影を見やすくする）
+    // ------------------------------------------------------------
+    const ambi = new THREE.AmbientLight(0x141414, 1.0);
+    scene.add(ambi);
+
+    const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+    dir.position.set(0, 30, 20);
+    scene.add(dir);
+
+    // ------------------------------------------------------------
+    // 6) dat.GUI（操作UI）
+    // ------------------------------------------------------------
+    const params = {
+      showCanvas: true,
+      penColor: pen.color,
+      penSize: pen.size,
+      clearCanvas: () => {
+        // 背景（黒）で塗りつぶしてクリア
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(0, 0, 350, 350);
+        canvasDirty = true;
+      },
+
+      rotationSpeed: 0.01,
+      rotate: true,
+
+      // “手動適用”ボタン：教材として「needsUpdate の意味」を体験できる
+      // - 通常は描画のたびに dirty で自動更新するが、あえてUIで呼べるようにする
+      applyTextureOnce: () => {
+        canvasDirty = true;
+      },
+
+      // needsUpdate を毎フレーム行うモード（デバッグ/比較用）
+      // - 普段は false 推奨（無駄が多い）
+      forceUpdateEveryFrame: false,
+    };
+
+    const gui = new dat.GUI();
+    gui.width = 360;
+
+    const fCanvas = gui.addFolder("Canvas (2D)");
+    fCanvas.add(params, "showCanvas").name("Show Draw Canvas").onChange(() => {
+      paintWrap.style.display = params.showCanvas ? "block" : "none";
+    });
+    fCanvas.addColor(params, "penColor").name("Pen Color").onChange(() => {
+      pen.color = params.penColor;
+    });
+    fCanvas.add(params, "penSize", 1, 60, 1).name("Pen Size").onChange(() => {
+      pen.size = params.penSize;
+    });
+    fCanvas.add(params, "clearCanvas").name("Clear");
+    fCanvas.add(params, "applyTextureOnce").name("Apply Texture Once");
+    fCanvas.open();
+
+    const fAnim = gui.addFolder("Cube (3D)");
+    fAnim.add(params, "rotate").name("Rotate");
+    fAnim.add(params, "rotationSpeed", -0.1, 0.1, 0.001).name("Rotation Speed");
+    fAnim.add(params, "forceUpdateEveryFrame").name("Force needsUpdate");
+    fAnim.open();
+
+    // ------------------------------------------------------------
+    // 7) Render loop（最重要：Texture更新のタイミング）
+    // ------------------------------------------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      stats.begin();
+
+      // cube回転（視覚的に貼れていることが分かりやすい）
+      if (params.rotate) {
+        cube.rotation.y += params.rotationSpeed;
+        cube.rotation.x += params.rotationSpeed;
+      }
+
+      // ここがこのサンプルの肝：
+      // - Canvas の内容が変わったら needsUpdate=true
+      // - ただし毎フレームやる必要はないので、dirty フラグで節約する
+      if (params.forceUpdateEveryFrame || canvasDirty) {
+        canvasTex.needsUpdate = true;
+        canvasDirty = false;
+      }
+
+      renderer.render(scene, camera);
+
+      stats.end();
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // 8) resize対応（3D側の歪み防止）
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    });
+
+    // 補足：
+    // - paintCanvas（2D側）は固定サイズ 350x350 のままにしている
+    // - もし画面サイズに合わせて絵の領域も伸縮したいなら、resizePaintCanvas() を呼び直し、
+    //   その後 canvasDirty=true で反映すれば良い
+  </script>
+</body>
+</html>
