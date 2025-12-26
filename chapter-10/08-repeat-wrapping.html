@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.08 - Repeat mapping（修正版 + 詳細コメント）</title>
+
+  <!--
+    目的：
+      - Texture の wrapS / wrapT と repeat が「UVの外側（0..1の範囲外）」をどう扱うかを観察する。
+      - RepeatWrapping / MirroredRepeatWrapping / ClampToEdgeWrapping を切り替え、
+        同じ repeat 値でも見え方がどう変化するかを比較する。
+
+    このサンプルの全体アルゴリズム（コア）：
+      1) シーン・カメラ・レンダラを初期化
+      2) 2つのメッシュ（cube / sphere）を作る
+         - それぞれ TextureLoader で別画像を読み込み、material.map に設定
+      3) dat.GUI で repeatX / repeatY / wrapping を操作できるようにする
+      4) GUI変更時に
+         - texture.repeat.set(x,y)
+         - texture.wrapS / wrapT を選択した wrapping に更新
+         - texture.needsUpdate = true（GPUへ反映）
+      5) requestAnimationFrame ループで回転しながら描画
+         - テクスチャが動かない＝“UVとTextureの関係”を観察しやすい
+
+    元コードの典型問題点（今回の修正）：
+      - createMesh(geom, texture) の引数名 texture がローカル変数 texture と衝突して読みづらい
+      - TextureLoader を createMesh のたびに new している（無駄）→ 1個を使い回す
+      - 初期状態で controls.updateRepeat() が呼ばれず、GUI値と実テクスチャ設定がズレやすい
+      - repeatWrapping という未使用フラグが残っている（混乱の元）→ 削除
+      - repeat の負値は挙動が分かりづらいので、教材としては「負もOK」だが意図をコメントで明示
+  -->
+
+  <script type="text/javascript" src="../libs/three.js"></script>
+  <script type="text/javascript" src="../libs/stats.js"></script>
+  <script type="text/javascript" src="../libs/dat.gui.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; }
+    #WebGL-output { width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="text/javascript">
+    function init() {
+      // ------------------------------------------------------------
+      // 1) Stats（FPS計測）
+      // ------------------------------------------------------------
+      var stats = initStats();
+
+      // ------------------------------------------------------------
+      // 2) Scene / Camera / Renderer
+      // ------------------------------------------------------------
+      var scene = new THREE.Scene();
+
+      var camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+
+      var renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(new THREE.Color(0xEEEEEE));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+
+      document.getElementById("WebGL-output").appendChild(renderer.domElement);
+
+      // ------------------------------------------------------------
+      // 3) TextureLoader は使い回す（毎回 new しない）
+      // ------------------------------------------------------------
+      var textureLoader = new THREE.TextureLoader();
+
+      // ------------------------------------------------------------
+      // 4) メッシュ作成（cube / sphere）
+      //    - “同じGUI操作” を2つの別テクスチャへ適用して比較する
+      // ------------------------------------------------------------
+      var sphere = createMesh(
+        new THREE.SphereGeometry(5, 20, 20),
+        "floor-wood.jpg"
+      );
+      sphere.position.x = 7;
+      scene.add(sphere);
+
+      var cube = createMesh(
+        new THREE.BoxGeometry(6, 6, 6),
+        "brick-wall.jpg"
+      );
+      cube.position.x = -7;
+      scene.add(cube);
+
+      // ------------------------------------------------------------
+      // 5) カメラ初期位置
+      // ------------------------------------------------------------
+      camera.position.set(0, 12, 20);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+      // ------------------------------------------------------------
+      // 6) ライト（Phongの陰影）
+      //    ※ Texture repeat の観察が主だが、陰影があると立体が見やすい
+      // ------------------------------------------------------------
+      var ambiLight = new THREE.AmbientLight(0x141414);
+      scene.add(ambiLight);
+
+      var dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+      dirLight.position.set(0, 30, 20);
+      scene.add(dirLight);
+
+      // ------------------------------------------------------------
+      // 7) dat.GUI（repeat と wrapping を操作）
+      // ------------------------------------------------------------
+      var controls = {
+        // repeat の意味：
+        // - (1,1) : 1枚だけ貼る（通常）
+        // - (2,2) : 2x2 で繰り返す
+        // - (0.5,0.5) : 1/2サイズで伸ばす（＝拡大されて見える）
+        // - 負値      : UVが反転した繰り返しになる（教材として面白いが直感的ではない）
+        repeatX: 1,
+        repeatY: 1,
+
+        // wrapping の意味：
+        // - RepeatWrapping           : 繰り返し
+        // - MirroredRepeatWrapping   : 反転しながら繰り返し（継ぎ目が目立ちにくい場合がある）
+        // - ClampToEdgeWrapping      : 端の色で引き伸ばし（繰り返さない）
+        wrapping: "repeat",
+
+        update: function () {
+          var wrappingConst = THREE.RepeatWrapping;
+
+          if (controls.wrapping === "repeat") {
+            wrappingConst = THREE.RepeatWrapping;
+          } else if (controls.wrapping === "mirrored repeat") {
+            wrappingConst = THREE.MirroredRepeatWrapping;
+          } else if (controls.wrapping === "clamp to edge") {
+            wrappingConst = THREE.ClampToEdgeWrapping;
+          }
+
+          // 共通処理：両方のテクスチャへ同じ設定を流し込む
+          applyRepeatAndWrapping(cube.material.map, controls.repeatX, controls.repeatY, wrappingConst);
+          applyRepeatAndWrapping(sphere.material.map, controls.repeatX, controls.repeatY, wrappingConst);
+        }
+      };
+
+      var gui = new dat.GUI();
+      gui.add(controls, "repeatX", -4, 4, 0.01).onChange(controls.update);
+      gui.add(controls, "repeatY", -4, 4, 0.01).onChange(controls.update);
+      gui.add(controls, "wrapping", ["repeat", "mirrored repeat", "clamp to edge"]).onChange(controls.update);
+
+      // 初期状態をGUI値で確定（GUI表示と実際のテクスチャ状態を一致させる）
+      controls.update();
+
+      // ------------------------------------------------------------
+      // 8) アニメーションループ（回転させて見え方を確認しやすくする）
+      // ------------------------------------------------------------
+      var step = 0;
+
+      function render() {
+        stats.update();
+
+        step += 0.01;
+        cube.rotation.set(step, step, 0);
+        sphere.rotation.set(step, step, 0);
+
+        requestAnimationFrame(render);
+        renderer.render(scene, camera);
+      }
+      render();
+
+      // ------------------------------------------------------------
+      // 9) resize対応（描画の歪み防止）
+      // ------------------------------------------------------------
+      window.addEventListener("resize", function () {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      // ============================================================
+      // 以降：ユーティリティ関数群
+      // ============================================================
+
+      function createMesh(geom, textureFileName) {
+        // テクスチャをロード
+        // 重要：repeat/wrapping を効かせるには wrapS/wrapT を Repeat系にする必要がある
+        var tex = textureLoader.load("../assets/textures/general/" + textureFileName);
+
+        // 初期は RepeatWrapping にしておく（GUIで変更される）
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.repeat.set(1, 1);
+
+        // 形状の法線を用意（Phongの陰影が安定する）
+        geom.computeVertexNormals();
+
+        var mat = new THREE.MeshPhongMaterial({
+          map: tex
+        });
+
+        return new THREE.Mesh(geom, mat);
+      }
+
+      function applyRepeatAndWrapping(tex, rx, ry, wrappingConst) {
+        // repeat を設定（UVスケール）
+        tex.repeat.set(rx, ry);
+
+        // wrap を設定（UV範囲外の扱い）
+        tex.wrapS = wrappingConst;
+        tex.wrapT = wrappingConst;
+
+        // GPUへ反映させるフラグ（wrapping 変更時に特に重要）
+        tex.needsUpdate = true;
+      }
+
+      function initStats() {
+        var stats = new Stats();
+        stats.setMode(0);
+        stats.domElement.style.position = "absolute";
+        stats.domElement.style.left = "0px";
+        stats.domElement.style.top = "0px";
+        document.getElementById("Stats-output").appendChild(stats.domElement);
+        return stats;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
