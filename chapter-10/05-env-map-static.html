@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.05 - Env map（libsなし・ES Modules版 / normalScale参照バグ回避）</title>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #eee; }
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      padding: 12px 12px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.92);
+      font: 13px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.15);
+      user-select: none;
+      max-width: 320px;
+    }
+    #ui .row { display: grid; grid-template-columns: 110px 1fr; gap: 8px; align-items: center; margin: 8px 0; }
+    #ui label { color: #222; }
+    #ui input[type="range"] { width: 180px; }
+    #ui .hint { color: #555; font-size: 12px; margin-top: 6px; }
+  </style>
+</head>
+
+<body>
+  <!-- libs（../libs/*）を使わないため、UIは dat.GUI ではなく素のHTMLで代替する -->
+  <div id="ui">
+    <div style="font-weight: 700; margin-bottom: 8px;">EnvMap / Skybox</div>
+
+    <div class="row">
+      <label for="normalScale">normalScale</label>
+      <input id="normalScale" type="range" min="-2" max="2" step="0.01" value="1.0" />
+    </div>
+
+    <div class="row">
+      <label for="reflectivity">reflectivity</label>
+      <input id="reflectivity" type="range" min="0" max="2" step="0.01" value="1.0" />
+    </div>
+
+    <div class="row">
+      <label for="textureSet">textureSet</label>
+      <select id="textureSet">
+        <option value="plaster" selected>plaster</option>
+        <option value="bathroom">bathroom</option>
+        <option value="metal-floor">metal-floor</option>
+        <option value="none">none</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label for="rotate">rotate</label>
+      <input id="rotate" type="checkbox" />
+    </div>
+
+    <div class="hint">
+      マウス移動でカメラが少し動く（反射は視点依存なので変化が分かりやすい）。
+    </div>
+  </div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 10.05 - Env map（libsなし・ES Modules版）
+      ============================================================
+
+      要求：
+        - ../libs/three.js / stats.js / dat.gui.js を使わない
+        - Uncaught TypeError: Cannot read properties of undefined (reading 'normalScale') を回避
+        - 詳細な説明コメント付きで、動作する形に修正する
+
+      いままでのエラーの本質：
+        - createMesh() 内で params.normalScale を参照していた
+        - しかし params は createMesh() を呼んだ後に作っていた
+        - よって createMesh 実行時点で params が undefined になって落ちる
+
+      解決方針（アルゴリズム設計の修正）：
+        ✅ createMesh は「外部状態に依存しない」純粋な関数にする
+           - 初期 normalScale は引数で渡す
+           - UI操作で変えるのは applyMaterialParams で material に反映する
+
+      このサンプルの全体アルゴリズム（EnvMap + Skybox）：
+        1) Cubemap（6枚）をロード
+        2) 背景（Skybox）として cubemap を貼る
+           - legacyの「2シーン+ShaderLib cube」ではなく、ここではより安全な
+             scene.background = cubeTexture を採用（余計なカメラ/autoClearが不要）
+        3) 比較用オブジェクトを2つ作成
+           - sphere1: map + envMap（凹凸なし）
+           - sphere2: map + normalMap + envMap（凹凸あり / normalScaleで調整）
+        4) ライト（Ambient + Spot + Point）を置く
+           - envMap はライト無しでも見えるが、Phongの陰影で形が分かりやすくなる
+           - SpotLight/PointLight の decay は “あなたの方針” に従い 0 に設定
+        5) UI（素のHTML）で material パラメータを変更
+           - normalScale / reflectivity / textureSet / rotate
+        6) 毎フレーム requestAnimationFrame で
+           - rotate がONなら回転
+           - 光源マーカー球を周回させ、PointLight を追従
+           - マウスでカメラを少し動かして反射の変化を見せる
+           - renderer.render(scene, camera)
+
+      依存（libsなしの解釈）：
+        - ここでの「libsなし」は「ローカルの ../libs 配下を使わない」という意味で解釈し、
+          three 本体は ES Modules を CDN から import している。
+        - もし “CDNも禁止（完全オフライン）” なら、three 自体が必要なので別途バンドルが必要になる。
+    */
+
+    // three.js（ES Modules）を CDN から読み込む（../libs/three.js を使わない）
+    import * as THREE from "https://unpkg.com/three@0.158.0/build/three.module.js";
+
+    // ------------------------------------------------------------
+    // UI（dat.GUI の代替）
+    // ------------------------------------------------------------
+    const ui = {
+      normalScale: document.getElementById("normalScale"),
+      reflectivity: document.getElementById("reflectivity"),
+      textureSet: document.getElementById("textureSet"),
+      rotate: document.getElementById("rotate"),
+    };
+
+    // ------------------------------------------------------------
+    // パラメータ（UI値の “正”）
+    // - createMesh はこの object を参照しない（= 依存しない）
+    // ------------------------------------------------------------
+    const params = {
+      normalScale: parseFloat(ui.normalScale.value),
+      reflectivity: parseFloat(ui.reflectivity.value),
+      textureSet: ui.textureSet.value,
+      rotate: ui.rotate.checked,
+    };
+
+    // ------------------------------------------------------------
+    // Three 基本セット
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(new THREE.Color(0xeeeeee));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    // ------------------------------------------------------------
+    // ローダは使い回す（毎回 new しない）
+    // ------------------------------------------------------------
+    const textureLoader = new THREE.TextureLoader();
+    const cubeTextureLoader = new THREE.CubeTextureLoader();
+
+    // ------------------------------------------------------------
+    // 1) Cubemap をロード（envMap と背景で共有）
+    // ------------------------------------------------------------
+    const envCube = createCubeMap();
+    // 2) Skybox：より安全な方法として scene.background に cubemap を直接セット
+    // - legacy の ShaderLib["cube"] + 別シーン でも可能だが、構文事故・版差分が増える
+    scene.background = envCube;
+
+    // ------------------------------------------------------------
+    // 3) 比較用メッシュ（createMesh は外部状態に依存しない）
+    // ------------------------------------------------------------
+    const sphere1 = createMesh(
+      new THREE.SphereGeometry(10, 24, 24),
+      "plaster.jpg",
+      null,
+      params.normalScale
+    );
+    sphere1.position.set(12, 5, 0);
+    sphere1.rotation.y = -0.5;
+    sphere1.material.envMap = envCube;
+    sphere1.material.reflectivity = params.reflectivity;
+    scene.add(sphere1);
+
+    const sphere2 = createMesh(
+      new THREE.BoxGeometry(10, 15, 15),
+      "plaster.jpg",
+      "plaster-normal.jpg",
+      params.normalScale
+    );
+    sphere2.position.set(-12, 5, 0);
+    sphere2.rotation.y = 0.5;
+    sphere2.material.envMap = envCube;
+    sphere2.material.reflectivity = params.reflectivity;
+    scene.add(sphere2);
+
+    // ------------------------------------------------------------
+    // カメラ初期配置（両方見える位置）
+    // ------------------------------------------------------------
+    camera.position.set(0, 12, 68);
+    camera.lookAt(scene.position);
+
+    // ------------------------------------------------------------
+    // 4) Light（Phong の陰影 + envMap の反射で見せる）
+    // ------------------------------------------------------------
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+
+    const spotLight = new THREE.SpotLight(0xffffff, 1.2);
+    spotLight.position.set(0, 30, 30);
+    // あなたの方針：SpotLight/PointLight の decay は 0（存在する場合のみ）
+    if ("decay" in spotLight) spotLight.decay = 0;
+    scene.add(spotLight);
+
+    const pointLight = new THREE.PointLight(0xff5808, 4.5);
+    if ("decay" in pointLight) pointLight.decay = 0;
+    scene.add(pointLight);
+
+    // 光源位置マーカー（可視化用）
+    const lightMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.2, 16, 16),
+      new THREE.MeshBasicMaterial({ color: 0xac6c25 })
+    );
+    lightMarker.position.set(3, 3, 3);
+    scene.add(lightMarker);
+
+    // ------------------------------------------------------------
+    // 5) UI → params → material 反映
+    // ------------------------------------------------------------
+    function applyTextureSet(setName) {
+      if (setName === "none") {
+        sphere1.material.map = null;
+
+        sphere2.material.map = null;
+        sphere2.material.normalMap = null;
+
+        sphere1.material.needsUpdate = true;
+        sphere2.material.needsUpdate = true;
+        return;
+      }
+
+      // map は両方同じテクスチャにする（比較しやすい）
+      const mapTex = textureLoader.load(`../assets/textures/general/${setName}.jpg`);
+      sphere1.material.map = mapTex;
+      sphere2.material.map = mapTex;
+
+      // normalMap は sphere2 のみ
+      const nTex = textureLoader.load(`../assets/textures/general/${setName}-normal.jpg`);
+      sphere2.material.normalMap = nTex;
+
+      sphere1.material.needsUpdate = true;
+      sphere2.material.needsUpdate = true;
+    }
+
+    function applyMaterialParams() {
+      // reflectivity（envMap の反射強度）
+      sphere1.material.reflectivity = params.reflectivity;
+      sphere2.material.reflectivity = params.reflectivity;
+
+      // normalScale（normalMap の強さ）※ sphere2 のみ
+      // MeshPhongMaterial.normalScale は Vector2 の想定
+      if (sphere2.material.normalScale && typeof sphere2.material.normalScale.set === "function") {
+        sphere2.material.normalScale.set(params.normalScale, params.normalScale);
+      } else {
+        // 万が一 normalScale が無い実装への保険
+        sphere2.material.normalScale = new THREE.Vector2(params.normalScale, params.normalScale);
+      }
+
+      sphere1.material.needsUpdate = true;
+      sphere2.material.needsUpdate = true;
+    }
+
+    // UIイベント
+    ui.normalScale.addEventListener("input", () => {
+      params.normalScale = parseFloat(ui.normalScale.value);
+      applyMaterialParams();
+    });
+    ui.reflectivity.addEventListener("input", () => {
+      params.reflectivity = parseFloat(ui.reflectivity.value);
+      applyMaterialParams();
+    });
+    ui.textureSet.addEventListener("change", () => {
+      params.textureSet = ui.textureSet.value;
+      applyTextureSet(params.textureSet);
+      applyMaterialParams();
+    });
+    ui.rotate.addEventListener("change", () => {
+      params.rotate = ui.rotate.checked;
+    });
+
+    // 初期状態を反映（UIの値と見た目の一致）
+    applyTextureSet(params.textureSet);
+    applyMaterialParams();
+
+    // ------------------------------------------------------------
+    // 6) マウスでカメラを少し動かす（反射は視点依存）
+    // ------------------------------------------------------------
+    let mouseX = 0;
+    let mouseY = 0;
+
+    window.addEventListener("pointermove", (e) => {
+      mouseX = (e.clientX - window.innerWidth / 2) * 10;
+      mouseY = (e.clientY - window.innerHeight / 2) * 10;
+    });
+
+    // ------------------------------------------------------------
+    // 7) レンダリングループ（周回ライト + 回転 + 描画）
+    // ------------------------------------------------------------
+    let invert = 1;
+    let phase = 0;
+
+    function animate() {
+      if (params.rotate) {
+        sphere1.rotation.y -= 0.01;
+        sphere2.rotation.y += 0.01;
+      }
+
+      // 光源マーカー球を周回（sin/cos）
+      if (phase > 2 * Math.PI) {
+        invert *= -1;
+        phase -= 2 * Math.PI;
+      } else {
+        phase += 0.03;
+      }
+
+      lightMarker.position.z = 21 * Math.sin(phase);
+      lightMarker.position.x = -14 + (14 * Math.cos(phase));
+
+      if (invert < 0) {
+        const pivot = 0;
+        lightMarker.position.x = (invert * (lightMarker.position.x - pivot)) + pivot;
+      }
+
+      // PointLight をマーカー球に追従
+      pointLight.position.copy(lightMarker.position);
+
+      // カメラをマウスで微調整（視点で反射が変わるのを体感）
+      camera.position.x = mouseX * 0.018;
+      camera.position.y = 6 + mouseY * 0.018;
+      camera.lookAt(scene.position);
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    animate();
+
+    // ------------------------------------------------------------
+    // resize：描画の歪み防止
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ------------------------------------------------------------
+    // Cubemap 作成（6面画像ロード）
+    // ------------------------------------------------------------
+    function createCubeMap() {
+      const path = "../assets/textures/cubemap/parliament/";
+      const format = ".jpg";
+      const urls = [
+        path + "posx" + format, path + "negx" + format,
+        path + "posy" + format, path + "negy" + format,
+        path + "posz" + format, path + "negz" + format
+      ];
+
+      // CubeTextureLoader.load のシグネチャは (urls, onLoad, onProgress, onError)
+      // mapping は “引数で渡す” より、ロード後にプロパティで設定するのが安全
+      const cube = cubeTextureLoader.load(urls);
+      cube.mapping = THREE.CubeReflectionMapping;
+      return cube;
+    }
+
+    // ------------------------------------------------------------
+    // createMesh：外部状態(params)に依存しない（= 参照バグを根絶）
+    // ------------------------------------------------------------
+    function createMesh(geom, textureFile, normalFile, initialNormalScale) {
+      geom.computeVertexNormals();
+
+      // map は常にセットする（これが無いと “真っ白” 事故になりやすい）
+      const mapTex = textureLoader.load(`../assets/textures/general/${textureFile}`);
+      const mat = new THREE.MeshPhongMaterial({ map: mapTex });
+
+      // normalMap がある場合のみ normalScale を初期化
+      if (normalFile) {
+        const nTex = textureLoader.load(`../assets/textures/general/${normalFile}`);
+        mat.normalMap = nTex;
+
+        if (mat.normalScale && typeof mat.normalScale.set === "function") {
+          mat.normalScale.set(initialNormalScale, initialNormalScale);
+        } else {
+          mat.normalScale = new THREE.Vector2(initialNormalScale, initialNormalScale);
+        }
+      }
+
+      return new THREE.Mesh(geom, mat);
+    }
+  </script>
+</body>
+</html>
