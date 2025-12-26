@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.07 - UV mapping（libsなし・importmap対応版 + 詳細コメント）</title>
+
+  <!--
+    ✅ あなたのエラー：
+      Failed to resolve module specifier "three"
+    原因：
+      - OBJLoader（examples/jsm）は内部で `import ... from "three"` という “bare specifier” を使う
+      - ブラウザは bundler/importmap が無いと "three" を解決できない
+
+    ✅ 解決策（今回）：
+      - importmap を使って "three" を CDN の three.module.js にマッピングする
+      - さらに "three/addons/" も examples/jsm/ にマッピングし、
+        OBJLoader を "three/addons/loaders/OBJLoader.js" で import する
+  -->
+
+  <!-- importmap：bare specifier をブラウザに解決させる -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <!-- dat.gui（グローバル dat.GUI） -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+
+  <!-- stats.js（グローバル Stats） -->
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #fff; }
+    canvas { display: block; }
+
+    # #hint {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.65);
+      color: #fff;
+      font: 12px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+      user-select: none;
+      max-width: 560px;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hint">
+    UV mapping demo：同じUVグリッド（ash_uvgrid01.jpg）を貼って、OBJごとのUVの歪みを比較します。<br>
+    GUI：Cube1 / Cube2 切替、回転ON/OFF、回転速度、ワイヤーフレーム表示。
+  </div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 10.07 - UV mapping（アルゴリズム中心の解説）
+      ============================================================
+
+      目的：
+        - UVマッピング（テクスチャ座標）の品質を “UVグリッド画像” で可視化する。
+        - UVCube1.obj / UVCube2.obj を切替えて、
+          歪み（伸び・ねじれ）やUV島の配置の違いを観察する。
+
+      全体アルゴリズム：
+        1) Renderer / Scene / Camera / Stats を初期化
+        2) UVグリッドテクスチャをロード（色テクスチャなので sRGB 扱い）
+        3) OBJLoader で .obj をロード
+        4) 読み込んだ Object3D を traverse し、全 Mesh に同じ material（UVグリッド）を適用
+           - children[0] 固定は “OBJが複数Mesh” のとき壊れるので避ける
+        5) dat.GUI でモデル切替・回転・速度・wireframe を操作
+        6) requestAnimationFrame で回転しながら描画
+        7) resize 対応で縦横比の歪みを防止
+
+      修正ポイント（元コードとの差）：
+        - “three” の解決：importmap で bare specifier を解決
+        - OBJのコールバック引数は geometry ではなく Object3D（ここでは obj と命名）
+        - traverse() で安全に材質を差し替え
+        - scene.remove だけでなく geometry.dispose でGPUメモリリークを抑制
+        - resize 対応追加
+    */
+
+    import * as THREE from "three";
+    import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
+
+    // ------------------------------------------------------------
+    // 1) Renderer / Scene / Camera / Stats
+    // ------------------------------------------------------------
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0xffffff, 1.0);
+    document.body.appendChild(renderer.domElement);
+
+    // 色空間：three の版によってプロパティ名が異なるため分岐
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(-30, 40, 50);
+    camera.lookAt(0, 0, 0);
+
+    // 観察しやすいように座標軸
+    const axes = new THREE.AxesHelper(20);
+    scene.add(axes);
+
+    // Stats（FPS）
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    document.body.appendChild(stats.dom);
+
+    // ------------------------------------------------------------
+    // 2) UVグリッドテクスチャ / Material
+    // ------------------------------------------------------------
+    const textureLoader = new THREE.TextureLoader();
+
+    // UVグリッド（色テクスチャなので sRGB）
+    const uvGridTex = textureLoader.load("../assets/textures/ash_uvgrid01.jpg");
+    if ("colorSpace" in uvGridTex) uvGridTex.colorSpace = THREE.SRGBColorSpace;
+    else if ("encoding" in uvGridTex) uvGridTex.encoding = THREE.sRGBEncoding;
+
+    // UV比較が目的なので “ライト影響なし” の MeshBasicMaterial を使う
+    const uvMaterial = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      map: uvGridTex,
+      wireframe: false
+    });
+
+    // ------------------------------------------------------------
+    // 3) OBJLoader / モデル管理
+    // ------------------------------------------------------------
+    const objLoader = new OBJLoader();
+    let currentModel = null; // Object3D
+
+    // ------------------------------------------------------------
+    // 4) dat.GUI（操作）
+    // ------------------------------------------------------------
+    const params = {
+      model: "Cube1",
+      rotate: true,
+      rotateSpeed: 0.006,
+      wireframe: false,
+      showAxes: true,
+
+      load: () => {
+        if (params.model === "Cube1") loadObj("../assets/models/UVCube1.obj", { scale: 15, rotX: 0.0 });
+        if (params.model === "Cube2") loadObj("../assets/models/UVCube2.obj", { scale: 15, rotX: -0.3 });
+      },
+
+      resetCamera: () => {
+        camera.position.set(-30, 40, 50);
+        camera.lookAt(0, 0, 0);
+      }
+    };
+
+    const gui = new dat.GUI();
+    gui.width = 360;
+
+    gui.add(params, "model", ["Cube1", "Cube2"]).name("OBJ");
+    gui.add(params, "load").name("Load/Reload");
+    gui.add(params, "rotate").name("Rotate");
+    gui.add(params, "rotateSpeed", 0.0, 0.03, 0.001).name("Rotate Speed");
+    gui.add(params, "wireframe").name("Wireframe").onChange(() => {
+      uvMaterial.wireframe = params.wireframe;
+      uvMaterial.needsUpdate = true;
+    });
+    gui.add(params, "showAxes").name("Show Axes").onChange(() => {
+      axes.visible = params.showAxes;
+    });
+    gui.add(params, "resetCamera").name("Reset Camera");
+
+    // 初期ロード
+    params.load();
+
+    // ------------------------------------------------------------
+    // 5) OBJロード（UV比較のコア）
+    // ------------------------------------------------------------
+    function loadObj(path, transform) {
+      // 既存モデルを外し、Geometry を dispose（GPUリーク抑制）
+      if (currentModel) {
+        scene.remove(currentModel);
+        disposeObject3D(currentModel);
+        currentModel = null;
+      }
+
+      objLoader.load(
+        path,
+        (obj) => {
+          // OBJは1Meshとは限らない → traverse() が安全
+          obj.traverse((child) => {
+            if (child.isMesh) {
+              child.material = uvMaterial;
+
+              // 影は不要（UV確認が目的）
+              child.castShadow = false;
+              child.receiveShadow = false;
+
+              // 法線欠落の保険（必要な場合のみ）
+              if (child.geometry && !child.geometry.attributes?.normal) {
+                child.geometry.computeVertexNormals();
+              }
+            }
+          });
+
+          // モデルごとの見た目差を付ける（教材の意図を維持）
+          const s = transform?.scale ?? 15;
+          obj.scale.set(s, s, s);
+
+          const rx = transform?.rotX ?? 0;
+          obj.rotation.x = rx;
+
+          scene.add(obj);
+          currentModel = obj;
+        },
+        undefined,
+        (err) => console.error("OBJ load failed:", err)
+      );
+    }
+
+    // ------------------------------------------------------------
+    // 6) dispose：OBJ側の Geometry を解放
+    //   - uvMaterial / uvGridTex は共有なので dispose しない
+    // ------------------------------------------------------------
+    function disposeObject3D(root) {
+      root.traverse((child) => {
+        if (child.isMesh) {
+          if (child.geometry) child.geometry.dispose();
+        }
+      });
+    }
+
+    // ------------------------------------------------------------
+    // 7) render loop
+    // ------------------------------------------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      stats.begin();
+
+      if (currentModel && params.rotate) {
+        currentModel.rotation.y += params.rotateSpeed;
+        currentModel.rotation.x += params.rotateSpeed;
+      }
+
+      renderer.render(scene, camera);
+
+      stats.end();
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // 8) resize 対応
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    });
+  </script>
+</body>
+</html>

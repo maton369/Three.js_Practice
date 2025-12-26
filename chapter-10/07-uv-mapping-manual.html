@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 10.07 - UV mapping（現行three対応・詳細コメント付き / libsなし）</title>
+
+  <!--
+    ✅ 方針：../libs は一切使わない
+      - three.js：ES Modules を CDN から import
+      - dat.gui / stats.js：CDN から script 読み込み（グローバル dat.GUI / Stats）
+
+    ✅ ここで直しているポイント（重要）
+      - 元コードは Geometry.faceVertexUvs を触っているが、現行three.jsでは廃止済み
+      - 現行は BufferGeometry + geometry.attributes.uv を編集するのが正攻法
+      - さらに「三角形単位でUVを独立にいじりたい」ので geometry.toNonIndexed() を使う
+        → インデックス共有がなくなるので、1つの三角形のUV変更が他へ波及しにくい
+  -->
+
+  <!-- dat.gui（グローバル dat.GUI） -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <!-- stats.js（グローバル Stats） -->
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #fff; }
+    canvas { display: block; }
+    #WebGL-output { width: 100vw; height: 100vh; }
+    #hint {
+      position: fixed;
+      left: 12px; bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.65);
+      color: #fff;
+      font: 12px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+      user-select: none;
+      max-width: 640px;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="WebGL-output"></div>
+  <div id="hint">
+    このサンプルは「BoxGeometry の先頭2三角形（Triangle A/B）」のUVだけをGUIで編集します。<br>
+    UVグリッド（ash_uvgrid01.jpg）が伸びる/歪む/反転する様子を観察してください。
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.158.0/build/three.module.js";
+
+    // ============================================================
+    // 0) 全体アルゴリズム（このサンプルのコア）
+    // ============================================================
+    /*
+      目的：
+        - UV（テクスチャ座標）を“手で動かす”と見た目がどう変わるか体感する。
+
+      手順（アルゴリズム）：
+        1) BoxGeometry を作り、UVグリッドテクスチャを貼る（MeshBasicMaterial）
+        2) geometry を toNonIndexed() して「三角形ごとに独立した頂点」を持たせる
+           - indexed のままだと頂点が共有され、UV変更が複数三角形へ波及しやすい
+        3) dat.GUI で「三角形A/B」「3頂点×(u,v)」をスライダー化
+        4) スライダー操作のたびに geometry.attributes.uv を直接書き換え、
+           uvAttr.needsUpdate = true でGPUへ再転送
+        5) requestAnimationFrame で描画し続ける
+
+      元コード（旧API）からの置換対応：
+        - geom.faceVertexUvs[0][0][k].x/y → uvAttr.setXY(vertexIndex, u, v)
+        - geom.uvsNeedUpdate = true      → uvAttr.needsUpdate = true
+    */
+
+    // ============================================================
+    // 1) Renderer / Scene / Camera / Stats
+    // ============================================================
+    const container = document.getElementById("WebGL-output");
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0xffffff, 1.0);
+
+    // 色空間（版差分吸収）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(-30, 40, 50);
+    camera.lookAt(0, 0, 0);
+
+    // 観察用の座標軸（UV自体とは無関係だが、向きが分かりやすくなる）
+    const axes = new THREE.AxesHelper(20);
+    scene.add(axes);
+
+    // Stats（FPS）
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    document.body.appendChild(stats.dom);
+
+    // ============================================================
+    // 2) Texture / Material / Geometry / Mesh
+    // ============================================================
+    const textureLoader = new THREE.TextureLoader();
+    const tex = textureLoader.load("../assets/textures/ash_uvgrid01.jpg");
+
+    // UVグリッドは色テクスチャ → sRGB 扱い
+    if ("colorSpace" in tex) tex.colorSpace = THREE.SRGBColorSpace;
+    else if ("encoding" in tex) tex.encoding = THREE.sRGBEncoding;
+
+    // UV変化だけ見たいのでライトの影響を受けない MeshBasicMaterial
+    const mat = new THREE.MeshBasicMaterial({ map: tex });
+
+    // BoxGeometry（BufferGeometry）を作る
+    // 重要：toNonIndexed() で “三角形単位に頂点が独立” する
+    // → 旧 Geometry.faceVertexUvs に近い感覚で「ある三角形だけ」UVを動かせる
+    const geom = new THREE.BoxGeometry(24, 24, 24).toNonIndexed();
+
+    const mesh = new THREE.Mesh(geom, mat);
+
+    // 元コードの初期回転を踏襲
+    mesh.rotation.z = 0.5 * Math.PI;
+    mesh.rotation.y = 0.2 * Math.PI;
+    mesh.rotation.x = 0.2 * Math.PI;
+
+    scene.add(mesh);
+
+    // UV属性（Float32Array）への参照
+    const uvAttr = geom.attributes.uv;
+
+    // ============================================================
+    // 3) “どの三角形のUVを編集するか” の定義
+    // ============================================================
+    /*
+      toNonIndexed() した BufferGeometry の構造：
+        - position は「頂点が三角形ごとに並ぶ」
+        - 1三角形 = 3頂点
+        - したがって triIndex 番目の三角形の頂点インデックスは
+            v0 = triIndex*3 + 0
+            v1 = triIndex*3 + 1
+            v2 = triIndex*3 + 2
+
+      Box は面が12三角形ある（6面×2）。
+      ここでは教材として “先頭の2三角形（tri 0, tri 1）” を A/B としていじる。
+      （どの面かは実装依存のこともあるが、UV編集の体験には十分）
+    */
+
+    function triVertexIndex(triIndex, corner /*0..2*/) {
+      return triIndex * 3 + corner;
+    }
+
+    // ============================================================
+    // 4) dat.GUI（旧コードの uv1..uv6 を現行APIで再現）
+    // ============================================================
+    const controls = {
+      // triA = 0, triB = 1 を切り替える
+      triangle: "A", // "A" or "B"
+
+      // 旧コードの uv1..uv6 相当（3頂点×(u,v)）
+      // v0: (uv1,uv2), v1: (uv3,uv4), v2: (uv5,uv6)
+      uv1: 0.0, uv2: 0.0,
+      uv3: 1.0, uv4: 0.0,
+      uv5: 1.0, uv6: 1.0,
+
+      // 表示補助
+      wireframe: false,
+      showAxes: true,
+
+      // 便利操作
+      resetUV: () => {
+        // 典型的な “正方形UV” に戻す（v0,v1,v2をそれっぽく）
+        controls.uv1 = 0.0; controls.uv2 = 0.0;
+        controls.uv3 = 1.0; controls.uv4 = 0.0;
+        controls.uv5 = 1.0; controls.uv6 = 1.0;
+        updateGuiDisplay();
+        applyTriangleUVFromControls();
+      }
+    };
+
+    const gui = new dat.GUI();
+    gui.width = 360;
+
+    gui.add(controls, "triangle", ["A", "B"]).name("Triangle").onChange(() => {
+      // 三角形切替時：現在のUVを読み出してGUIに反映する
+      readTriangleUVIntoControls();
+      updateGuiDisplay();
+    });
+
+    const f = gui.addFolder("UV (3 vertices)");
+    f.add(controls, "uv1", 0, 1, 0.001).name("v0.u").onChange(applyTriangleUVFromControls);
+    f.add(controls, "uv2", 0, 1, 0.001).name("v0.v").onChange(applyTriangleUVFromControls);
+    f.add(controls, "uv3", 0, 1, 0.001).name("v1.u").onChange(applyTriangleUVFromControls);
+    f.add(controls, "uv4", 0, 1, 0.001).name("v1.v").onChange(applyTriangleUVFromControls);
+    f.add(controls, "uv5", 0, 1, 0.001).name("v2.u").onChange(applyTriangleUVFromControls);
+    f.add(controls, "uv6", 0, 1, 0.001).name("v2.v").onChange(applyTriangleUVFromControls);
+    f.open();
+
+    gui.add(controls, "wireframe").name("Wireframe").onChange(() => {
+      mat.wireframe = controls.wireframe;
+      mat.needsUpdate = true;
+    });
+
+    gui.add(controls, "showAxes").name("Show Axes").onChange(() => {
+      axes.visible = controls.showAxes;
+    });
+
+    gui.add(controls, "resetUV").name("Reset UV");
+
+    // 初期状態：実際のUVを読み出してGUIへ反映しておく
+    readTriangleUVIntoControls();
+    updateGuiDisplay();
+
+    // ============================================================
+    // 5) UV更新（ここが“旧faceVertexUvs編集”の現行版）
+    // ============================================================
+    function currentTriangleIndex() {
+      // A=0, B=1
+      return controls.triangle === "A" ? 0 : 1;
+    }
+
+    function setUV(vertexIndex, u, v) {
+      uvAttr.setXY(vertexIndex, u, v);
+    }
+
+    function getUV(vertexIndex) {
+      return { u: uvAttr.getX(vertexIndex), v: uvAttr.getY(vertexIndex) };
+    }
+
+    // GUI（controls.uv1..uv6）→ 実際の uvAttr へ書き込む
+    function applyTriangleUVFromControls() {
+      const tri = currentTriangleIndex();
+
+      const v0 = triVertexIndex(tri, 0);
+      const v1 = triVertexIndex(tri, 1);
+      const v2 = triVertexIndex(tri, 2);
+
+      setUV(v0, controls.uv1, controls.uv2);
+      setUV(v1, controls.uv3, controls.uv4);
+      setUV(v2, controls.uv5, controls.uv6);
+
+      // GPUへ再アップロード
+      uvAttr.needsUpdate = true;
+    }
+
+    // 実際の uvAttr → GUI（controls）へ読み出す
+    function readTriangleUVIntoControls() {
+      const tri = currentTriangleIndex();
+
+      const v0 = triVertexIndex(tri, 0);
+      const v1 = triVertexIndex(tri, 1);
+      const v2 = triVertexIndex(tri, 2);
+
+      const a = getUV(v0);
+      const b = getUV(v1);
+      const c = getUV(v2);
+
+      controls.uv1 = a.u; controls.uv2 = a.v;
+      controls.uv3 = b.u; controls.uv4 = b.v;
+      controls.uv5 = c.u; controls.uv6 = c.v;
+    }
+
+    function updateGuiDisplay() {
+      // dat.GUI は controller.updateDisplay() でスライダー表示を揃えられる
+      gui.__controllers.forEach(c => c.updateDisplay && c.updateDisplay());
+      // フォルダ内コントローラも更新
+      f.__controllers.forEach(c => c.updateDisplay && c.updateDisplay());
+    }
+
+    // ============================================================
+    // 6) Render loop
+    // ============================================================
+    function animate() {
+      requestAnimationFrame(animate);
+      stats.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ============================================================
+    // 7) resize対応（縦横比の歪み防止）
+    // ============================================================
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    });
+  </script>
+</body>
+</html>
