@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 11.01 - Effect compositing（FilmPass uniforms 実装差に追従）</title>
+
+  <!-- dat.gui / stats.js は CDN（グローバル）で利用（ローカル libs 不使用） -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+
+  <!--
+    ✅ importmap（必須）
+    - examples/jsm(addons) 内部は `import ... from "three"` を使うため、"three" を解決できるようにする
+    - addons の import は "three/addons/..." に統一する
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #WebGL-output { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 11.01 - Effect compositing（ポストプロセス合成）
+      ============================================================
+
+      ■ 全体アルゴリズム（このサンプルの核）
+      目的は「通常の3D描画をいったんオフスクリーンに描き、その画像を“画面全体の画像処理”に通して出力」すること。
+
+      1) Scene を構築（地球スフィア + ライト + カメラ + 操作）
+      2) EffectComposer に Pass を並べて “描画パイプライン” を作る
+         - RenderPass：scene/camera をレンダーターゲットに描いて元画像を作る
+         - FilmPass  ：元画像にフィルム風の効果（ノイズ/グレースケール等）を合成する
+         - OutputPass：最終結果を画面へ出す
+      3) アニメーションループで composer.render() を呼ぶと、
+         RenderPass → FilmPass → OutputPass の順で処理が毎フレーム実行される。
+
+      ■ 今回の warning の意味（Understand this warning）
+      [FilmPass] uniform "nIntensity" not found. available=['tDiffuse','time','intensity','grayscale']
+
+      これは「あなたが想定している FilmPass(FilmShader) の uniform 名」と、
+      実際に読み込まれた FilmPass が持っている uniform 名が違う」ことを示す。
+
+      - 旧 FilmShader 系： nIntensity / sIntensity / sCount / grayscale ...
+      - 今回の FilmPass が提供している uniform： intensity / grayscale / time / tDiffuse
+
+      つまり、three.js r0.158.0 の FilmPass 実装では
+      “ノイズ強度・走査線強度・本数” を別々の uniform で直接いじるのではなく、
+      より単純なパラメータ（intensity 等）に統合されている（or 実装が切り替わっている）状態。
+
+      ✅ 対応方針
+      - まず uniforms を “実際に存在するキー” で検出する
+      - nIntensity/sIntensity/sCount がある場合はそれを使う（旧仕様互換）
+      - ない場合は intensity だけで制御できるよう GUI を寄せる（新仕様互換）
+      - これで警告が消え、どちらの実装でも動く
+    */
+
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { FilmPass } from "three/addons/postprocessing/FilmPass.js";
+    import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+
+    // ------------------------------------------------------------
+    // DOM
+    // ------------------------------------------------------------
+    const container = document.getElementById("WebGL-output");
+    const statsHost = document.getElementById("Stats-output");
+
+    // ------------------------------------------------------------
+    // Stats（FPS）
+    // ------------------------------------------------------------
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    statsHost.appendChild(stats.dom);
+
+    // ------------------------------------------------------------
+    // Scene / Camera / Renderer
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(-10, 15, 25);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(0x000000, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+    // 色空間（r152+ は outputColorSpace）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    container.appendChild(renderer.domElement);
+
+    // ------------------------------------------------------------
+    // OrbitControls（カメラ操作）
+    // ------------------------------------------------------------
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.autoRotate = false;
+
+    // ------------------------------------------------------------
+    // Lights（Phong を使うので必須）
+    // ------------------------------------------------------------
+    scene.add(new THREE.AmbientLight(0x181818));
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+    dirLight.position.set(550, 100, 550);
+    scene.add(dirLight);
+
+    // ------------------------------------------------------------
+    // Mesh（地球）
+    // ------------------------------------------------------------
+    const sphere = createEarthSphere();
+    scene.add(sphere);
+
+    // ------------------------------------------------------------
+    // EffectComposer（Pass をつないで合成する）
+    // ------------------------------------------------------------
+    const composer = new EffectComposer(renderer);
+
+    const renderPass = new RenderPass(scene, camera);
+
+    // FilmPass(noiseIntensity, scanlinesIntensity, scanlinesCount, grayscale)
+    // 引数は古い説明だと “個別制御” に見えるが、実装によって uniforms が統合されている場合がある。
+    // → 下の “実装差吸収レイヤ” で GUI からの更新を分岐させる。
+    const filmPass = new FilmPass(0.8, 0.325, 256, false);
+
+    const outputPass = new OutputPass();
+
+    composer.addPass(renderPass);
+    composer.addPass(filmPass);
+    composer.addPass(outputPass);
+
+    // ------------------------------------------------------------
+    // FilmPass uniforms を “安全に” 扱うユーティリティ
+    // ------------------------------------------------------------
+    function getFilmUniforms() {
+      return filmPass.uniforms ?? filmPass.material?.uniforms ?? null;
+    }
+
+    // 実際に存在する uniform 名を列挙（デバッグ用）
+    function listFilmUniformKeys() {
+      const u = getFilmUniforms();
+      return u ? Object.keys(u) : [];
+    }
+
+    // 旧仕様 or 新仕様を自動判定して “どのパラメータが使えるか” を決める
+    function detectFilmUniformLayout() {
+      const u = getFilmUniforms();
+      if (!u) return { kind: "none" };
+
+      const hasLegacy =
+        ("nIntensity" in u) || ("sIntensity" in u) || ("sCount" in u);
+
+      const hasUnified =
+        ("intensity" in u); // あなたの環境ではこれが存在している
+
+      // grayscale は両方にあることが多い
+      return {
+        kind: hasLegacy ? "legacy" : (hasUnified ? "unified" : "unknown"),
+        hasGrayscale: ("grayscale" in u),
+        keys: Object.keys(u),
+      };
+    }
+
+    // 値セット（存在する場合だけ）
+    function setIfExists(name, value) {
+      const u = getFilmUniforms();
+      if (!u || !u[name]) return false;
+      u[name].value = value;
+      return true;
+    }
+
+    // ------------------------------------------------------------
+    // dat.gui（FilmPass のパラメータを操作）
+    // ------------------------------------------------------------
+    const filmLayout = detectFilmUniformLayout();
+    // console.log("FilmPass uniforms:", filmLayout);
+
+    /*
+      GUI設計方針：
+      - legacy の場合：noise/scanlines/count を個別に出す（元教材に近い）
+      - unified の場合：intensity（強さ）だけに寄せる（存在しないつまみは出さない）
+      - grayscale は存在すれば共通で出す
+    */
+    const guiState = {
+      // legacy想定パラメータ（存在すれば使う）
+      scanlinesCount: 256,
+      scanlinesIntensity: 0.325,
+      noiseIntensity: 0.8,
+
+      // unified想定パラメータ（あなたの環境はこれ）
+      intensity: 0.8,
+
+      grayscale: false,
+
+      // GUI変更→FilmPassへ反映（実装差を吸収するのがここ）
+      apply() {
+        // grayscale は存在すれば更新
+        if (filmLayout.hasGrayscale) {
+          setIfExists("grayscale", this.grayscale);
+        }
+
+        if (filmLayout.kind === "legacy") {
+          // 旧 FilmShader 互換：個別制御
+          setIfExists("nIntensity", this.noiseIntensity);
+          setIfExists("sIntensity", this.scanlinesIntensity);
+          setIfExists("sCount", this.scanlinesCount);
+        } else if (filmLayout.kind === "unified") {
+          // ✅ あなたの環境：intensity に統合されている
+          // ノイズ/走査線を分けていじれない実装なので、全体強度だけを制御する。
+          setIfExists("intensity", this.intensity);
+        } else {
+          // unknown / none：何があるか分からないので、落ちないように最低限
+          // （keys はデバッグに使える）
+        }
+      }
+    };
+
+    const gui = new dat.GUI();
+    gui.width = 380;
+
+    // 実装差を “GUIの項目” にも反映する（存在しないものを出さない）
+    gui.add(guiState, "grayscale").name("Grayscale").onChange(() => guiState.apply());
+
+    if (filmLayout.kind === "legacy") {
+      gui.add(guiState, "scanlinesIntensity", 0, 1, 0.001).name("Scanlines Intensity").onChange(() => guiState.apply());
+      gui.add(guiState, "noiseIntensity", 0, 3, 0.001).name("Noise Intensity").onChange(() => guiState.apply());
+      gui.add(guiState, "scanlinesCount", 0, 2048, 1).name("Scanlines Count").onChange(() => guiState.apply());
+    } else if (filmLayout.kind === "unified") {
+      // ✅ intensity のみ（あなたの警告の available に intensity があるのでこれが正解）
+      gui.add(guiState, "intensity", 0, 3, 0.001).name("Film Intensity").onChange(() => guiState.apply());
+    } else {
+      // unknown のときは、最低限だけ残す（必要なら keys を画面に出すなどもできる）
+      gui.add({ keys: listFilmUniformKeys().join(", ") }, "keys").name("Uniform Keys");
+    }
+
+    // 初期反映（警告が出ない＆落ちない）
+    guiState.apply();
+
+    // ------------------------------------------------------------
+    // Animation loop（composer.render が主役）
+    // ------------------------------------------------------------
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      stats.begin();
+
+      const delta = clock.getDelta();
+
+      orbit.update();
+      sphere.rotation.y += 0.002;
+
+      composer.render(delta);
+
+      stats.end();
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // Resize（renderer と composer の両方）
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+      composer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ------------------------------------------------------------
+    // 地球スフィア生成（旧 SceneUtils は使わず Mesh）
+    // ------------------------------------------------------------
+    function createEarthSphere() {
+      const geom = new THREE.SphereGeometry(10, 40, 40);
+
+      const loader = new THREE.TextureLoader();
+      const planetTexture = loader.load("../assets/textures/planets/Earth.png");
+      const specularTexture = loader.load("../assets/textures/planets/EarthSpec.png");
+      const normalTexture = loader.load("../assets/textures/planets/EarthNormal.png");
+
+      if ("colorSpace" in planetTexture) planetTexture.colorSpace = THREE.SRGBColorSpace;
+
+      const mat = new THREE.MeshPhongMaterial({
+        map: planetTexture,
+        normalMap: normalTexture,
+        specularMap: specularTexture,
+        specular: new THREE.Color(0x4444aa),
+      });
+
+      return new THREE.Mesh(geom, mat);
+    }
+  </script>
+</body>
+</html>
