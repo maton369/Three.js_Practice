@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 11.04 - Shader Pass simple（ES Modules / 修正版 + 詳細コメント）</title>
+
+  <!--
+    ✅ dat.gui / stats.js は「デバッグ/操作UI」なので CDN のグローバル読み込みでOK
+    - three.js 本体と examples(addons) は ES Modules で import する
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+
+  <!--
+    ✅ importmap（必須）
+    - examples/jsm(addons) 内部は `import ... from "three"` を使う
+    - ブラウザは "three" という bare specifier をそのまま解決できない
+    - ここで "three" と "three/addons/" を URL に割り当てる
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+    #WebGL-output { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 11.04 - Shader Pass simple（ShaderPassの教材）
+      ============================================================
+
+      ■ このサンプルがやりたいこと
+      「1つのシーンの描画結果（画面全体）」に対して、
+      ShaderPass（フルスクリーンのポストプロセス）を “差し替え式” に適用する。
+
+      ■ 全体アルゴリズム（毎フレーム）
+      1) RenderPass: まず 3Dシーンを普通に描く（オフスクリーンのバッファに入る）
+      2) ShaderPass群: 直前の描画結果をテクスチャとして受け取り、
+         フルスクリーンクアッドで加工して次のバッファに書く
+      3) OutputPass: 最後の結果を「画面（canvas）」へ出す
+
+      ■ 重要ポイント（EffectComposerの考え方）
+      - composer は「2枚のレンダーターゲット」を交互に使う（ping-pong）
+      - Pass は基本的に
+          入力: 前段の出力テクスチャ（tDiffuse）
+          出力: 次のレンダーターゲット
+        を繰り返す
+      - どのPassを有効にするか（enabled=true/false）を切り替えると、
+        “同じ元画像” から様々な見た目を作れる
+
+      ■ 元コードからの主な修正点（壊れやすい所を現代化）
+      - scriptタグ直読み（旧three.js）→ ES Modules + importmap
+      - OBJLoader / MTLLoader を addons から import
+      - 最終出力を renderToScreen=true ではなく OutputPass に統一
+      - resize 時に renderer / camera / composer のサイズを同期
+      - SpotLight の decay はユーザー方針に合わせて 0 に固定（decay=0）
+      - テクスチャの色空間（diffuse は sRGB）を補正
+      - “UnpackDepthRGBAShader は本来 depth パック用” なので注意コメントを追加
+    */
+
+    // ------------------------------------------------------------
+    // imports
+    // ------------------------------------------------------------
+    import * as THREE from "three";
+
+    // ローダ（OBJ/MTL）
+    import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
+    import { MTLLoader } from "three/addons/loaders/MTLLoader.js";
+
+    // ポストプロセス基盤
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+    import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+
+    // シェーダ（ShaderPassに渡す “Shader定義オブジェクト”）
+    import { BrightnessContrastShader } from "three/addons/shaders/BrightnessContrastShader.js";
+    import { ColorifyShader } from "three/addons/shaders/ColorifyShader.js";
+    import { SepiaShader } from "three/addons/shaders/SepiaShader.js";
+    import { RGBShiftShader } from "three/addons/shaders/RGBShiftShader.js";
+    import { ColorCorrectionShader } from "three/addons/shaders/ColorCorrectionShader.js";
+    import { MirrorShader } from "three/addons/shaders/MirrorShader.js";
+    import { VignetteShader } from "three/addons/shaders/VignetteShader.js";
+    import { HueSaturationShader } from "three/addons/shaders/HueSaturationShader.js";
+    import { KaleidoShader } from "three/addons/shaders/KaleidoShader.js";
+    import { LuminosityShader } from "three/addons/shaders/LuminosityShader.js";
+    import { TechnicolorShader } from "three/addons/shaders/TechnicolorShader.js";
+    import { UnpackDepthRGBAShader } from "three/addons/shaders/UnpackDepthRGBAShader.js";
+
+    // ------------------------------------------------------------
+    // 0) DOM / Stats
+    // ------------------------------------------------------------
+    const host = document.getElementById("WebGL-output");
+    const statsHost = document.getElementById("Stats-output");
+
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    statsHost.appendChild(stats.dom);
+
+    // 予期せぬロード失敗を見逃さないための最低限ログ
+    window.addEventListener("error", (e) => {
+      console.error("[window.error]", e.message, e.filename, e.lineno, e.colno);
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      console.error("[unhandledrejection]", e.reason);
+    });
+
+    // ------------------------------------------------------------
+    // 1) Scene / Camera / Renderer
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      2000
+    );
+
+    // 元コードの視点
+    camera.position.set(20, 30, 40);
+    camera.lookAt(new THREE.Vector3(-15, -10, -25));
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(0xaaaaff, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+    // 影
+    renderer.shadowMap.enabled = true;
+
+    // 色空間（r152+ は outputColorSpace）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    host.appendChild(renderer.domElement);
+
+    // ------------------------------------------------------------
+    // 2) Lights（Spot + Ambient）
+    // ------------------------------------------------------------
+    const ambiLight = new THREE.AmbientLight(0x444444);
+    scene.add(ambiLight);
+
+    const spotLight = new THREE.SpotLight(0xffffff, 1.0);
+    spotLight.position.set(0, 60, 50);
+
+    // ✅ ユーザー方針：SpotLight の decay は 0
+    spotLight.decay = 0;
+
+    // 影の設定（元コード踏襲）
+    spotLight.castShadow = true;
+    spotLight.shadow.mapSize.width = 2048;
+    spotLight.shadow.mapSize.height = 2048;
+    spotLight.shadow.camera.fov = 120;
+    spotLight.shadow.camera.near = 1;
+    spotLight.shadow.camera.far = 1000;
+
+    scene.add(spotLight);
+
+    // ------------------------------------------------------------
+    // 3) Floor（床：BoxGeometryを“板”として使う）
+    // ------------------------------------------------------------
+    const floorGeom = new THREE.BoxGeometry(1600, 1600, 0.1, 40, 40);
+
+    const texLoader = new THREE.TextureLoader();
+
+    // 床のディフューズ（色）テクスチャは sRGB 扱いが自然
+    const floorDiffuse = texLoader.load("../assets/textures/general/plaster-diffuse.jpg");
+    if ("colorSpace" in floorDiffuse) floorDiffuse.colorSpace = THREE.SRGBColorSpace;
+
+    const floorNormal = texLoader.load("../assets/textures/general/plaster-normal.jpg");
+
+    // 繰り返し
+    floorDiffuse.wrapS = THREE.RepeatWrapping;
+    floorDiffuse.wrapT = THREE.RepeatWrapping;
+    floorDiffuse.repeat.set(80, 80);
+
+    floorNormal.wrapS = THREE.RepeatWrapping;
+    floorNormal.wrapT = THREE.RepeatWrapping;
+    floorNormal.repeat.set(80, 80);
+
+    const floorMat = new THREE.MeshPhongMaterial({
+      color: 0xffffff,
+      map: floorDiffuse,
+      normalMap: floorNormal,
+      normalScale: new THREE.Vector2(0.6, 0.6)
+    });
+
+    const floor = new THREE.Mesh(floorGeom, floorMat);
+    floor.rotation.x = Math.PI / 2;
+    floor.receiveShadow = true;
+
+    // 元コードの配置
+    floor.position.set(-150, 0, -150);
+    scene.add(floor);
+
+    // ------------------------------------------------------------
+    // 4) Cubes（手前の小物：回転デモ用）
+    // ------------------------------------------------------------
+    const cube1 = new THREE.Mesh(
+      new THREE.BoxGeometry(30, 10, 2),
+      new THREE.MeshPhongMaterial({ color: 0xff0000 })
+    );
+    cube1.position.set(-15, 5, 15);
+    cube1.castShadow = true;
+    scene.add(cube1);
+
+    const cube2 = cube1.clone();
+    cube2.material = cube1.material.clone();
+    cube2.material.color = new THREE.Color(0x00ff00);
+    cube2.position.set(-20, 5, 5);
+    cube2.castShadow = true;
+    scene.add(cube2);
+
+    const cube3 = cube1.clone();
+    cube3.material = cube1.material.clone();
+    cube3.material.color = new THREE.Color(0x0000ff);
+    cube3.position.set(-25, 5, -8);
+    cube3.castShadow = true;
+    scene.add(cube3);
+
+    // ------------------------------------------------------------
+    // 5) OBJ + MTL ロード（自由の女神）
+    // ------------------------------------------------------------
+    /*
+      ロードの流れ（アルゴリズム）：
+      1) MTLLoader で材質（.mtl）をロード
+      2) materials.preload() で内部準備
+      3) OBJLoader に materials を渡して .obj をロード
+      4) 読み込めたメッシュに castShadow を付け、scene に追加
+
+      注意：
+      - この相対パスは「HTTPサーバで配信」されていることが前提（file:// 直開きだとCORS等で失敗しがち）
+      - assets の配置が元サンプルと違うと 404 になり、何も出ないので console を見る
+    */
+    let statue = null;
+
+    const mtlLoader = new MTLLoader();
+    mtlLoader.setPath("../assets/models/sol/");
+    // setBaseUrl は新しめ環境では不要なことも多いが、元コードの意図を踏襲
+    // （MTL内のテクスチャ参照が相対パスのときに効くことがある）
+    if (typeof mtlLoader.setBaseUrl === "function") {
+      mtlLoader.setBaseUrl("../assets/models/sol/");
+    }
+
+    mtlLoader.load(
+      "libertStatue.mtl",
+      (materials) => {
+        materials.preload();
+
+        const objLoader = new OBJLoader();
+        objLoader.setMaterials(materials);
+
+        // 元コードは setPath("../assets/models/") + load("sol/LibertStatue.obj")
+        objLoader.setPath("../assets/models/");
+
+        objLoader.load(
+          "sol/LibertStatue.obj",
+          (object) => {
+            // 子メッシュに影設定
+            object.traverse((child) => {
+              if (child && child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = false;
+              }
+            });
+
+            object.scale.set(20, 20, 20);
+            object.position.set(15, 0, 5);
+
+            statue = object;
+            scene.add(object);
+          },
+          undefined,
+          (err) => console.error("[OBJLoader] load error:", err)
+        );
+      },
+      undefined,
+      (err) => console.error("[MTLLoader] load error:", err)
+    );
+
+    // ------------------------------------------------------------
+    // 6) Postprocessing：Pass を作る
+    // ------------------------------------------------------------
+    /*
+      ここがこのサンプルの “本題”。
+
+      Pass の設計（アルゴリズム観点）：
+      - RenderPass は「3Dシーンを描く」＝入力なしで scene/camera から絵を生成
+      - ShaderPass は「直前の絵(tDiffuse)を加工」＝入力あり
+      - OutputPass は「最後を画面に出す」＝終端
+
+      そしてこのサンプルは「選択された ShaderPass だけ enabled=true にする」
+      ことで “差し替え式のエフェクト” を実現している。
+    */
+
+    const composer = new EffectComposer(renderer);
+
+    // 1) まず普通に描く
+    const renderPass = new RenderPass(scene, camera);
+    composer.addPass(renderPass);
+
+    // 2) ShaderPass 群（全部用意して、選択で enabled を切り替える）
+    const passMirror = new ShaderPass(MirrorShader);
+    const passHueSat = new ShaderPass(HueSaturationShader);
+    const passVignette = new ShaderPass(VignetteShader);
+    const passColorCorrection = new ShaderPass(ColorCorrectionShader);
+    const passRGBShift = new ShaderPass(RGBShiftShader);
+    const passBrightness = new ShaderPass(BrightnessContrastShader);
+    const passColorify = new ShaderPass(ColorifyShader);
+    const passSepia = new ShaderPass(SepiaShader);
+    const passKaleido = new ShaderPass(KaleidoShader);
+    const passLuminosity = new ShaderPass(LuminosityShader);
+    const passTechnicolor = new ShaderPass(TechnicolorShader);
+
+    // ⚠ UnpackDepthRGBAShader は本来「depth を RGBA にパックしたテクスチャ」を戻す用途。
+    // ここでは通常カラーを入れるので “教材としての見せ物” にはなるが、意味としては正しくない。
+    // 「深度パックをしているパイプライン」前提で使うべきシェーダである。
+    const passUnpackDepth = new ShaderPass(UnpackDepthRGBAShader);
+
+    // 初期値（元コード踏襲）
+    passBrightness.uniforms["brightness"].value = 0.0;
+    passBrightness.uniforms["contrast"].value = 0.0;
+
+    passColorify.uniforms["color"].value = new THREE.Color(0xffffff);
+    passSepia.uniforms["amount"].value = 1.0;
+
+    // まず全部無効（選択で1個だけ有効化する）
+    const allEffectPasses = [
+      passBrightness,
+      passSepia,
+      passMirror,
+      passColorify,
+      passColorCorrection,
+      passRGBShift,
+      passVignette,
+      passHueSat,
+      passKaleido,
+      passLuminosity,
+      passTechnicolor,
+      passUnpackDepth
+    ];
+    allEffectPasses.forEach((p) => (p.enabled = false));
+
+    // composer に登録（順番＝処理順）
+    allEffectPasses.forEach((p) => composer.addPass(p));
+
+    // 3) 最終出力
+    const outputPass = new OutputPass();
+    composer.addPass(outputPass);
+
+    // ------------------------------------------------------------
+    // 7) GUI（どのShaderPassを有効にするか）
+    // ------------------------------------------------------------
+    const controls = {
+      select: "none",
+      rotate: false,
+
+      // brightness/contrast
+      brightness: 0.01,
+      contrast: 0.01,
+
+      // colorify
+      color: 0xffffff,
+
+      // sepia
+      amount: 1,
+
+      // color correction
+      powRGB_R: 2,
+      mulRGB_R: 1,
+      powRGB_G: 2,
+      mulRGB_G: 1,
+      powRGB_B: 2,
+      mulRGB_B: 1,
+
+      // rgb shift
+      rgbAmount: 0.005,
+      angle: 0.0,
+
+      // mirror
+      side: 1,
+
+      // vignette
+      offset: 1,
+      darkness: 1,
+
+      // hue/saturation
+      hue: 0.01,
+      saturation: 0.01,
+
+      // kaleido
+      kalAngle: 0,
+      kalSides: 6,
+
+      // --------- pass切替（差し替えアルゴリズムの中核） ---------
+      switchShader() {
+        const map = {
+          none: null,
+          colorify: passColorify,
+          brightness: passBrightness,
+          sepia: passSepia,
+          colorCorrection: passColorCorrection,
+          rgbShift: passRGBShift,
+          mirror: passMirror,
+          vignette: passVignette,
+          hueAndSaturation: passHueSat,
+          kaleidoscope: passKaleido,
+          luminosity: passLuminosity,
+          technicolor: passTechnicolor,
+          unpackDepth: passUnpackDepth
+        };
+        enableOnly(map[this.select] ?? null);
+      },
+
+      // --------- uniform更新（GUIの値→ShaderPassのuniformへ） ---------
+      changeBrightness() {
+        passBrightness.uniforms["brightness"].value = this.brightness;
+        passBrightness.uniforms["contrast"].value = this.contrast;
+      },
+
+      changeColor() {
+        passColorify.uniforms["color"].value = new THREE.Color(this.color);
+      },
+
+      changeSepia() {
+        passSepia.uniforms["amount"].value = this.amount;
+      },
+
+      changeCorrection() {
+        passColorCorrection.uniforms["mulRGB"].value = new THREE.Vector3(
+          this.mulRGB_R, this.mulRGB_G, this.mulRGB_B
+        );
+        passColorCorrection.uniforms["powRGB"].value = new THREE.Vector3(
+          this.powRGB_R, this.powRGB_G, this.powRGB_B
+        );
+      },
+
+      changeRGBShifter() {
+        passRGBShift.uniforms["amount"].value = this.rgbAmount;
+        passRGBShift.uniforms["angle"].value = this.angle;
+      },
+
+      changeMirror() {
+        // MirrorShader は side で左右/上下などを切り替える（実装により意味は多少変わる）
+        passMirror.uniforms["side"].value = this.side;
+      },
+
+      changeVignette() {
+        passVignette.uniforms["darkness"].value = this.darkness;
+        passVignette.uniforms["offset"].value = this.offset;
+      },
+
+      changeHue() {
+        passHueSat.uniforms["hue"].value = this.hue;
+        passHueSat.uniforms["saturation"].value = this.saturation;
+      },
+
+      changeKal() {
+        passKaleido.uniforms["sides"].value = this.kalSides;
+        passKaleido.uniforms["angle"].value = this.kalAngle;
+      }
+    };
+
+    /*
+      enableOnly(pass)
+      - RenderPass と OutputPass は常に有効（=描画パイプラインの骨格）
+      - エフェクト群だけ “1つ” を enabled=true、他は false にする
+      - pass=null のときは全部OFF（=素の見た目）
+    */
+    function enableOnly(pass) {
+      allEffectPasses.forEach((p) => (p.enabled = (p === pass)));
+    }
+
+    // GUI構築
+    const gui = new dat.GUI();
+    gui.add(
+      controls,
+      "select",
+      [
+        "none",
+        "colorify",
+        "brightness",
+        "sepia",
+        "colorCorrection",
+        "rgbShift",
+        "mirror",
+        "vignette",
+        "hueAndSaturation",
+        "kaleidoscope",
+        "luminosity",
+        "technicolor",
+        "unpackDepth"
+      ]
+    ).onChange(() => controls.switchShader());
+
+    gui.add(controls, "rotate");
+
+    const bnFolder = gui.addFolder("Brightness");
+    bnFolder.add(controls, "brightness", -1, 1, 0.001).onChange(() => controls.changeBrightness());
+    bnFolder.add(controls, "contrast", -1, 1, 0.001).onChange(() => controls.changeBrightness());
+
+    const clFolder = gui.addFolder("Colorify");
+    clFolder.addColor(controls, "color").onChange(() => controls.changeColor());
+
+    const colFolder = gui.addFolder("Color Correction");
+    colFolder.add(controls, "powRGB_R", 0, 5, 0.001).onChange(() => controls.changeCorrection());
+    colFolder.add(controls, "powRGB_G", 0, 5, 0.001).onChange(() => controls.changeCorrection());
+    colFolder.add(controls, "powRGB_B", 0, 5, 0.001).onChange(() => controls.changeCorrection());
+    colFolder.add(controls, "mulRGB_R", 0, 5, 0.001).onChange(() => controls.changeCorrection());
+    colFolder.add(controls, "mulRGB_G", 0, 5, 0.001).onChange(() => controls.changeCorrection());
+    colFolder.add(controls, "mulRGB_B", 0, 5, 0.001).onChange(() => controls.changeCorrection());
+
+    const sepiaFolder = gui.addFolder("Sepia");
+    sepiaFolder.add(controls, "amount", 0, 2, 0.1).onChange(() => controls.changeSepia());
+
+    const shiftFolder = gui.addFolder("RGB Shift");
+    shiftFolder.add(controls, "rgbAmount", 0, 0.1, 0.001).onChange(() => controls.changeRGBShifter());
+    shiftFolder.add(controls, "angle", 0, Math.PI, 0.001).onChange(() => controls.changeRGBShifter());
+
+    const mirrorFolder = gui.addFolder("Mirror");
+    mirrorFolder.add(controls, "side", 0, 3, 1).onChange(() => controls.changeMirror());
+
+    const vignetteFolder = gui.addFolder("Vignette");
+    vignetteFolder.add(controls, "darkness", 0, 2, 0.001).onChange(() => controls.changeVignette());
+    vignetteFolder.add(controls, "offset", 0, 2, 0.001).onChange(() => controls.changeVignette());
+
+    const hueAndSat = gui.addFolder("Hue & Saturation");
+    hueAndSat.add(controls, "hue", -1, 1, 0.01).onChange(() => controls.changeHue());
+    hueAndSat.add(controls, "saturation", -1, 1, 0.01).onChange(() => controls.changeHue());
+
+    const kalMenu = gui.addFolder("Kaleidoscope");
+    kalMenu.add(controls, "kalAngle", -2 * Math.PI, 2 * Math.PI, 0.001).onChange(() => controls.changeKal());
+    kalMenu.add(controls, "kalSides", 2, 20, 1).onChange(() => controls.changeKal());
+
+    // 初期：none（全部OFF）
+    controls.switchShader();
+    controls.changeBrightness();
+    controls.changeColor();
+    controls.changeSepia();
+    controls.changeCorrection();
+    controls.changeRGBShifter();
+    controls.changeMirror();
+    controls.changeVignette();
+    controls.changeHue();
+    controls.changeKal();
+
+    // ------------------------------------------------------------
+    // 8) Render loop
+    // ------------------------------------------------------------
+    /*
+      毎フレームの流れ：
+      - 操作/回転などの “状態更新”
+      - composer.render() を 1回呼ぶ（Pass列を順に実行して画面へ）
+    */
+    function animate() {
+      requestAnimationFrame(animate);
+      stats.begin();
+
+      if (controls.rotate) {
+        if (statue) statue.rotation.y += 0.01;
+        cube1.rotation.y += 0.01;
+        cube2.rotation.y += 0.01;
+        cube3.rotation.y += 0.01;
+      }
+
+      composer.render();
+
+      stats.end();
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // 9) Resize（renderer / camera / composer を同期）
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+      composer.setSize(w, h);
+    });
+  </script>
+</body>
+</html>
