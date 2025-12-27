@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 11.06 - Advanced（ES Modules / PostProcessing 修正版 + 詳細コメント）</title>
+
+  <!--
+    GUI / FPS は「便利ツール」なので従来通りグローバルでOK
+    - dat.gui: パラメータ操作UI
+    - stats.js: FPS表示
+    - chroma-js: ランダム色生成（グラデーションスケール）
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chroma-js@2.4.2/chroma.min.js"></script>
+
+  <!--
+    ✅ importmap（必須）
+    - "three" と "three/addons/" をブラウザが解決できるようにURLを割り当てる
+    - jsDelivr はローカル開発でも読みやすい（CORS的に安定しがち）
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #WebGL-output { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 11.06 - Advanced（複数シェーダの PostProcessing 切替）
+      ============================================================
+
+      ■ 今回のエラーの原因（重要）
+      - GET .../EdgeShader2.js 404 (Not Found)
+      - three.js の examples/jsm/shaders には「EdgeShader2.js」が存在しない版がある
+        （少なくともあなたの指定しているバージョン/配布先では 404）
+      - したがって「EdgeShader2 を import する」方針だと必ず壊れる
+
+      ✅ 解決策（今回の修正）
+      - EdgeShader2 をやめて、公式同梱の “エッジ検出” シェーダを使う
+      - 具体的には SobelOperatorShader（Sobelフィルタ）へ置き換える
+
+      ■ EffectComposer のアルゴリズム（全体の処理フロー）
+      - composer は内部に read/write の2枚RTを持ち、各 Pass を順番に適用していく（ping-pong）
+      - RenderPass は 3D シーンを「元画像」としてRTに描く
+      - ShaderPass はその「元画像テクスチャ」を受け取り、フルスクリーンクアッドで加工して次へ渡す
+      - 最後の OutputPass が画面（canvas）に描き出す
+
+        RenderPass(scene,camera)
+          -> (BleachBypass?)   : フィルム調（白黒寄り）
+          -> (Sobel Edge?)     : 輪郭抽出（エッジ検出）
+          -> (FXAA?)           : 後段AA（antialias=false の代替）
+          -> (Focus?)          : 擬似被写界深度
+          -> OutputPass        : 最終出力
+
+      ■ 典型的な“不具合ポイント”と対策
+      1) renderer.antialias は生成後に代入しても効かない
+         -> new THREE.WebGLRenderer({ antialias: false }) で決める（OK）
+
+      2) 解像度依存 uniform は resize や DPR 変更に追従させる必要がある
+         - FXAA: resolution = (1/描画バッファ幅, 1/描画バッファ高)
+         - Sobel: resolution = (描画バッファ幅, 描画バッファ高)（実装が texelSize=1/resolution を使うため）
+         - Focus: screenWidth/Height を使う実装があるので追従
+
+      3) SpotLight.target は scene に追加しておくと挙動が安定する
+         -> scene.add(spotLight.target)（OK）
+      ============================================================
+    */
+
+    import * as THREE from "three";
+
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+    import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+
+    // Postprocessing shaders（公式 examples/jsm/shaders）
+    import { BleachBypassShader } from "three/addons/shaders/BleachBypassShader.js";
+    import { FXAAShader } from "three/addons/shaders/FXAAShader.js";
+    import { FocusShader } from "three/addons/shaders/FocusShader.js";
+
+    // ✅ EdgeShader2.js は 404 になり得るので使わない
+    // ✅ 代替：SobelOperatorShader（輪郭抽出）
+    import { SobelOperatorShader } from "three/addons/shaders/SobelOperatorShader.js";
+
+    // ------------------------------------------------------------
+    // 0) DOM / Stats
+    // ------------------------------------------------------------
+    const host = document.getElementById("WebGL-output");
+    const statsHost = document.getElementById("Stats-output");
+
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    statsHost.appendChild(stats.dom);
+
+    // ------------------------------------------------------------
+    // 1) Scene / Camera / Renderer
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(30, 30, 30);
+    camera.lookAt(0, 0, 0);
+
+    /*
+      antialias は “生成時の引数” で決まる
+      - ここでは antialias=false にしておき、必要なら FXAA を ON にしてAAを後段で掛ける
+    */
+    const renderer = new THREE.WebGLRenderer({ antialias: false });
+    renderer.setClearColor(0xaaaaff, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = true;
+
+    // 色空間（r152+ 系）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    host.appendChild(renderer.domElement);
+
+    // ------------------------------------------------------------
+    // 2) Lights
+    // ------------------------------------------------------------
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(30, 30, 30);
+    scene.add(dirLight);
+
+    const spotLight = new THREE.SpotLight(0xffffff, 0.6);
+    spotLight.castShadow = true;
+    spotLight.position.set(-30, 30, -100);
+    spotLight.shadow.mapSize.set(2048, 2048);
+    spotLight.shadow.camera.fov = 120;
+    spotLight.shadow.camera.near = 1;
+    spotLight.shadow.camera.far = 200;
+
+    // target は scene に追加しておくと安定
+    spotLight.target.position.set(-10, 0, -10);
+    scene.add(spotLight);
+    scene.add(spotLight.target);
+
+    // ------------------------------------------------------------
+    // 3) Ground（床）
+    // ------------------------------------------------------------
+    const loader = new THREE.TextureLoader();
+    const floorTex = loader.load("../assets/textures/general/floor-wood.jpg");
+    if ("colorSpace" in floorTex) floorTex.colorSpace = THREE.SRGBColorSpace;
+    floorTex.wrapS = THREE.RepeatWrapping;
+    floorTex.wrapT = THREE.RepeatWrapping;
+    floorTex.repeat.set(80, 80);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(1600, 1600, 40, 40),
+      new THREE.MeshPhongMaterial({ color: 0xffffff, map: floorTex })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    ground.position.set(-150, -1, -150);
+    scene.add(ground);
+
+    // ------------------------------------------------------------
+    // 4) Cubes（大量の透明ボックス）
+    // ------------------------------------------------------------
+    /*
+      chroma.scale で “白→青” のランダム色
+      - 透明物体が多いと、エッジ抽出やフォーカスの視覚効果が分かりやすい
+    */
+    const scale = chroma.scale(["white", "blue"]);
+    const range = 3;
+    const stepX = 8;
+    const stepZ = 8;
+
+    for (let i = -25; i < 5; i++) {
+      for (let j = -15; j < 15; j++) {
+        const box = new THREE.Mesh(
+          new THREE.BoxGeometry(3, 4, 3),
+          new THREE.MeshPhongMaterial({
+            color: new THREE.Color(scale(Math.random()).hex()),
+            opacity: 0.8,
+            transparent: true
+          })
+        );
+        box.position.x = i * stepX + (Math.random() - 0.5) * range;
+        box.position.z = j * stepZ + (Math.random() - 0.5) * range;
+        box.position.y = (Math.random() - 0.5) * 2;
+        box.castShadow = true;
+        scene.add(box);
+      }
+    }
+
+    // ------------------------------------------------------------
+    // 5) PostProcessing（Composer / Passes）
+    // ------------------------------------------------------------
+    const renderPass = new RenderPass(scene, camera);
+
+    // 5-1) BleachBypass（白黒っぽいフィルム調）
+    const bleachPass = new ShaderPass(BleachBypassShader);
+    bleachPass.enabled = false;
+    if (bleachPass.uniforms?.opacity) bleachPass.uniforms.opacity.value = 1.0;
+
+    // 5-2) Sobel（輪郭抽出：EdgeShader2 の代替）
+    /*
+      SobelOperatorShader の典型uniform:
+      - tDiffuse: 入力テクスチャ（ShaderPass が自動で渡す）
+      - resolution: (描画バッファのピクセル幅, ピクセル高)
+        ※ shader 内で texelSize = 1.0 / resolution を作るため
+    */
+    const sobelPass = new ShaderPass(SobelOperatorShader);
+    sobelPass.enabled = false;
+
+    // 5-3) FXAA（アンチエイリアス）
+    const fxaaPass = new ShaderPass(FXAAShader);
+    fxaaPass.enabled = false;
+
+    // 5-4) Focus（擬似DOF/フォーカス）
+    const focusPass = new ShaderPass(FocusShader);
+    focusPass.enabled = false;
+
+    // 5-5) Output（最終出力）
+    const outputPass = new OutputPass();
+
+    const composer = new EffectComposer(renderer);
+    composer.addPass(renderPass);
+    composer.addPass(bleachPass);
+    composer.addPass(sobelPass);
+    composer.addPass(fxaaPass);
+    composer.addPass(focusPass);
+    composer.addPass(outputPass);
+
+    // ------------------------------------------------------------
+    // 6) GUI（ON/OFF + パラメータ）
+    // ------------------------------------------------------------
+    const params = {
+      // toggles
+      bleach: false,
+      edgeDetect: false, // Sobel ON/OFF
+      FXAA: false,
+      focus: false,
+
+      // bleach
+      bleachOpacity: 1.0,
+
+      // edge（Sobel）
+      edgeScale: 1.0,
+      /*
+        edgeScale は「太さ/強さっぽい」コントロールとして扱う
+        - Sobel は本来「強さ」よりも「サンプリングの間隔（texelSize）」で見た目が変わる
+        - resolution を (w/edgeScale, h/edgeScale) にすることで、
+          edgeScale を上げるほど “粗いサンプリング（太め）” になりやすい
+      */
+
+      // focus
+      sampleDistance: 0.94,
+      waveFactor: 0.00125,
+
+      apply() {
+        bleachPass.enabled = this.bleach;
+        sobelPass.enabled  = this.edgeDetect;
+        fxaaPass.enabled   = this.FXAA;
+        focusPass.enabled  = this.focus;
+
+        if (bleachPass.uniforms?.opacity) {
+          bleachPass.uniforms.opacity.value = this.bleachOpacity;
+        }
+
+        updateSobelResolution();
+        updateFXAAResolution();
+        updateFocusUniforms();
+      }
+    };
+
+    const gui = new dat.GUI();
+
+    const f0 = gui.addFolder("Toggles");
+    f0.add(params, "bleach").name("BleachBypass").onChange(() => params.apply());
+    f0.add(params, "edgeDetect").name("Sobel Edge").onChange(() => params.apply());
+    f0.add(params, "FXAA").name("FXAA").onChange(() => params.apply());
+    f0.add(params, "focus").name("Focus").onChange(() => params.apply());
+    f0.open();
+
+    const f1 = gui.addFolder("BleachBypass");
+    f1.add(params, "bleachOpacity", 0, 2, 0.001).name("opacity").onChange(() => params.apply());
+
+    const f2 = gui.addFolder("Sobel Edge");
+    f2.add(params, "edgeScale", 0.25, 4, 0.01).name("edgeScale").onChange(() => params.apply());
+
+    const f3 = gui.addFolder("Focus");
+    f3.add(params, "sampleDistance", 0, 2, 0.01).name("sampleDistance").onChange(() => params.apply());
+    f3.add(params, "waveFactor", 0, 0.005, 0.0001).name("waveFactor").onChange(() => params.apply());
+
+    // 初期反映
+    params.apply();
+
+    // ------------------------------------------------------------
+    // 7) 解像度依存uniform更新（resize でも再利用）
+    // ------------------------------------------------------------
+    function updateFXAAResolution() {
+      if (!fxaaPass.uniforms?.resolution) return;
+
+      /*
+        FXAA は「1ピクセルのUV幅」が必要なので、(1/width, 1/height)
+        ここで重要なのは “描画バッファ（DPR込み）のピクセル数” を使うこと
+      */
+      const buf = new THREE.Vector2();
+      renderer.getDrawingBufferSize(buf); // DPR込みのピクセルサイズ
+      fxaaPass.uniforms.resolution.value.set(1 / buf.x, 1 / buf.y);
+    }
+
+    function updateSobelResolution() {
+      if (!sobelPass.uniforms?.resolution) return;
+
+      /*
+        Sobel は shader 内で texelSize = 1.0 / resolution を使う想定。
+        よって resolution は “描画バッファのピクセルサイズ” を入れるのが基本。
+
+        edgeScale を「太さ調整」っぽく使うために
+        resolution = (buf.x / edgeScale, buf.y / edgeScale) としている。
+        - edgeScale↑ => resolution↓ => texelSize↑ => 太め/粗めのエッジになりやすい
+      */
+      const buf = new THREE.Vector2();
+      renderer.getDrawingBufferSize(buf);
+      const s = Math.max(0.0001, params.edgeScale);
+      sobelPass.uniforms.resolution.value.set(buf.x / s, buf.y / s);
+    }
+
+    function updateFocusUniforms() {
+      const u = focusPass.uniforms;
+      if (!u) return;
+
+      // FocusShader は実装差があるため、存在するuniformだけ触る
+      if (u.screenWidth)  u.screenWidth.value  = window.innerWidth;
+      if (u.screenHeight) u.screenHeight.value = window.innerHeight;
+
+      if (u.sampleDistance) u.sampleDistance.value = params.sampleDistance;
+      if (u.waveFactor)     u.waveFactor.value = params.waveFactor;
+    }
+
+    // ------------------------------------------------------------
+    // 8) Animation loop
+    // ------------------------------------------------------------
+    const clock = new THREE.Clock();
+    function animate() {
+      requestAnimationFrame(animate);
+      stats.begin();
+
+      const delta = clock.getDelta();
+
+      // FocusShader が time を持つ実装の場合のみ進める（版差対策）
+      if (focusPass.uniforms?.time) {
+        focusPass.uniforms.time.value += delta;
+      }
+
+      // composer がパス列を順に実行し、最後に OutputPass が画面へ出す
+      composer.render();
+
+      stats.end();
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // 9) Resize（renderer / camera / composer / uniforms を同期）
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+      composer.setSize(w, h);
+
+      // DPR/解像度依存uniformを更新
+      updateFXAAResolution();
+      updateSobelResolution();
+      updateFocusUniforms();
+    });
+  </script>
+</body>
+</html>
