@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 11.04 - Shader Pass simple（ES Modules / Blur・TiltShift・TriangleBlur 修正版 + 詳細コメント）</title>
+
+  <!--
+    ✅ dat.gui / stats.js / chroma.js は「ユーティリティ」なので CDN のグローバルを使用
+    - dat.gui: UIスライダー
+    - stats.js: FPS表示
+    - chroma.js: カラースケール生成（キューブの色付け）
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chroma-js@2.4.2/chroma.min.js"></script>
+
+  <!--
+    ✅ importmap（必須）
+    - examples/jsm(addons) は内部で "three" を import するため、
+      ブラウザが bare specifier を解決できるようにする
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #WebGL-output { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 11.04 - Shader Pass simple（ポストプロセス入門）
+      ============================================================
+
+      ■ このサンプルでやること
+      - 3Dシーン（床 + 透明キューブ群）を通常レンダリングする
+      - その「元画像」に対して、フルスクリーンのシェーダで加工（ShaderPass）する
+      - GUIで各エフェクト（Blur / TiltShift / TriangleBlur）を ON/OFF し、パラメータを変える
+
+      ============================================================
+      ✅ 重要：EffectComposer のアルゴリズム（ここが本題）
+      ============================================================
+
+      EffectComposer は「パス列（Pass chain）」を順に実行して最終画面を作る。
+      各フレームでの概念的な処理は次の通り：
+
+      (1) RenderPass(scene, camera)
+          - 3Dを通常描画して “元画像” を作る（カラー結果がバッファに入る）
+
+      (2) ShaderPass群（任意で enabled=true のものだけ）
+          - 直前の結果（tDiffuse）をテクスチャとして受け取り、
+            フルスクリーンクアッドでピクセル単位加工をして次のバッファへ書く
+          - enabled=false のパスはスキップされる（＝処理しない）
+
+      (3) OutputPass
+          - 最終結果を画面（canvas）へ出す
+          - 旧コードの renderToScreen=true の代替で、最後に OutputPass を置くのが今の流儀
+
+      ※ 内部では “readBuffer / writeBuffer” を ping-pong しながら、
+         「入力→加工→出力」をパス列で連鎖させていく。
+
+      ============================================================
+      ✅ 元コードからの修正点（バグ修正の核心）
+      ============================================================
+
+      1) Blurシェーダの 1/width, 1/height が逆になっていた
+         - HorizontalBlurShader: uniform h は 1/width
+         - VerticalBlurShader  : uniform v は 1/height
+         - 元コードは innerWidth/innerHeight を取り違えていたため、
+           ブラー量が意図通りにならない・極端に弱い/強い等が起きる
+
+      2) resize 時に「renderer / camera / composer / uniform」を同期していなかった
+         - 解像度が変わると 1/width, 1/height も再計算が必要
+         - composer.setSize() も必須（内部RTのサイズが古いままだと崩れる）
+
+      3) renderToScreen=true の旧流儀をやめ、OutputPass を最後に置く
+         - 複数サンプルを扱う時の破綻を避けるため、終端を明示する
+
+      4) SpotLight.target は “シーンに居る” 必要がある（安定化）
+         - three.js のバージョン差や扱いの差で target が期待位置にならない事があるため、
+           scene.add(spotLight.target) を明示する
+    */
+
+    // ------------------------------------------------------------
+    // imports
+    // ------------------------------------------------------------
+    import * as THREE from "three";
+
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+    import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+
+    import { CopyShader } from "three/addons/shaders/CopyShader.js"; // デバッグ用に残す（最終出力は OutputPass）
+
+    import { HorizontalBlurShader } from "three/addons/shaders/HorizontalBlurShader.js";
+    import { VerticalBlurShader } from "three/addons/shaders/VerticalBlurShader.js";
+    import { HorizontalTiltShiftShader } from "three/addons/shaders/HorizontalTiltShiftShader.js";
+    import { VerticalTiltShiftShader } from "three/addons/shaders/VerticalTiltShiftShader.js";
+    import { TriangleBlurShader } from "three/addons/shaders/TriangleBlurShader.js";
+
+    // ------------------------------------------------------------
+    // 0) DOM / Stats
+    // ------------------------------------------------------------
+    const host = document.getElementById("WebGL-output");
+    const statsHost = document.getElementById("Stats-output");
+
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    statsHost.appendChild(stats.dom);
+
+    // ------------------------------------------------------------
+    // 1) Scene / Camera / Renderer
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(30, 30, 30);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(0xaaaaff, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+    // 色空間（テクスチャ表示が自然になる）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    // 影を使う
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    host.appendChild(renderer.domElement);
+
+    // ------------------------------------------------------------
+    // 2) Lights（シーンが黒くならないように最低限 + 影）
+    // ------------------------------------------------------------
+    // ベースの明るさ
+    scene.add(new THREE.AmbientLight(0x222222));
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(30, 30, 30);
+    scene.add(dirLight);
+
+    // 影の主役（床に落とす）
+    const spotLight = new THREE.SpotLight(0xffffff, 0.6);
+    spotLight.castShadow = true;
+    spotLight.position.set(-30, 30, -100);
+
+    // target は明示的に scene に追加して安定化（重要）
+    spotLight.target.position.set(-10, 0, -10);
+    scene.add(spotLight.target);
+
+    // シャドウ品質
+    spotLight.shadow.mapSize.set(2048, 2048);
+    spotLight.shadow.camera.near = 1;
+    spotLight.shadow.camera.far = 200;
+    spotLight.shadow.camera.fov = 120;
+
+    scene.add(spotLight);
+
+    // ------------------------------------------------------------
+    // 3) Objects（床 + 透明キューブ群）
+    // ------------------------------------------------------------
+    // chroma で色を作る（white→blue グラデ）
+    const scale = chroma.scale(["white", "blue"]);
+
+    // 床：本来 PlaneGeometry が自然だが、元コードの雰囲気を残して厚み極薄の BoxGeometry
+    const floorGeom = new THREE.BoxGeometry(1600, 1600, 0.1, 40, 40);
+
+    const texLoader = new THREE.TextureLoader();
+    const floorTex = texLoader.load("../assets/textures/general/floor-wood.jpg");
+    // テクスチャは sRGB として扱うのが自然
+    if ("colorSpace" in floorTex) floorTex.colorSpace = THREE.SRGBColorSpace;
+
+    floorTex.wrapS = THREE.RepeatWrapping;
+    floorTex.wrapT = THREE.RepeatWrapping;
+    floorTex.repeat.set(80, 80);
+
+    const floorMat = new THREE.MeshPhongMaterial({
+      color: 0xffffff,
+      map: floorTex
+    });
+
+    const floor = new THREE.Mesh(floorGeom, floorMat);
+    floor.rotation.x = Math.PI / 2;
+    floor.receiveShadow = true;
+    floor.position.set(-150, 0, -150);
+    scene.add(floor);
+
+    // キューブ群（半透明）
+    const range = 3;
+    const stepX = 8;
+    const stepZ = 8;
+
+    for (let i = -25; i < 5; i++) {
+      for (let j = -15; j < 15; j++) {
+        const box = new THREE.Mesh(
+          new THREE.BoxGeometry(3, 4, 3),
+          new THREE.MeshPhongMaterial({
+            color: new THREE.Color(scale(Math.random()).hex()),
+            opacity: 0.8,
+            transparent: true
+          })
+        );
+
+        box.position.x = i * stepX + (Math.random() - 0.5) * range;
+        box.position.z = j * stepZ + (Math.random() - 0.5) * range;
+        box.position.y = (Math.random() - 0.5) * 2;
+
+        box.castShadow = true;
+        scene.add(box);
+      }
+    }
+
+    // ------------------------------------------------------------
+    // 4) Postprocessing: passes
+    // ------------------------------------------------------------
+    /*
+      ✅ ここが“本体”のパス列
+
+      composer:
+        RenderPass(scene,camera)
+        -> (任意) HorizontalBlur
+        -> (任意) VerticalBlur
+        -> (任意) VerticalTiltShift
+        -> (任意) HorizontalTiltShift
+        -> (任意) TriangleBlur
+        -> OutputPass
+
+      ※ enabled=false のパスはスキップされるので、
+         GUI で ON にしたものだけ効果が出る。
+    */
+
+    // 4-1) シーンをまず描く（元画像）
+    const renderPass = new RenderPass(scene, camera);
+
+    // 4-2) ShaderPass 群（初期はOFF）
+    const hBlur = new ShaderPass(HorizontalBlurShader);
+    hBlur.enabled = false;
+
+    const vBlur = new ShaderPass(VerticalBlurShader);
+    vBlur.enabled = false;
+
+    const hTilt = new ShaderPass(HorizontalTiltShiftShader);
+    hTilt.enabled = false;
+
+    const vTilt = new ShaderPass(VerticalTiltShiftShader);
+    vTilt.enabled = false;
+
+    // TriangleBlurShader は “入力テクスチャ uniform 名” が 'texture' のため、textureID を指定する
+    const tri = new ShaderPass(TriangleBlurShader, "texture");
+    tri.enabled = false;
+
+    // 4-3) 最終出力（旧 renderToScreen=true の代替）
+    const outputPass = new OutputPass();
+
+    // composer 構築
+    const composer = new EffectComposer(renderer);
+    composer.addPass(renderPass);
+    composer.addPass(hBlur);
+    composer.addPass(vBlur);
+    composer.addPass(vTilt);
+    composer.addPass(hTilt);
+    composer.addPass(tri);
+    composer.addPass(outputPass);
+
+    // （任意）デバッグ用 CopyShader を最後に挿したい場合の例：
+    // const copyPass = new ShaderPass(CopyShader);
+    // composer.addPass(copyPass); // OutputPass の代わりに使うなら copyPass を最後に置く
+
+    // ------------------------------------------------------------
+    // 5) “解像度依存 uniform” を正しく設定する
+    // ------------------------------------------------------------
+    /*
+      ✅ ここが元コードのバグ修正ポイント
+
+      HorizontalBlurShader:
+        uniforms.h = 1 / width
+      VerticalBlurShader:
+        uniforms.v = 1 / height
+
+      TiltShift も同様に “h/v は画素単位” なので、width/height で決まる。
+    */
+    function updateResolutionUniforms() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      // Blur
+      if (hBlur.uniforms?.h) hBlur.uniforms.h.value = 1 / Math.max(w, 1);
+      if (vBlur.uniforms?.v) vBlur.uniforms.v.value = 1 / Math.max(h, 1);
+
+      // TiltShift
+      if (hTilt.uniforms?.h) hTilt.uniforms.h.value = 1 / Math.max(w, 1);
+      if (vTilt.uniforms?.v) vTilt.uniforms.v.value = 1 / Math.max(h, 1);
+    }
+    updateResolutionUniforms();
+
+    // ------------------------------------------------------------
+    // 6) GUI（ON/OFF とパラメータ）
+    // ------------------------------------------------------------
+    const controls = {
+      // enable flags
+      hBlur: false,
+      vBlur: false,
+      hTilt: false,
+      vTilt: false,
+      triBlur: false,
+
+      // TiltShift の “ピント帯” パラメータ（r）
+      // - TiltShiftShader は “r が大きいほど、ボケが入る領域が広がる/効きが変わる” 系の調整
+      hTiltR: 0.35,
+      vTiltR: 0.35,
+
+      // TriangleBlur の強さ（delta）
+      deltaX: 0.05,
+      deltaY: 0.05,
+
+      apply() {
+        hBlur.enabled = this.hBlur;
+        vBlur.enabled = this.vBlur;
+
+        hTilt.enabled = this.hTilt;
+        if (hTilt.uniforms?.r) hTilt.uniforms.r.value = this.hTiltR;
+
+        vTilt.enabled = this.vTilt;
+        if (vTilt.uniforms?.r) vTilt.uniforms.r.value = this.vTiltR;
+
+        tri.enabled = this.triBlur;
+        if (tri.uniforms?.delta) tri.uniforms.delta.value.set(this.deltaX, this.deltaY);
+      }
+    };
+
+    const gui = new dat.GUI();
+    gui.add(controls, "hBlur").name("Horizontal Blur").onChange(() => controls.apply());
+    gui.add(controls, "vBlur").name("Vertical Blur").onChange(() => controls.apply());
+
+    gui.add(controls, "hTilt").name("Horizontal TiltShift").onChange(() => controls.apply());
+    gui.add(controls, "hTiltR", 0, 1, 0.001).name("hTilt r").onChange(() => controls.apply());
+
+    gui.add(controls, "vTilt").name("Vertical TiltShift").onChange(() => controls.apply());
+    gui.add(controls, "vTiltR", 0, 1, 0.001).name("vTilt r").onChange(() => controls.apply());
+
+    gui.add(controls, "triBlur").name("Triangle Blur").onChange(() => controls.apply());
+    gui.add(controls, "deltaX", 0, 0.1, 0.001).name("deltaX").onChange(() => controls.apply());
+    gui.add(controls, "deltaY", 0, 0.1, 0.001).name("deltaY").onChange(() => controls.apply());
+
+    // 初期反映
+    controls.apply();
+
+    // ------------------------------------------------------------
+    // 7) Render loop
+    // ------------------------------------------------------------
+    const clock = new THREE.Clock();
+
+    function render() {
+      requestAnimationFrame(render);
+      stats.begin();
+
+      // delta は一部パスで時間依存の処理をする場合に使える（今回の blur 系は基本不要だが統一）
+      const delta = clock.getDelta();
+
+      // 通常レンダリングの代わりに composer を回す
+      composer.render(delta);
+
+      stats.end();
+    }
+    render();
+
+    // ------------------------------------------------------------
+    // 8) Resize（renderer / camera / composer / uniforms を同期）
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+      // composer は内部レンダーターゲットを持つので必ず setSize が必要
+      composer.setSize(w, h);
+
+      // 解像度依存uniformの更新も必須
+      updateResolutionUniforms();
+    });
+
+  </script>
+</body>
+</html>
