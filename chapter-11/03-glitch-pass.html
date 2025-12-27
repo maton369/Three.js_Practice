@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 11.01 - Effect compositing（GlitchPass / ES Modules 修正版 + 詳細コメント）</title>
+
+  <!--
+    ✅ stats.js / dat.gui は「UIツール」なので従来通り CDN のグローバル読み込みでOK
+    - Stats  : FPSなどのパフォーマンス表示
+    - dat.gui: パラメータをつまみで調整するUI
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+
+  <!--
+    ✅ importmap（必須）
+    - three/addons（旧 examples/jsm）側のモジュールは内部で `import ... from "three"` を使う
+    - ブラウザは "three" のような bare specifier をそのまま解決できない
+    - そこで「"three" はこのURL」「"three/addons/" はこのURL配下」を教える
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #WebGL-output { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 11.01 - Effect compositing（GlitchPass）
+      ============================================================
+
+      ■ このサンプルの「全体アルゴリズム（処理の流れ）」が何か？
+
+      目的：
+        - 3Dシーン（地球スフィア）を普通に描いたあと、
+          画面全体に “グリッチ（ノイズ/破損風）” 効果を合成して表示する。
+
+      パイプライン（EffectComposer）で言うと：
+
+        [RenderPass]  ->  [GlitchPass]  ->  [OutputPass]  ->  Screen
+
+      1) RenderPass
+         - scene + camera を “いったんオフスクリーン（レンダーターゲット）” に描く
+         - ここで「元画像（tDiffuse）」が出来る
+
+      2) GlitchPass
+         - RenderPass が作った元画像（tDiffuse）を入力に
+         - DigitalGlitch シェーダで画像を “乱す” 画像処理をする
+         - goWild=true で激しめ、false で控えめ（ランダム発生）
+
+      3) OutputPass
+         - 最終結果を画面へ出すための「最後の出力パス」
+         - 最近の three.js の postprocessing では「最後に OutputPass」を置くのが分かりやすい
+
+      アニメーションループ（requestAnimationFrame）では：
+        - OrbitControls.update()（カメラ操作を反映）
+        - sphere.rotation.y += ...（地球の自転演出）
+        - composer.render(delta)（上のパス列を “順番に実行”）
+
+      つまりこのサンプルの本質は
+        「renderer.render(scene,camera) をやめて、composer.render() に置き換える」
+      という一点にあります（＝後段で画像処理を挟めるようになる）。
+    */
+
+    // ------------------------------------------------------------
+    // imports（ES Modules）
+    // ------------------------------------------------------------
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { GlitchPass } from "three/addons/postprocessing/GlitchPass.js";
+    import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+
+    // ------------------------------------------------------------
+    // 0) DOM
+    // ------------------------------------------------------------
+    const container = document.getElementById("WebGL-output");
+    const statsHost = document.getElementById("Stats-output");
+
+    // ------------------------------------------------------------
+    // 1) Stats（FPS）
+    // ------------------------------------------------------------
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    statsHost.appendChild(stats.dom);
+
+    // ------------------------------------------------------------
+    // 2) Scene / Camera / Renderer
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(
+      45,                      // fov
+      window.innerWidth / window.innerHeight, // aspect
+      0.1,                     // near
+      1000                     // far
+    );
+
+    // 元コードのカメラ位置を踏襲
+    camera.position.set(-10, 15, 25);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(0x000000, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+    // 色空間（r152+ は outputColorSpace）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    container.appendChild(renderer.domElement);
+
+    // ------------------------------------------------------------
+    // 3) Controls（OrbitControls）
+    // ------------------------------------------------------------
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;   // 慣性（damping）を効かせる
+    orbit.dampingFactor = 0.08;
+    orbit.autoRotate = false;
+
+    const clock = new THREE.Clock();
+
+    // ------------------------------------------------------------
+    // 4) Lights（Phong を使うのでライト必須）
+    // ------------------------------------------------------------
+    // 環境光（全体の底上げ）
+    scene.add(new THREE.AmbientLight(0x181818));
+
+    // 指向性ライト（太陽光のような一方向の光）
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+    dirLight.position.set(550, 100, 550);
+    scene.add(dirLight);
+
+    // ------------------------------------------------------------
+    // 5) Mesh（地球スフィア）
+    // ------------------------------------------------------------
+    // 元コードは SceneUtils.createMultiMaterialObject を使っていたが、現代では廃止系。
+    // 今回は単一Materialなので THREE.Mesh で十分。
+    const sphere = createEarthSphere();
+    scene.add(sphere);
+
+    // ------------------------------------------------------------
+    // 6) EffectComposer（ここが主役：パス合成チェーン）
+    // ------------------------------------------------------------
+    const composer = new EffectComposer(renderer);
+
+    // (1) まず普通に 3D シーンを描いて「元画像」を作る
+    const renderPass = new RenderPass(scene, camera);
+
+    // (2) グリッチ効果
+    // GlitchPass(dt_size)
+    // - dt_size は内部で使うノイズ用の “雑テクスチャ” のサイズ（大きいほど細かいが重い）
+    // - 旧コード: new THREE.GlitchPass(64) と同じ意味
+    const glitchPass = new GlitchPass(64);
+
+    // (3) 最終出力（最後に置く）
+    const outputPass = new OutputPass();
+
+    composer.addPass(renderPass);
+    composer.addPass(glitchPass);
+    composer.addPass(outputPass);
+
+    // ------------------------------------------------------------
+    // 7) dat.gui（GlitchPass の goWild を切り替える）
+    // ------------------------------------------------------------
+    const state = {
+      // GlitchPass で “暴れる” モード
+      goWild: false,
+
+      // GlitchPass 自体の ON/OFF（比較用に便利）
+      glitchEnabled: true,
+
+      // 現代の composer は passes の enabled で個別に切れる
+      apply() {
+        glitchPass.goWild = !!this.goWild;
+        glitchPass.enabled = !!this.glitchEnabled;
+      }
+    };
+    state.apply();
+
+    const gui = new dat.GUI();
+    gui.width = 320;
+    gui.add(state, "glitchEnabled").name("Enable Glitch").onChange(() => state.apply());
+    gui.add(state, "goWild").name("Go Wild").onChange(() => state.apply());
+
+    // ------------------------------------------------------------
+    // 8) Render loop（composer.render が主役）
+    // ------------------------------------------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      stats.begin();
+
+      const delta = clock.getDelta();
+
+      // OrbitControls（damping を使うので毎フレーム update が必要）
+      orbit.update();
+
+      // 地球の自転演出
+      sphere.rotation.y += 0.002;
+
+      // ✅ ここが肝：
+      // renderer.render(scene,camera) ではなく
+      // RenderPass -> GlitchPass -> OutputPass を実行する
+      composer.render(delta);
+
+      stats.end();
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // 9) Resize（renderer と composer の両方）
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+      // composer は内部にレンダーターゲットを持つのでサイズ同期が必要
+      composer.setSize(w, h);
+    });
+
+    // ------------------------------------------------------------
+    // 10) 地球スフィア生成
+    // ------------------------------------------------------------
+    function createEarthSphere() {
+      // ジオメトリ（分割を増やすほど滑らか＝少し重い）
+      const geom = new THREE.SphereGeometry(10, 40, 40);
+
+      const loader = new THREE.TextureLoader();
+
+      // ベースカラー（地図）
+      const planetTexture = loader.load("../assets/textures/planets/Earth.png");
+      // 反射マップ（海などの反射っぽさ）
+      const specularTexture = loader.load("../assets/textures/planets/EarthSpec.png");
+      // 法線マップ（凹凸表現）
+      const normalTexture = loader.load("../assets/textures/planets/EarthNormal.png");
+
+      // “色” のテクスチャは sRGB として扱うのが自然（発色が正しくなる）
+      if ("colorSpace" in planetTexture) planetTexture.colorSpace = THREE.SRGBColorSpace;
+
+      const mat = new THREE.MeshPhongMaterial({
+        map: planetTexture,
+        specularMap: specularTexture,
+        normalMap: normalTexture,
+        specular: new THREE.Color(0x4444aa)
+      });
+
+      return new THREE.Mesh(geom, mat);
+    }
+  </script>
+</body>
+</html>
