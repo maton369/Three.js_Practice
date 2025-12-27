@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 11.03 - Post processing masks（ES Modules / マスク合成・修正版 + 詳細コメント）</title>
+
+  <!-- dat.gui / stats.js は “外部ツール” なので従来通り CDN のグローバルでOK -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+
+  <!-- importmap（bare specifier "three" をブラウザが解決できるようにする） -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #WebGL-output { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 11.03 - Post processing masks（マスク付きポストプロセス）
+      ============================================================
+
+      ■ あなたのエラーの原因
+        Uncaught ReferenceError: Cannot access 'loader' before initialization
+
+      - createEarthMesh() / createMarsMesh() の中で `loader.load(...)` を呼んでいるが、
+        その `loader`（TextureLoader）を `const loader = ...` で初期化する前に、
+        Earth/Mars を生成してしまっていた（TDZ: Temporal Dead Zone）。
+
+      ✅ 修正：
+      - loader を “メッシュ生成より前” に作る
+      - もしくは mesh生成関数に loader を引数で渡す
+      ここでは分かりやすく、`const textureLoader = new THREE.TextureLoader()` を
+      上の方で一度だけ作って共有する。
+
+      ------------------------------------------------------------
+      ■ アルゴリズム（このサンプルでやっていること）
+      ------------------------------------------------------------
+
+      (0) Background RenderPass
+          - 星空のフルスクリーンクアッドを描く
+
+      (1) Earth RenderPass（clear=false）
+      (2) Mars  RenderPass（clear=false）
+          - ここまでで「背景 + 2つの惑星」が合成される
+
+      (3) Mars MaskPass
+          - ステンシルに「Mars の画素だけ = 1」を書く
+      (4) Colorify ShaderPass
+          - “Mars の画素だけ” 色味を変える（ステンシルでゲートされる）
+      (5) ClearMaskPass
+          - 次の処理に影響しないようにマスク状態を解除
+
+      (6) Earth MaskPass
+      (7) Sepia ShaderPass
+          - “Earth の画素だけ” セピアにする
+      (8) ClearMaskPass
+
+      (9) OutputPass
+          - 最終結果を画面へ出す（旧 renderToScreen=true の代替）
+
+      ------------------------------------------------------------
+      ■ MaskPass の重要ポイント
+      ------------------------------------------------------------
+      - MaskPass は “色を変える” のではなく、ステンシルテスト条件を作るパス
+      - なので composer のレンダーターゲットに stencilBuffer=true が必須
+      - そのため、EffectComposer に stencilBuffer=true の WebGLRenderTarget を渡す
+    */
+
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+    import { MaskPass, ClearMaskPass } from "three/addons/postprocessing/MaskPass.js";
+    import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+
+    import { SepiaShader } from "three/addons/shaders/SepiaShader.js";
+    import { ColorifyShader } from "three/addons/shaders/ColorifyShader.js";
+
+    // ------------------------------------------------------------
+    // 0) DOM / Stats
+    // ------------------------------------------------------------
+    const host = document.getElementById("WebGL-output");
+    const statsHost = document.getElementById("Stats-output");
+
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    statsHost.appendChild(stats.dom);
+
+    // ------------------------------------------------------------
+    // 1) Renderer / Camera（メイン）
+    // ------------------------------------------------------------
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(0x000000, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+    // three.js r152+ は outputColorSpace が主流
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    // 複数RenderPassを重ねるので、レンダラ側の autoClear は切っておく
+    renderer.autoClear = false;
+
+    host.appendChild(renderer.domElement);
+
+    // メインカメラ（Earth/Mars 用）
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(-10, 15, 25);
+    camera.lookAt(0, 0, 0);
+
+    // ------------------------------------------------------------
+    // 2) Scenes（Earth / Mars / Background を分ける）
+    // ------------------------------------------------------------
+    const sceneEarth = new THREE.Scene();
+    const sceneMars  = new THREE.Scene();
+    const sceneBG    = new THREE.Scene();
+
+    // ------------------------------------------------------------
+    // ✅ 3) TextureLoader は “先に” 作る（TDZ回避）
+    // ------------------------------------------------------------
+    /*
+      ここが今回の修正の本丸。
+      以降の createEarthMesh/createMarsMesh/createBackground で必ず参照されるので、
+      「呼ばれる前に必ず初期化済み」になる場所に置く。
+    */
+    const textureLoader = new THREE.TextureLoader();
+
+    // ------------------------------------------------------------
+    // 4) Controls（カメラ操作）
+    // ------------------------------------------------------------
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.autoRotate = false;
+
+    const clock = new THREE.Clock();
+
+    // ------------------------------------------------------------
+    // 5) Lights（Earth/Mars は別シーンなので、それぞれに光を置く）
+    // ------------------------------------------------------------
+    sceneEarth.add(new THREE.AmbientLight(0x181818));
+    sceneMars.add(new THREE.AmbientLight(0x181818));
+
+    const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.6);
+    dirLight1.position.set(550, 100, 550);
+    sceneEarth.add(dirLight1);
+
+    const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.6);
+    dirLight2.position.set(550, 100, 550); // ✅ 元コードのミス修正：spotLight2 の方に設定
+    sceneMars.add(dirLight2);
+
+    // ------------------------------------------------------------
+    // 6) Mesh（Earth / Mars）
+    // ------------------------------------------------------------
+    const earth = createEarthMesh(textureLoader);
+    earth.position.x = -10;
+    sceneEarth.add(earth);
+
+    const mars = createMarsMesh(textureLoader);
+    mars.position.x = 10;
+    sceneMars.add(mars);
+
+    // ------------------------------------------------------------
+    // 7) Background（フルスクリーンクアッド）
+    // ------------------------------------------------------------
+    /*
+      BG は “画面に貼り付く2D” として扱う。
+      - OrthoCamera(-1..1) + PlaneGeometry(2,2) で NDC に直接描画
+      - depthTest/depthWrite を false にして常に背景化
+    */
+    const cameraBG = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+    const bgTex = textureLoader.load("../assets/textures/starry-deep-outer-space-galaxy.jpg");
+    if ("colorSpace" in bgTex) bgTex.colorSpace = THREE.SRGBColorSpace;
+
+    const bgMat = new THREE.MeshBasicMaterial({
+      map: bgTex,
+      depthTest: false,
+      depthWrite: false,
+    });
+
+    const bgQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), bgMat);
+    sceneBG.add(bgQuad);
+
+    // ------------------------------------------------------------
+    // 8) EffectComposer（ステンシル付きレンダーターゲットを使用）
+    // ------------------------------------------------------------
+    /*
+      MaskPass を使うには stencilBuffer=true が必須。
+      - EffectComposer のデフォルトRTは環境によって stencilBuffer が無いことがある
+      - なので確実に有効化した RenderTarget を composer に渡す
+    */
+    const pixelRatio = renderer.getPixelRatio();
+    const rt = new THREE.WebGLRenderTarget(
+      Math.floor(window.innerWidth  * pixelRatio),
+      Math.floor(window.innerHeight * pixelRatio),
+      {
+        stencilBuffer: true, // ★マスクに必須
+        depthBuffer: true
+      }
+    );
+
+    const composer = new EffectComposer(renderer, rt);
+
+    // ------------------------------------------------------------
+    // 9) Pass 構築（アルゴリズムの通りに並べる）
+    // ------------------------------------------------------------
+
+    // (0) 背景
+    const bgPass = new RenderPass(sceneBG, cameraBG);
+
+    // (1) Earth / (2) Mars を “重ね描き”
+    // - clear=false で「前段を消さずに上書き」していく
+    const earthPass = new RenderPass(sceneEarth, camera);
+    earthPass.clear = false;
+
+    const marsPass = new RenderPass(sceneMars, camera);
+    marsPass.clear = false;
+
+    // (3) Mars マスク → (4) Colorify → (5) ClearMask
+    const marsMask = new MaskPass(sceneMars, camera);
+    const clearMask = new ClearMaskPass();
+
+    const colorifyPass = new ShaderPass(ColorifyShader);
+    colorifyPass.uniforms["color"].value.setRGB(0.5, 0.5, 1.0);
+
+    // (6) Earth マスク → (7) Sepia → (8) ClearMask
+    const earthMask = new MaskPass(sceneEarth, camera);
+
+    const sepiaPass = new ShaderPass(SepiaShader);
+    sepiaPass.uniforms["amount"].value = 0.8;
+
+    // (9) 最終出力
+    const outputPass = new OutputPass();
+
+    // ---- Pass列登録（=処理順）----
+    composer.addPass(bgPass);
+    composer.addPass(earthPass);
+    composer.addPass(marsPass);
+
+    composer.addPass(marsMask);
+    composer.addPass(colorifyPass);
+    composer.addPass(clearMask);
+
+    composer.addPass(earthMask);
+    composer.addPass(sepiaPass);
+    composer.addPass(clearMask);
+
+    composer.addPass(outputPass);
+
+    // ------------------------------------------------------------
+    // 10) GUI（色やセピア量・マスク反転の調整）
+    // ------------------------------------------------------------
+    const gui = new dat.GUI();
+
+    const params = {
+      // Mars の Colorify（RGB）
+      marsColorR: 0.5,
+      marsColorG: 0.5,
+      marsColorB: 1.0,
+
+      // Earth の Sepia
+      earthSepia: 0.8,
+
+      // inverse=true にすると「それ以外の領域に効果」
+      marsMaskInverse: false,
+      earthMaskInverse: false,
+
+      apply() {
+        colorifyPass.uniforms["color"].value.setRGB(this.marsColorR, this.marsColorG, this.marsColorB);
+        sepiaPass.uniforms["amount"].value = this.earthSepia;
+
+        marsMask.inverse = this.marsMaskInverse;
+        earthMask.inverse = this.earthMaskInverse;
+      }
+    };
+
+    const fMars = gui.addFolder("Mars (Mask + Colorify)");
+    fMars.add(params, "marsColorR", 0, 1, 0.001).name("color R").onChange(() => params.apply());
+    fMars.add(params, "marsColorG", 0, 1, 0.001).name("color G").onChange(() => params.apply());
+    fMars.add(params, "marsColorB", 0, 1, 0.001).name("color B").onChange(() => params.apply());
+    fMars.add(params, "marsMaskInverse").name("mask inverse").onChange(() => params.apply());
+
+    const fEarth = gui.addFolder("Earth (Mask + Sepia)");
+    fEarth.add(params, "earthSepia", 0, 1, 0.001).name("sepia amount").onChange(() => params.apply());
+    fEarth.add(params, "earthMaskInverse").name("mask inverse").onChange(() => params.apply());
+
+    params.apply();
+
+    // ------------------------------------------------------------
+    // 11) Animation loop（状態更新 → composer.render）
+    // ------------------------------------------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      stats.begin();
+
+      orbit.update();
+
+      earth.rotation.y += 0.002;
+      mars.rotation.y  += 0.002;
+
+      composer.render(clock.getDelta());
+
+      stats.end();
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // 12) Resize（renderer / camera / composer を同期）
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+      composer.setSize(w, h);
+    });
+
+    // ============================================================
+    // Mesh builders（SceneUtils 廃止対応：Mesh を返す）
+    // ============================================================
+    function createMarsMesh(loader) {
+      const geom = new THREE.SphereGeometry(5, 40, 40);
+
+      const tex = loader.load("../assets/textures/planets/Mars_2k-050104.png");
+      const nrm = loader.load("../assets/textures/planets/Mars-normalmap_2k.png");
+
+      if ("colorSpace" in tex) tex.colorSpace = THREE.SRGBColorSpace;
+
+      const mat = new THREE.MeshPhongMaterial({
+        map: tex,
+        normalMap: nrm
+      });
+
+      return new THREE.Mesh(geom, mat);
+    }
+
+    function createEarthMesh(loader) {
+      const geom = new THREE.SphereGeometry(10, 40, 40);
+
+      const tex = loader.load("../assets/textures/planets/Earth.png");
+      const spc = loader.load("../assets/textures/planets/EarthSpec.png");
+      const nrm = loader.load("../assets/textures/planets/EarthNormal.png");
+
+      if ("colorSpace" in tex) tex.colorSpace = THREE.SRGBColorSpace;
+
+      const mat = new THREE.MeshPhongMaterial({
+        map: tex,
+        normalMap: nrm,
+        specularMap: spc,
+        specular: new THREE.Color(0x4444aa)
+      });
+
+      return new THREE.Mesh(geom, mat);
+    }
+  </script>
+</body>
+</html>
