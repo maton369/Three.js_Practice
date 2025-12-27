@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Example 11.07 - custom shaderpass（ES Modules / 修正版 + 詳細コメント）</title>
+
+  <!--
+    dat.gui / stats.js は “便利ツール” なので CDN でグローバル読み込みでOK
+    - dat.gui: UIでuniformを調整する
+    - stats.js: FPS表示
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+
+  <!--
+    ✅ importmap
+    - ブラウザの ESM は "three" という bare specifier を解決できないため、CDNの実体URLへ割り当てる
+    - jsDelivr はローカル開発（http://127.0.0.1:xxxx）でも比較的安定して読み込める
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #WebGL-output { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+  </style>
+</head>
+
+<body>
+  <div id="Stats-output"></div>
+  <div id="WebGL-output"></div>
+
+  <script type="module">
+    /*
+      ============================================================
+      Example 11.07 - custom shaderpass（カスタムShaderPass）
+      ============================================================
+
+      ■ このサンプルの目的
+      - “自分で作ったシェーダ” を ShaderPass として EffectComposer に繋ぎ、
+        3D描画の後段（ポストプロセス）として適用できることを示す。
+
+      ■ アルゴリズム（1フレーム内の処理の流れ）
+      このコードは「3Dレンダリング → 2D画像処理（シェーダ）→ 画面出力」という直列パイプラインで動く。
+
+      (1) RenderPass(scene, camera)
+          - 3Dシーンをレンダーターゲットに描画して “元画像（tDiffuse）” を作る
+
+      (2) GrayScalePass（任意）
+          - tDiffuse を入力として、輝度Y'（luma）を計算し、グレースケール化
+          - 典型式（Rec.709 / Wikipedia）：
+              Y' = 0.2126 R + 0.7152 G + 0.0722 B
+          - 重み（rPower/gPower/bPower）はGUIで変更可能
+
+      (3) BitPass（任意）
+          - tDiffuse を入力として、色を “n bit” に量子化（ポスタライズ）
+          - bitSize = 8 なら各チャンネル 256 階調相当に丸めるイメージ
+          - 量子化の基本：
+              levels = 2^bitSize - 1
+              quant = floor(color * levels + 0.5) / levels
+
+      (4) OutputPass
+          - 最終結果を canvas に出力
+
+      ■ 重要なポイント（理解の芯）
+      - ShaderPass は “3Dシーンを描く” のではなく、
+        「前段で出来上がった画像（tDiffuse）をフルスクリーンクアッドで加工する」2D処理である。
+      - つまり、重い3Dの計算をやり直さず、後段で視覚効果を積み重ねられる。
+
+      ============================================================
+      ✅ 元コードからの主な修正点
+      ============================================================
+      1) scriptタグ直読みの旧構成 → ES Modules + importmap
+      2) THREE.SceneUtils.createMultiMaterialObject は廃止寄り
+         → 単一Materialなので THREE.Mesh に置き換え
+      3) custom-shader.js 外部依存を排除
+         → このHTML内に “CustomGrayScaleShader / CustomBitShader” を定義（再現性UP）
+      4) renderToScreen=true + CopyShader の旧パターンをやめる
+         → 最後に OutputPass を置く（構造が分かりやすい）
+      5) OrbitControls.update(delta) の旧呼び出しを整理
+         → enableDamping を使い update() で統一（版差で壊れにくい）
+      6) resize で renderer / camera / composer を同期（DPR込み）
+
+      ============================================================
+    */
+
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+    import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+
+    // ------------------------------------------------------------
+    // 0) Stats（FPS）
+    // ------------------------------------------------------------
+    const host = document.getElementById("WebGL-output");
+    const statsHost = document.getElementById("Stats-output");
+
+    const stats = new Stats();
+    stats.showPanel(0);
+    stats.dom.style.position = "fixed";
+    stats.dom.style.left = "0px";
+    stats.dom.style.top = "0px";
+    statsHost.appendChild(stats.dom);
+
+    // ------------------------------------------------------------
+    // 1) Scene / Camera / Renderer
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(-10, 15, 25);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(0x000000, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = true;
+
+    // 色空間（r152+）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    host.appendChild(renderer.domElement);
+
+    // ------------------------------------------------------------
+    // 2) Controls（カメラ操作）
+    // ------------------------------------------------------------
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.autoRotate = false;
+
+    const clock = new THREE.Clock();
+
+    // ------------------------------------------------------------
+    // 3) Lights（最低限）
+    // ------------------------------------------------------------
+    scene.add(new THREE.AmbientLight(0x181818));
+
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(550, 100, 550);
+    scene.add(dir);
+
+    // ------------------------------------------------------------
+    // 4) Mesh（地球っぽい球）
+    // ------------------------------------------------------------
+    const sphere = createEarthSphere();
+    scene.add(sphere);
+
+    function createEarthSphere() {
+      const geom = new THREE.SphereGeometry(10, 40, 40);
+
+      const loader = new THREE.TextureLoader();
+
+      // ベースカラー（sRGBテクスチャ）
+      const earthTex = loader.load("../assets/textures/planets/Earth.png");
+      if ("colorSpace" in earthTex) earthTex.colorSpace = THREE.SRGBColorSpace;
+
+      // 法線/スペキュラは通常 Linear として扱う（colorSpace を設定しない）
+      const specTex  = loader.load("../assets/textures/planets/EarthSpec.png");
+      const normTex  = loader.load("../assets/textures/planets/EarthNormal.png");
+
+      const mat = new THREE.MeshPhongMaterial({
+        map: earthTex,
+        normalMap: normTex,
+        specularMap: specTex,
+        specular: new THREE.Color(0x4444aa)
+      });
+
+      // ✅ SceneUtils.createMultiMaterialObject は使わず Mesh を返す
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = false;
+      return mesh;
+    }
+
+    // ------------------------------------------------------------
+    // 5) カスタムシェーダ定義（ShaderPass 用）
+    // ------------------------------------------------------------
+    /*
+      ShaderPass に渡す “shaderオブジェクト” は、次の形式を満たす必要がある：
+
+      {
+        uniforms: { tDiffuse: { value: null }, ... },
+        vertexShader: "....",
+        fragmentShader: "...."
+      }
+
+      - tDiffuse は ShaderPass が自動で「前段の出力テクスチャ」を入れてくれる入力
+      - fragmentShader では tDiffuse をサンプリングして加工する
+    */
+
+    // 5-1) グレースケール化（重みはGUIで変更）
+    const CustomGrayScaleShader = {
+      uniforms: {
+        tDiffuse: { value: null }, // 入力画像
+        rPower: { value: 0.2126 },
+        gPower: { value: 0.7152 },
+        bPower: { value: 0.0722 },
+        normalizeWeights: { value: 1 } // 1なら r+g+b で正規化して明るさ暴れを抑える
+      },
+      vertexShader: /* glsl */`
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */`
+        uniform sampler2D tDiffuse;
+        uniform float rPower;
+        uniform float gPower;
+        uniform float bPower;
+        uniform int normalizeWeights;
+        varying vec2 vUv;
+
+        void main() {
+          vec4 c = texture2D(tDiffuse, vUv);
+
+          float wSum = rPower + gPower + bPower;
+          // 重みが変でも破綻しないように最低限の保護
+          if (normalizeWeights == 1 && wSum > 0.00001) {
+            wSum = 1.0 / wSum;
+          } else {
+            wSum = 1.0;
+          }
+
+          float y = (c.r * rPower + c.g * gPower + c.b * bPower) * wSum;
+
+          // グレースケールはRGBを同じ値にする
+          gl_FragColor = vec4(vec3(y), c.a);
+        }
+      `
+    };
+
+    // 5-2) 量子化（bitSize bits / channel）
+    const CustomBitShader = {
+      uniforms: {
+        tDiffuse: { value: null },
+        bitSize:  { value: 8.0 } // 2〜24を想定（ただしfloat精度的に大きいと差が見えにくくなる）
+      },
+      vertexShader: /* glsl */`
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */`
+        uniform sampler2D tDiffuse;
+        uniform float bitSize;
+        varying vec2 vUv;
+
+        void main() {
+          vec4 c = texture2D(tDiffuse, vUv);
+
+          // float精度の都合で過度に大きいbitは意味が薄いので、shader側で軽く上限を設ける
+          float bs = clamp(bitSize, 1.0, 16.0);
+          float levels = pow(2.0, bs) - 1.0; // 例: 8bit -> 255
+
+          // nearest quantization
+          vec3 q = floor(c.rgb * levels + 0.5) / levels;
+
+          gl_FragColor = vec4(q, c.a);
+        }
+      `
+    };
+
+    // ------------------------------------------------------------
+    // 6) PostProcessing（composer / passes）
+    // ------------------------------------------------------------
+    /*
+      パス列（重要）：
+        RenderPass -> GrayPass(optional) -> BitPass(optional) -> OutputPass
+
+      - GrayPass / BitPass は “enabled” の ON/OFF で適用を切り替える
+      - どちらも tDiffuse を入力にしてフルスクリーンで加工する
+    */
+    const renderPass = new RenderPass(scene, camera);
+
+    const grayPass = new ShaderPass(CustomGrayScaleShader);
+    grayPass.enabled = false;
+
+    const bitPass = new ShaderPass(CustomBitShader);
+    bitPass.enabled = false;
+
+    const outputPass = new OutputPass();
+
+    const composer = new EffectComposer(renderer);
+    composer.addPass(renderPass);
+    composer.addPass(grayPass);
+    composer.addPass(bitPass);
+    composer.addPass(outputPass);
+
+    // ------------------------------------------------------------
+    // 7) GUI（uniform を編集して “効果の中身” を体感する）
+    // ------------------------------------------------------------
+    const params = {
+      // toggles
+      grayScale: false,
+      bitShader: false,
+
+      // gray weights
+      rPower: 0.2126,
+      gPower: 0.7152,
+      bPower: 0.0722,
+      normalizeWeights: true,
+
+      // bit depth
+      bitSize: 8,
+
+      applyGray() {
+        grayPass.enabled = this.grayScale;
+        grayPass.uniforms.rPower.value = this.rPower;
+        grayPass.uniforms.gPower.value = this.gPower;
+        grayPass.uniforms.bPower.value = this.bPower;
+        grayPass.uniforms.normalizeWeights.value = this.normalizeWeights ? 1 : 0;
+      },
+
+      applyBit() {
+        bitPass.enabled = this.bitShader;
+        bitPass.uniforms.bitSize.value = this.bitSize;
+      },
+
+      applyAll() {
+        this.applyGray();
+        this.applyBit();
+      }
+    };
+
+    const gui = new dat.GUI();
+
+    const g1 = gui.addFolder("Gray Scale (Custom)");
+    g1.add(params, "grayScale").name("enabled").onChange(() => params.applyGray());
+    g1.add(params, "rPower", 0, 1, 0.0001).name("r weight").onChange(() => params.applyGray());
+    g1.add(params, "gPower", 0, 1, 0.0001).name("g weight").onChange(() => params.applyGray());
+    g1.add(params, "bPower", 0, 1, 0.0001).name("b weight").onChange(() => params.applyGray());
+    g1.add(params, "normalizeWeights").name("normalize").onChange(() => params.applyGray());
+
+    const g2 = gui.addFolder("Bit (Posterize / Custom)");
+    g2.add(params, "bitShader").name("enabled").onChange(() => params.applyBit());
+    g2.add(params, "bitSize", 2, 24, 1).name("bitSize").onChange(() => params.applyBit());
+
+    params.applyAll();
+
+    // ------------------------------------------------------------
+    // 8) Animation loop（更新 → composer.render）
+    // ------------------------------------------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      stats.begin();
+
+      orbit.update();
+
+      sphere.rotation.y += 0.002;
+
+      // composer は登録された Pass を順番に実行する
+      // delta は時間依存パスがある場合に有用（今回のカスタムシェーダは未使用だが渡しておく）
+      const delta = clock.getDelta();
+      composer.render(delta);
+
+      stats.end();
+    }
+    animate();
+
+    // ------------------------------------------------------------
+    // 9) Resize（renderer / camera / composer を同期）
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+      composer.setSize(w, h);
+    });
+  </script>
+</body>
+</html>
