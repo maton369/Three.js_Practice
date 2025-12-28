@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Physics Shapes（three.js + cannon-es / libsフォルダ不使用 / 詳細コメント）</title>
+
+  <!--
+    ✅ 方針
+    - 「../libs/〜」は一切使わない（three.js / physijs / stats / dat.gui / chroma / perlin などのローカル依存を排除）
+    - three.js は ES Modules を CDN から import
+    - 物理は Physijs(Ammo) ではなく cannon-es を使用（ES Modules）
+    - GUI は dat.gui ではなく、素の HTML ボタン/スライダーで提供
+    - Perlin ノイズも perlin.js に頼らず、最小実装をこのファイル内に同梱
+  -->
+
+  <!-- importmap: "three" をブラウザが解決できるようにする -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #viewport { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+
+    /* dat.gui 代替の簡易HUD */
+    .hud {
+      position: fixed;
+      left: 10px;
+      top: 10px;
+      z-index: 10;
+      color: #fff;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans JP", sans-serif;
+      background: rgba(0,0,0,0.55);
+      padding: 10px 12px;
+      border-radius: 12px;
+      user-select: none;
+      min-width: 320px;
+    }
+    .hud h1 {
+      margin: 0 0 8px;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 74px 1fr 56px;
+      gap: 8px;
+      align-items: center;
+      margin: 6px 0;
+      font-size: 12px;
+    }
+    .row input[type="range"] { width: 100%; }
+    .val { text-align: right; font-variant-numeric: tabular-nums; opacity: 0.9; }
+    .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+    button {
+      background: #1f6feb;
+      color: #fff;
+      border: 0;
+      padding: 8px 10px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    button.secondary { background: #444; }
+    button:active { transform: translateY(1px); }
+    .fps { margin-top: 8px; font-size: 12px; opacity: 0.9; }
+    .note { margin-top: 6px; font-size: 11px; opacity: 0.75; line-height: 1.35; }
+  </style>
+</head>
+
+<body>
+  <div id="viewport"></div>
+
+  <div class="hud">
+    <h1>Physics Shapes（three + cannon-es）</h1>
+
+    <!-- 重力（Physijs: scene.setGravity 相当） -->
+    <div class="row">
+      <div>gravityX</div>
+      <input id="gx" type="range" min="-100" max="100" step="1" value="0">
+      <div class="val" id="gxv">0</div>
+    </div>
+    <div class="row">
+      <div>gravityY</div>
+      <input id="gy" type="range" min="-100" max="0" step="1" value="-20">
+      <div class="val" id="gyv">-20</div>
+    </div>
+    <div class="row">
+      <div>gravityZ</div>
+      <input id="gz" type="range" min="-100" max="100" step="1" value="0">
+      <div class="val" id="gzv">0</div>
+    </div>
+
+    <!-- Physijs の addXXXMesh / clearMeshes 相当 -->
+    <div class="btns">
+      <button id="addPlane">addPlane</button>
+      <button id="addBox">addBox</button>
+      <button id="addSphere">addSphere</button>
+      <button id="addCylinder">addCylinder</button>
+      <button id="addCone">addCone</button>
+      <button id="addCapsule">addCapsule</button>
+      <button id="addConvex">addConvex</button>
+      <button id="clear" class="secondary">clearMeshes</button>
+      <button id="regen" class="secondary">regenTerrain</button>
+      <button id="pause" class="secondary">pause</button>
+    </div>
+
+    <div class="fps" id="fps">FPS: --</div>
+    <div class="note">
+      - Perlin地形(Heightfield)は静的ボディ<br>
+      - 生成物は動的ボディ（落下→衝突→停止）<br>
+      - libsフォルダ不使用（CDN import のみ）
+    </div>
+  </div>
+
+  <script type="module">
+    /*
+      ============================================================
+      全体アルゴリズム（Physijs版を cannon-es で置き換えた要点）
+      ============================================================
+
+      ■ 目的
+      - Physijs の「Shape追加 + Heightfield地形 + 物理落下」を
+        three.js + cannon-es（ESM）で再実装する。
+
+      ■ 毎フレームの流れ（最重要）
+      1) dt を計測（前フレームからの経過時間）
+      2) 物理(world.step)を固定刻みで進める（安定化の定石）
+      3) 物理Bodyの position/quaternion を three.js Mesh に同期
+      4) renderer.render(scene,camera) で描画
+
+      ■ なぜ固定刻み？
+      - 可変dtで step すると、フレーム落ち時に dt が急増して
+        物体がめり込む/跳ねが爆増する/不安定になることがある。
+      - fixedDt=1/60 と accumulator を使うと、現実時間を「コマ割り」して
+        安定したシミュレーションになりやすい。
+
+      ■ Heightfield（Perlin地形）の作り方（概念）
+      - Perlinノイズで (x,z) -> height を作る
+      - three.js:
+          PlaneGeometry を XZ 平面にして頂点の y を height にする
+      - cannon-es:
+          Heightfield shape に heights[][] を渡して静的Bodyにする
+      - 重要: Heightfield は「等間隔グリッド」前提なので
+        elementSize（格子間隔）を揃える必要がある。
+
+      ============================================================
+    */
+
+    import * as THREE from "three";
+    import * as CANNON from "https://esm.sh/cannon-es@0.20.0";
+    import { ConvexGeometry } from "three/addons/geometries/ConvexGeometry.js";
+
+    // -----------------------------
+    // DOM
+    // -----------------------------
+    const viewport = document.getElementById("viewport");
+
+    const gx = document.getElementById("gx");
+    const gy = document.getElementById("gy");
+    const gz = document.getElementById("gz");
+    const gxv = document.getElementById("gxv");
+    const gyv = document.getElementById("gyv");
+    const gzv = document.getElementById("gzv");
+
+    const btnAddPlane = document.getElementById("addPlane");
+    const btnAddBox = document.getElementById("addBox");
+    const btnAddSphere = document.getElementById("addSphere");
+    const btnAddCylinder = document.getElementById("addCylinder");
+    const btnAddCone = document.getElementById("addCone");
+    const btnAddCapsule = document.getElementById("addCapsule");
+    const btnAddConvex = document.getElementById("addConvex");
+    const btnClear = document.getElementById("clear");
+    const btnRegen = document.getElementById("regen");
+    const btnPause = document.getElementById("pause");
+    const fpsEl = document.getElementById("fps");
+
+    function syncGravityLabels() {
+      gxv.textContent = String(gx.value);
+      gyv.textContent = String(gy.value);
+      gzv.textContent = String(gz.value);
+    }
+    syncGravityLabels();
+
+    // -----------------------------
+    // three.js: Renderer / Scene / Camera / Lights
+    // -----------------------------
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(0x000000, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = true;
+
+    // 色空間（r152+）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    viewport.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 1, 1000);
+    camera.position.set(105, 85, 85);
+    camera.lookAt(0, 0, 0);
+
+    // 環境光（Physijs版の ambi 相当）
+    scene.add(new THREE.AmbientLight(0x222222));
+
+    // 影の出るライト
+    const spot = new THREE.SpotLight(0xffffff, 1.5);
+    spot.position.set(40, 50, 100);
+    spot.castShadow = true;
+    spot.decay = 0;      // ✅ ユーザー方針：SpotLight の decay は 0
+    spot.distance = 0;   // 0 は無限（減衰を気にしない）
+    spot.shadow.mapSize.set(2048, 2048);
+    spot.shadow.camera.near = 10;
+    spot.shadow.camera.far = 200;
+    spot.target.position.set(0, 0, 0);
+    scene.add(spot);
+    scene.add(spot.target);
+
+    // -----------------------------
+    // cannon-es: World（物理世界）
+    // -----------------------------
+    const world = new CANNON.World({
+      gravity: new CANNON.Vec3(0, -20, 0)
+    });
+
+    // ぶつかる物体が多いので最適化（整列系にそこそこ強い）
+    world.broadphase = new CANNON.SAPBroadphase(world);
+    world.allowSleep = true;
+
+    // -----------------------------
+    // Material（摩擦/反発）
+    // - Physijs の createMaterial(friction,restitution) 相当を
+    //   cannon-es では ContactMaterial で表現する
+    // -----------------------------
+    const matGround = new CANNON.Material("ground");
+    const matObject = new CANNON.Material("object");
+
+    const contact = new CANNON.ContactMaterial(matGround, matObject, {
+      friction: 0.5,       // Physijs版の getMaterial(0.5,0.7) に近い感触を目安
+      restitution: 0.7
+    });
+    world.addContactMaterial(contact);
+
+    // -----------------------------
+    // 物理 <-> 描画 の同期
+    // -----------------------------
+    const pairs = [];   // { mesh: THREE.Object3D, body: CANNON.Body }
+    let spawned = [];   // 追加した動的物体だけを管理（clearMeshes 用）
+
+    // -----------------------------
+    // ランダム色（Physijs + chroma.scale(['blue','white']) 相当）
+    // -----------------------------
+    function randomBlueWhiteColor() {
+      // t=0 -> blue, t=1 -> white
+      const t = Math.random();
+      // blue(0,0,1) -> white(1,1,1)
+      return new THREE.Color(t, t, 1);
+    }
+
+    // -----------------------------
+    // Perlin ノイズ（perlin.js 不使用の最小実装）
+    // - terrain の高さ生成に使う
+    // -----------------------------
+    class Perlin {
+      constructor(seed = 12345) {
+        this.p = new Uint8Array(512);
+        const perm = new Uint8Array(256);
+        for (let i = 0; i < 256; i++) perm[i] = i;
+
+        // 簡易seed RNG（LCG）
+        let s = seed >>> 0;
+        const rand = () => (s = (1664525 * s + 1013904223) >>> 0) / 4294967296;
+
+        // Fisher-Yates
+        for (let i = 255; i >= 0; i--) {
+          const j = Math.floor(rand() * (i + 1));
+          [perm[i], perm[j]] = [perm[j], perm[i]];
+        }
+        for (let i = 0; i < 512; i++) this.p[i] = perm[i & 255];
+      }
+
+      fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+      lerp(a, b, t) { return a + t * (b - a); }
+
+      grad(hash, x, y, z) {
+        // 12方向の勾配（クラシックPerlinの簡易）
+        const h = hash & 15;
+        const u = h < 8 ? x : y;
+        const v = h < 4 ? y : (h === 12 || h === 14 ? x : z);
+        return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+      }
+
+      noise(x, y, z) {
+        const X = Math.floor(x) & 255;
+        const Y = Math.floor(y) & 255;
+        const Z = Math.floor(z) & 255;
+
+        const xf = x - Math.floor(x);
+        const yf = y - Math.floor(y);
+        const zf = z - Math.floor(z);
+
+        const u = this.fade(xf);
+        const v = this.fade(yf);
+        const w = this.fade(zf);
+
+        const A  = this.p[X] + Y;
+        const AA = this.p[A] + Z;
+        const AB = this.p[A + 1] + Z;
+        const B  = this.p[X + 1] + Y;
+        const BA = this.p[B] + Z;
+        const BB = this.p[B + 1] + Z;
+
+        const x1 = this.lerp(
+          this.grad(this.p[AA], xf, yf, zf),
+          this.grad(this.p[BA], xf - 1, yf, zf),
+          u
+        );
+        const x2 = this.lerp(
+          this.grad(this.p[AB], xf, yf - 1, zf),
+          this.grad(this.p[BB], xf - 1, yf - 1, zf),
+          u
+        );
+        const y1 = this.lerp(x1, x2, v);
+
+        const x3 = this.lerp(
+          this.grad(this.p[AA + 1], xf, yf, zf - 1),
+          this.grad(this.p[BA + 1], xf - 1, yf, zf - 1),
+          u
+        );
+        const x4 = this.lerp(
+          this.grad(this.p[AB + 1], xf, yf - 1, zf - 1),
+          this.grad(this.p[BB + 1], xf - 1, yf - 1, zf - 1),
+          u
+        );
+        const y2 = this.lerp(x3, x4, v);
+
+        // [-1,1] 付近
+        return this.lerp(y1, y2, w);
+      }
+    }
+
+    // -----------------------------
+    // Terrain（Heightfield）生成
+    // -----------------------------
+    let terrain = null; // { mesh, body, heights, elementSize, segX, segZ, size }
+
+    function createTerrain() {
+      // 既存terrainを消す（regenTerrain 用）
+      if (terrain) {
+        scene.remove(terrain.mesh);
+        if (terrain.mesh.geometry) terrain.mesh.geometry.dispose();
+        if (terrain.mesh.material) terrain.mesh.material.dispose();
+        world.removeBody(terrain.body);
+
+        // pairs から terrain を除去
+        for (let i = pairs.length - 1; i >= 0; i--) {
+          if (pairs[i].body === terrain.body) pairs.splice(i, 1);
+        }
+        terrain = null;
+      }
+
+      // Heightfield は elementSize が1つなので、正方格子が扱いやすい
+      // Physijs版は 120x100 だったが、ここでは安定/簡潔さ優先で 120x120 に寄せる
+      const size = 120;
+      const segX = 100;
+      const segZ = 100;
+      const elementSize = size / segX;
+
+      // ノイズ生成
+      const seed = Math.floor(Math.random() * 1e9);
+      const pn = new Perlin(seed);
+
+      // heights[x][z] を作る（cannon-es Heightfield は2D配列が必要）
+      // - ノイズを少しスケールして地形のうねりを作る
+      const heights = [];
+      for (let xi = 0; xi <= segX; xi++) {
+        heights[xi] = [];
+        for (let zi = 0; zi <= segZ; zi++) {
+          const x = (xi / segX) * 10;
+          const z = (zi / segZ) * 10;
+          const n = pn.noise(x, z, 0);      // [-1,1] 付近
+          heights[xi][zi] = n * 10;         // 高さスケール（Physijs版: vertex.z = value * 10）
+        }
+      }
+
+      // three.js: Plane を XZ 平面にして y を高さにする
+      const geom = new THREE.PlaneGeometry(size, size, segX, segZ);
+      geom.rotateX(-Math.PI / 2);
+
+      const pos = geom.getAttribute("position");
+      // PlaneGeometry の頂点は (segX+1)*(segZ+1) 個
+      // 走査順は z(行) -> x(列) のことが多いので、インデックス変換を行う
+      let idx = 0;
+      for (let zi = 0; zi <= segZ; zi++) {
+        for (let xi = 0; xi <= segX; xi++) {
+          pos.setY(idx, heights[xi][zi]);
+          idx++;
+        }
+      }
+      pos.needsUpdate = true;
+      geom.computeVertexNormals();
+
+      // 見た目用マテリアル
+      const mat = new THREE.MeshLambertMaterial({
+        color: 0xffffff
+        // テクスチャが欲しければここに map を設定（ただし assets の存在が前提になるので今回は省略）
+      });
+
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.receiveShadow = true;
+      mesh.castShadow = false;
+      scene.add(mesh);
+
+      // cannon-es: Heightfield shape
+      const shape = new CANNON.Heightfield(heights, { elementSize });
+
+      const body = new CANNON.Body({
+        mass: 0,
+        material: matGround
+      });
+      body.addShape(shape);
+
+      // Heightfield のローカル原点は “配列の(0,0)が基準” なので、中心を(0,0)に置くためにオフセットする
+      // - これをやらないと地形が一方向にずれて見える
+      const half = size / 2;
+      body.position.set(-half, 0, -half);
+
+      // 向きを合わせる（three.js は既に XZ 平面）
+      body.quaternion.setFromEuler(-Math.PI / 2, 0, 0); // Heightfield は XY 平面想定に近いので回す
+
+      world.addBody(body);
+
+      pairs.push({ mesh, body });
+
+      terrain = { mesh, body, heights, elementSize, segX, segZ, size, seed };
+    }
+
+    // -----------------------------
+    // 生成ヘルパ（Physijsの setPosAndShade / getMaterial 相当）
+    // -----------------------------
+    function randomSpawnTransform() {
+      // Physijs版: x: [-45,-25], z: [-5,15] っぽい配置だったが、ここでは見やすく少し広め
+      const x = Math.random() * 40 - 20;
+      const y = 40;
+      const z = Math.random() * 40 - 20;
+
+      // ランダム回転
+      const e = new THREE.Euler(
+        Math.random() * 2 * Math.PI,
+        Math.random() * 2 * Math.PI,
+        Math.random() * 2 * Math.PI,
+        "XYZ"
+      );
+      const q = new THREE.Quaternion().setFromEuler(e);
+      return { x, y, z, q };
+    }
+
+    function addBodyMeshPair({ threeMesh, body, trackSpawned = true }) {
+      scene.add(threeMesh);
+      world.addBody(body);
+
+      pairs.push({ mesh: threeMesh, body });
+      if (trackSpawned) spawned.push({ mesh: threeMesh, body });
+    }
+
+    function makeThreeMaterial() {
+      return new THREE.MeshLambertMaterial({
+        color: randomBlueWhiteColor()
+        // 透明にしたいなら transparent/opacity を設定
+      });
+    }
+
+    // -----------------------------
+    // Shape 追加（Physijsの addSphereMesh 等を再現）
+    // -----------------------------
+    function addSphere() {
+      const { x, y, z, q } = randomSpawnTransform();
+
+      // three
+      const radius = 3;
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 20, 20), makeThreeMaterial());
+      mesh.position.set(x, y, z);
+      mesh.quaternion.copy(q);
+      mesh.castShadow = true;
+
+      // cannon
+      const body = new CANNON.Body({
+        mass: 3,
+        material: matObject
+      });
+      body.addShape(new CANNON.Sphere(radius));
+      body.position.set(x, y, z);
+      body.quaternion.set(q.x, q.y, q.z, q.w);
+
+      // スリープで計算軽量化
+      body.allowSleep = true;
+      body.sleepTimeLimit = 0.5;
+      body.sleepSpeedLimit = 0.2;
+
+      addBodyMeshPair({ threeMesh: mesh, body });
+    }
+
+    function addBox() {
+      const { x, y, z, q } = randomSpawnTransform();
+
+      // three: BoxGeometry(4,2,6)
+      const sx = 2, sy = 1, sz = 3; // half-size
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(sx * 2, sy * 2, sz * 2), makeThreeMaterial());
+      mesh.position.set(x, y, z);
+      mesh.quaternion.copy(q);
+      mesh.castShadow = true;
+
+      // cannon
+      const body = new CANNON.Body({ mass: 5, material: matObject });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(sx, sy, sz)));
+      body.position.set(x, y, z);
+      body.quaternion.set(q.x, q.y, q.z, q.w);
+
+      body.allowSleep = true;
+      body.sleepTimeLimit = 0.5;
+      body.sleepSpeedLimit = 0.2;
+
+      addBodyMeshPair({ threeMesh: mesh, body });
+    }
+
+    function addCylinder() {
+      const { x, y, z, q } = randomSpawnTransform();
+
+      const radius = 2;
+      const height = 6;
+      const segments = 16;
+
+      // three
+      const mesh = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, height, segments), makeThreeMaterial());
+      mesh.position.set(x, y, z);
+      mesh.quaternion.copy(q);
+      mesh.castShadow = true;
+
+      // cannon
+      const shape = new CANNON.Cylinder(radius, radius, height, segments);
+      const body = new CANNON.Body({ mass: 4, material: matObject });
+      body.addShape(shape);
+      body.position.set(x, y, z);
+      body.quaternion.set(q.x, q.y, q.z, q.w);
+
+      body.allowSleep = true;
+      body.sleepTimeLimit = 0.5;
+      body.sleepSpeedLimit = 0.2;
+
+      addBodyMeshPair({ threeMesh: mesh, body });
+    }
+
+    function addCone() {
+      const { x, y, z, q } = randomSpawnTransform();
+
+      const radius = 3;
+      const height = 7;
+      const segments = 20;
+
+      // three: Physijs版は ConeMesh に CylinderGeometry(0,3,7,...) を入れていた
+      const mesh = new THREE.Mesh(new THREE.ConeGeometry(radius, height, segments), makeThreeMaterial());
+      mesh.position.set(x, y, z);
+      mesh.quaternion.copy(q);
+      mesh.castShadow = true;
+
+      // cannon: “円錐”は Cylinder(top=0,bottom=radius) で近似
+      const shape = new CANNON.Cylinder(0.001, radius, height, segments);
+      const body = new CANNON.Body({ mass: 4, material: matObject });
+      body.addShape(shape);
+      body.position.set(x, y, z);
+      body.quaternion.set(q.x, q.y, q.z, q.w);
+
+      body.allowSleep = true;
+      body.sleepTimeLimit = 0.5;
+      body.sleepSpeedLimit = 0.2;
+
+      addBodyMeshPair({ threeMesh: mesh, body });
+    }
+
+    function addPlane() {
+      // Physijsの PlaneMesh は “有限の板” を落とす用途だったので、
+      // cannon-es では “薄いBox” として再現する（Plane shape は無限平面で用途が違う）
+      const { x, y, z, q } = randomSpawnTransform();
+
+      const w = 5, d = 5, t = 0.2;
+      const sx = w / 2, sy = t / 2, sz = d / 2;
+
+      // three
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, t, d), makeThreeMaterial());
+      mesh.position.set(x, y, z);
+      mesh.quaternion.copy(q);
+      mesh.castShadow = true;
+
+      // cannon
+      const body = new CANNON.Body({ mass: 2, material: matObject });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(sx, sy, sz)));
+      body.position.set(x, y, z);
+      body.quaternion.set(q.x, q.y, q.z, q.w);
+
+      body.allowSleep = true;
+      body.sleepTimeLimit = 0.5;
+      body.sleepSpeedLimit = 0.2;
+
+      addBodyMeshPair({ threeMesh: mesh, body });
+    }
+
+    function addCapsule() {
+      // Physijs版は THREE.Geometry を merge して CapsuleMesh を作っていた。
+      // cannon-es では “複合形状(Compound)” で再現するのが定石：
+      // - 中央: Cylinder
+      // - 上下: Sphere
+      const { x, y, z, q } = randomSpawnTransform();
+
+      const radius = 2;
+      const cylHeight = 6; // 中央円柱の高さ
+      const segments = 16;
+
+      // three: 表示は CapsuleGeometry があれば使い、なければ group で代用
+      let mesh;
+      if (THREE.CapsuleGeometry) {
+        mesh = new THREE.Mesh(new THREE.CapsuleGeometry(radius, cylHeight, segments, segments), makeThreeMaterial());
+      } else {
+        // 古い環境向けフォールバック（簡易）
+        const g = new THREE.Group();
+        const mat = makeThreeMaterial();
+        const cyl = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, cylHeight, segments), mat);
+        const top = new THREE.Mesh(new THREE.SphereGeometry(radius, segments, segments), mat);
+        const bot = new THREE.Mesh(new THREE.SphereGeometry(radius, segments, segments), mat);
+        top.position.y = cylHeight / 2;
+        bot.position.y = -cylHeight / 2;
+        g.add(cyl, top, bot);
+        mesh = g;
+      }
+      mesh.position.set(x, y, z);
+      mesh.quaternion.copy(q);
+      mesh.castShadow = true;
+
+      // cannon: compound body
+      const body = new CANNON.Body({ mass: 5, material: matObject });
+
+      const cylShape = new CANNON.Cylinder(radius, radius, cylHeight, segments);
+      const sphShape = new CANNON.Sphere(radius);
+
+      // cylinder は Z軸方向に伸びる扱いのことがあるので、向き補正
+      // cannon-es Cylinder は “Y軸方向に高さ” で合っているが、環境差で補正したい時は quaternion を噛ませる。
+      body.addShape(cylShape, new CANNON.Vec3(0, 0, 0));
+      body.addShape(sphShape, new CANNON.Vec3(0, cylHeight / 2, 0));
+      body.addShape(sphShape, new CANNON.Vec3(0, -cylHeight / 2, 0));
+
+      body.position.set(x, y, z);
+      body.quaternion.set(q.x, q.y, q.z, q.w);
+
+      body.allowSleep = true;
+      body.sleepTimeLimit = 0.5;
+      body.sleepSpeedLimit = 0.2;
+
+      addBodyMeshPair({ threeMesh: mesh, body });
+    }
+
+    // three.js の BufferGeometry(凸包) -> cannon-es ConvexPolyhedron へ変換
+    function convexGeometryToCannon(geometry) {
+      // ConvexGeometry は BufferGeometry（indexが無い場合もある）
+      const pos = geometry.getAttribute("position");
+      const index = geometry.index ? geometry.index.array : null;
+
+      // 頂点重複をざっくり統合（近い点を同一視）
+      const keyOf = (x, y, z) => `${x.toFixed(5)},${y.toFixed(5)},${z.toFixed(5)}`;
+
+      const vertMap = new Map();  // key -> newIndex
+      const verts = [];           // CANNON.Vec3[]
+      const remap = [];           // originalVertexIndex -> newIndex
+
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const y = pos.getY(i);
+        const z = pos.getZ(i);
+        const k = keyOf(x, y, z);
+        if (!vertMap.has(k)) {
+          vertMap.set(k, verts.length);
+          verts.push(new CANNON.Vec3(x, y, z));
+        }
+        remap[i] = vertMap.get(k);
+      }
+
+      const faces = [];
+      if (index) {
+        for (let i = 0; i < index.length; i += 3) {
+          const a = remap[index[i]];
+          const b = remap[index[i + 1]];
+          const c = remap[index[i + 2]];
+          // 同じ点だけの退化三角形は除外
+          if (a !== b && b !== c && c !== a) faces.push([a, b, c]);
+        }
+      } else {
+        // index無し: 3つずつ三角形とみなす
+        for (let i = 0; i < pos.count; i += 3) {
+          const a = remap[i];
+          const b = remap[i + 1];
+          const c = remap[i + 2];
+          if (a !== b && b !== c && c !== a) faces.push([a, b, c]);
+        }
+      }
+
+      return new CANNON.ConvexPolyhedron({ vertices: verts, faces });
+    }
+
+    function addConvex() {
+      // Physijsの ConvexMesh は “与えたメッシュを凸包扱い” にして落とす用途。
+      // 今回は「ランダム点群→ConvexGeometry→ConvexPolyhedron」で凸包を作る。
+      const { x, y, z, q } = randomSpawnTransform();
+
+      // 30点のランダム点群（元コードの createShape に近い）
+      const points = [];
+      for (let i = 0; i < 30; i++) {
+        const rx = -5 + Math.round(Math.random() * 10);
+        const ry = -5 + Math.round(Math.random() * 10);
+        const rz = -5 + Math.round(Math.random() * 10);
+        points.push(new THREE.Vector3(rx, ry, rz));
+      }
+
+      // three: 凸包ジオメトリ（表示用）
+      const geom = new ConvexGeometry(points);
+      const mesh = new THREE.Mesh(geom, makeThreeMaterial());
+      mesh.position.set(x, y, z);
+      mesh.quaternion.copy(q);
+      mesh.castShadow = true;
+
+      // cannon: ConvexPolyhedron（物理用）
+      const shape = convexGeometryToCannon(geom);
+      const body = new CANNON.Body({ mass: 6, material: matObject });
+      body.addShape(shape);
+      body.position.set(x, y, z);
+      body.quaternion.set(q.x, q.y, q.z, q.w);
+
+      body.allowSleep = true;
+      body.sleepTimeLimit = 0.5;
+      body.sleepSpeedLimit = 0.2;
+
+      addBodyMeshPair({ threeMesh: mesh, body });
+    }
+
+    // -----------------------------
+    // clearMeshes（Physijs版の clearMeshes 相当）
+    // -----------------------------
+    function clearMeshes() {
+      // 追加した動的物体だけ消す（terrainは消さない）
+      for (const s of spawned) {
+        scene.remove(s.mesh);
+
+        // メモリ解放（BufferGeometry/Material）
+        // mesh が Group の場合（capsuleフォールバック）もあるので分岐
+        if (s.mesh.isMesh) {
+          if (s.mesh.geometry) s.mesh.geometry.dispose();
+          if (s.mesh.material) s.mesh.material.dispose();
+        } else if (s.mesh.isGroup) {
+          s.mesh.traverse((obj) => {
+            if (obj.isMesh) {
+              if (obj.geometry) obj.geometry.dispose();
+              if (obj.material) obj.material.dispose();
+            }
+          });
+        }
+
+        world.removeBody(s.body);
+      }
+
+      // pairs から spawned の body を除去
+      const spawnedBodies = new Set(spawned.map(s => s.body));
+      for (let i = pairs.length - 1; i >= 0; i--) {
+        if (spawnedBodies.has(pairs[i].body)) pairs.splice(i, 1);
+      }
+
+      spawned = [];
+    }
+
+    // -----------------------------
+    // 重力 UI
+    // -----------------------------
+    function applyGravityFromUI() {
+      syncGravityLabels();
+      world.gravity.set(Number(gx.value), Number(gy.value), Number(gz.value));
+    }
+    gx.addEventListener("input", applyGravityFromUI);
+    gy.addEventListener("input", applyGravityFromUI);
+    gz.addEventListener("input", applyGravityFromUI);
+
+    // -----------------------------
+    // ボタン紐付け
+    // -----------------------------
+    btnAddSphere.addEventListener("click", addSphere);
+    btnAddBox.addEventListener("click", addBox);
+    btnAddCylinder.addEventListener("click", addCylinder);
+    btnAddCone.addEventListener("click", addCone);
+    btnAddCapsule.addEventListener("click", addCapsule);
+    btnAddPlane.addEventListener("click", addPlane);
+    btnAddConvex.addEventListener("click", addConvex);
+    btnClear.addEventListener("click", clearMeshes);
+
+    btnRegen.addEventListener("click", () => {
+      // terrain再生成（地形だけ入れ替える）
+      createTerrain();
+    });
+
+    // -----------------------------
+    // 初期化
+    // -----------------------------
+    applyGravityFromUI();
+    createTerrain();
+
+    // -----------------------------
+    // アニメーション（固定刻みステップ）
+    // -----------------------------
+    let paused = false;
+    btnPause.addEventListener("click", () => {
+      paused = !paused;
+      btnPause.textContent = paused ? "resume" : "pause";
+    });
+
+    const fixedDt = 1 / 60;
+    let accumulator = 0;
+    let lastTime = performance.now();
+
+    // FPS計測（stats.js 不使用）
+    let fpsAcc = 0;
+    let fpsCount = 0;
+    let fpsLast = performance.now();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05); // スパイク抑制
+      lastTime = now;
+
+      // FPS表示（0.5秒ごとに更新）
+      fpsAcc += dt;
+      fpsCount++;
+      if (now - fpsLast >= 500) {
+        const fps = fpsCount / fpsAcc;
+        fpsEl.textContent = "FPS: " + fps.toFixed(1);
+        fpsAcc = 0;
+        fpsCount = 0;
+        fpsLast = now;
+      }
+
+      if (!paused) {
+        accumulator += dt;
+
+        // “dtが大きい時に無限に step しない” 安全弁
+        let subSteps = 0;
+        const maxSubSteps = 5;
+
+        while (accumulator >= fixedDt && subSteps < maxSubSteps) {
+          world.step(fixedDt);
+          accumulator -= fixedDt;
+          subSteps++;
+        }
+      }
+
+      // 物理 -> 描画 同期（このループが物理連携の核心）
+      for (const p of pairs) {
+        const b = p.body;
+        p.mesh.position.set(b.position.x, b.position.y, b.position.z);
+        p.mesh.quaternion.set(b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w);
+      }
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // -----------------------------
+    // リサイズ対応
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    });
+  </script>
+</body>
+</html>
