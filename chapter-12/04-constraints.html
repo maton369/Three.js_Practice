@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Constraints Demo（three.js + cannon-es / libs不使用 / 詳細コメント）</title>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #viewport { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+
+    .hud {
+      position: fixed;
+      left: 12px;
+      top: 12px;
+      z-index: 10;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans JP", sans-serif;
+      padding: 12px;
+      border-radius: 12px;
+      min-width: 360px;
+      user-select: none;
+    }
+    .hud h1 { margin: 0 0 10px; font-size: 14px; font-weight: 700; opacity: 0.95; }
+
+    .row {
+      display: grid;
+      grid-template-columns: 130px 1fr 70px;
+      gap: 8px;
+      align-items: center;
+      margin: 6px 0;
+      font-size: 12px;
+    }
+    .row input[type="range"] { width: 100%; }
+    .val { text-align: right; font-variant-numeric: tabular-nums; opacity: 0.9; }
+
+    .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    button {
+      background: #1f6feb;
+      color: #fff;
+      border: 0;
+      padding: 8px 10px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    button.secondary { background: rgba(255,255,255,0.12); }
+    button:active { transform: translateY(1px); }
+
+    .fps { margin-top: 10px; font-size: 12px; opacity: 0.9; }
+    .hint { margin-top: 8px; font-size: 11px; opacity: 0.8; line-height: 1.35; }
+    .warn { margin-top: 8px; font-size: 11px; opacity: 0.85; color: #ffd26a; line-height: 1.35; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+  </style>
+</head>
+
+<body>
+  <div id="viewport"></div>
+
+  <div class="hud">
+    <h1>Constraints Demo（three + cannon-es）</h1>
+
+    <div class="row">
+      <div>hinge motor</div>
+      <input id="hingeEnable" type="checkbox" />
+      <div class="val" id="hingeEnableV">OFF</div>
+    </div>
+
+    <div class="row">
+      <div>hinge speed</div>
+      <input id="hingeSpeed" type="range" min="-20" max="20" step="0.1" value="-10" />
+      <div class="val" id="hingeSpeedV">-10.0</div>
+    </div>
+
+    <div class="row">
+      <div>hinge force</div>
+      <input id="hingeForce" type="range" min="0" max="80" step="0.5" value="20" />
+      <div class="val" id="hingeForceV">20.0</div>
+    </div>
+
+    <div class="row">
+      <div>slider speed</div>
+      <input id="sliderSpeed" type="range" min="-20" max="20" step="0.1" value="-10" />
+      <div class="val" id="sliderSpeedV">-10.0</div>
+    </div>
+
+    <div class="row">
+      <div>slider force</div>
+      <input id="sliderForce" type="range" min="0" max="120" step="1" value="35" />
+      <div class="val" id="sliderForceV">35.0</div>
+    </div>
+
+    <div class="row">
+      <div>cone motor</div>
+      <input id="coneEnable" type="checkbox" />
+      <div class="val" id="coneEnableV">OFF</div>
+    </div>
+
+    <div class="row">
+      <div>target X</div>
+      <input id="tx" type="range" min="-1.57" max="1.57" step="0.01" value="0" />
+      <div class="val" id="txV">0.00</div>
+    </div>
+    <div class="row">
+      <div>target Y</div>
+      <input id="ty" type="range" min="-1.57" max="1.57" step="0.01" value="0" />
+      <div class="val" id="tyV">0.00</div>
+    </div>
+    <div class="row">
+      <div>target Z</div>
+      <input id="tz" type="range" min="-1.57" max="1.57" step="0.01" value="0" />
+      <div class="val" id="tzV">0.00</div>
+    </div>
+
+    <div class="btns">
+      <button id="sliderLeft">sliderLeft</button>
+      <button id="sliderRight">sliderRight</button>
+      <button id="spawnSpheres" class="secondary">addSpheres</button>
+      <button id="clearSpawned" class="secondary">clearMeshes</button>
+      <button id="pause" class="secondary">pause</button>
+    </div>
+
+    <div class="fps" id="fps">FPS: --</div>
+
+    <div class="hint">
+      ・hinge motor：左右フリッパーを回す（右は符号を反転）<br/>
+      ・sliderLeft/Right：上下スライダーを左右（X方向）に直線駆動（KINEMATICで代替）<br/>
+      ・cone motor：目標Euler(X/Y/Z)→Quaternionに変換して姿勢を誘導<br/>
+      ・addSpheres：球を落として制約の動きが見やすくなる
+    </div>
+
+    <div class="warn">
+      ※ cannon-es には Physijs の SliderConstraint 相当（Prismatic/Slider）が標準で無い。<br/>
+      そのため本デモでは「スライダー=KINEMATICボディをレール上に速度移動」方式で代替している。
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import * as CANNON from "https://esm.sh/cannon-es@0.20.0";
+
+    // ============================================================
+    // 0) DOM（UI）
+    // ============================================================
+    const viewport = document.getElementById("viewport");
+
+    const hingeEnable   = document.getElementById("hingeEnable");
+    const hingeEnableV  = document.getElementById("hingeEnableV");
+    const hingeSpeed    = document.getElementById("hingeSpeed");
+    const hingeSpeedV   = document.getElementById("hingeSpeedV");
+    const hingeForce    = document.getElementById("hingeForce");
+    const hingeForceV   = document.getElementById("hingeForceV");
+
+    const sliderSpeed   = document.getElementById("sliderSpeed");
+    const sliderSpeedV  = document.getElementById("sliderSpeedV");
+    const sliderForce   = document.getElementById("sliderForce");
+    const sliderForceV  = document.getElementById("sliderForceV");
+
+    const coneEnable    = document.getElementById("coneEnable");
+    const coneEnableV   = document.getElementById("coneEnableV");
+    const tx = document.getElementById("tx");
+    const ty = document.getElementById("ty");
+    const tz = document.getElementById("tz");
+    const txV = document.getElementById("txV");
+    const tyV = document.getElementById("tyV");
+    const tzV = document.getElementById("tzV");
+
+    const btnSliderLeft  = document.getElementById("sliderLeft");
+    const btnSliderRight = document.getElementById("sliderRight");
+    const btnSpawnSpheres = document.getElementById("spawnSpheres");
+    const btnClearSpawned = document.getElementById("clearSpawned");
+    const btnPause = document.getElementById("pause");
+
+    const fpsEl = document.getElementById("fps");
+
+    function syncLabels() {
+      hingeEnableV.textContent = hingeEnable.checked ? "ON" : "OFF";
+      hingeSpeedV.textContent = Number(hingeSpeed.value).toFixed(1);
+      hingeForceV.textContent = Number(hingeForce.value).toFixed(1);
+
+      sliderSpeedV.textContent = Number(sliderSpeed.value).toFixed(1);
+      sliderForceV.textContent = Number(sliderForce.value).toFixed(1);
+
+      coneEnableV.textContent = coneEnable.checked ? "ON" : "OFF";
+      txV.textContent = Number(tx.value).toFixed(2);
+      tyV.textContent = Number(ty.value).toFixed(2);
+      tzV.textContent = Number(tz.value).toFixed(2);
+    }
+    syncLabels();
+
+    // ============================================================
+    // 1) three.js（描画）
+    // ============================================================
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(0x000000, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = true;
+
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    viewport.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 1, 1000);
+    camera.position.set(85, 65, 65);
+    camera.lookAt(0, 0, 0);
+
+    scene.add(new THREE.AmbientLight(0x222222));
+
+    const light = new THREE.SpotLight(0xffffff, 1.2);
+    light.position.set(20, 50, 50);
+    light.castShadow = true;
+    light.decay = 0;     // ユーザー方針：decay=0
+    light.distance = 0;
+    light.shadow.mapSize.set(2048, 2048);
+    light.shadow.camera.near = 10;
+    light.shadow.camera.far  = 120;
+    light.target.position.set(0, 0, 0);
+    scene.add(light);
+    scene.add(light.target);
+
+    // ============================================================
+    // 2) cannon-es（物理）
+    // ============================================================
+    const world = new CANNON.World({
+      gravity: new CANNON.Vec3(0, -10, 0)
+    });
+    world.broadphase = new CANNON.SAPBroadphase(world);
+    world.allowSleep = true;
+
+    const matGround = new CANNON.Material("ground");
+    const matObject = new CANNON.Material("object");
+
+    world.addContactMaterial(new CANNON.ContactMaterial(matGround, matObject, {
+      friction: 0.9,
+      restitution: 0.2
+    }));
+
+    world.defaultContactMaterial.friction = 0.3;
+    world.defaultContactMaterial.restitution = 0.0;
+
+    // ============================================================
+    // 3) 物理→描画同期（pairs）
+    // ============================================================
+    const pairs = [];
+    const spawned = [];
+
+    function link(mesh, body) {
+      pairs.push({ mesh, body });
+      return { mesh, body };
+    }
+
+    // ============================================================
+    // 4) world→local 変換（Constraint用）
+    // ============================================================
+    function worldPointToLocal(body, worldPoint) {
+      const p = worldPoint.vsub(body.position);
+      const inv = body.quaternion.inverse();
+      return inv.vmult(p);
+    }
+
+    // ============================================================
+    // 5) 色（chroma代替）
+    // ============================================================
+    const palette = [0xffffff, 0x4d79ff, 0xff5555, 0xffdd55];
+    function randomPaletteColor() {
+      return new THREE.Color(palette[(Math.random() * palette.length) | 0]);
+    }
+
+    // ============================================================
+    // 6) 生成ヘルパ
+    // ============================================================
+    function addStaticBox({ sizeX, sizeY, sizeZ, x, y, z, threeMat }) {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(sizeX, sizeY, sizeZ), threeMat);
+      mesh.position.set(x, y, z);
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+
+      const body = new CANNON.Body({ mass: 0, material: matGround });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(sizeX / 2, sizeY / 2, sizeZ / 2)));
+      body.position.set(x, y, z);
+      world.addBody(body);
+
+      return link(mesh, body);
+    }
+
+    function addDynamicBox({ sizeX, sizeY, sizeZ, x, y, z, threeMat, mass }) {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(sizeX, sizeY, sizeZ), threeMat);
+      mesh.position.set(x, y, z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+
+      const body = new CANNON.Body({ mass, material: matObject });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(sizeX / 2, sizeY / 2, sizeZ / 2)));
+      body.position.set(x, y, z);
+
+      body.allowSleep = true;
+      body.sleepSpeedLimit = 0.2;
+      body.sleepTimeLimit  = 0.5;
+
+      world.addBody(body);
+      return link(mesh, body);
+    }
+
+    function addDynamicSphere({ r, x, y, z, threeMat, mass }) {
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 20), threeMat);
+      mesh.position.set(x, y, z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+
+      const body = new CANNON.Body({ mass, material: matObject });
+      body.addShape(new CANNON.Sphere(r));
+      body.position.set(x, y, z);
+      body.allowSleep = true;
+      world.addBody(body);
+
+      const pair = link(mesh, body);
+      spawned.push(pair);
+      return pair;
+    }
+
+    // ============================================================
+    // 7) Ground
+    // ============================================================
+    const texLoader = new THREE.TextureLoader();
+    const groundTex = texLoader.load(
+      "../assets/textures/general/floor-wood.jpg",
+      () => {
+        if ("colorSpace" in groundTex) groundTex.colorSpace = THREE.SRGBColorSpace;
+        groundTex.wrapS = groundTex.wrapT = THREE.RepeatWrapping;
+        groundTex.repeat.set(4, 4);
+      },
+      undefined,
+      () => {}
+    );
+    const groundMat3 = new THREE.MeshPhongMaterial({ color: 0xffffff, map: groundTex });
+
+    addStaticBox({ sizeX: 60, sizeY: 1, sizeZ: 65, x: 0, y: 0, z: 0, threeMat: groundMat3 });
+
+    addStaticBox({ sizeX: 2,  sizeY: 6, sizeZ: 65, x: -31, y: 2,   z: 0,  threeMat: groundMat3 });
+    addStaticBox({ sizeX: 2,  sizeY: 6, sizeZ: 65, x:  31, y: 2,   z: 0,  threeMat: groundMat3 });
+    addStaticBox({ sizeX: 64, sizeY: 6, sizeZ: 2,  x:  0,  y: 1.5, z: 32, threeMat: groundMat3 });
+    addStaticBox({ sizeX: 64, sizeY: 6, sizeZ: 2,  x:  0,  y: 2,   z: -32,threeMat: groundMat3 });
+
+    // ============================================================
+    // 8) Hinge（左右フリッパー）+ ソフト制限
+    // ============================================================
+    const hingeLimitMin = -2.2;
+    const hingeLimitMax = -0.6;
+
+    const tmpV = new CANNON.Vec3();
+    const tmpRef = new CANNON.Vec3(1, 0, 0);
+    const tmpCross = new CANNON.Vec3();
+
+    function signedAngleAroundAxis(body, axisWorld) {
+      body.quaternion.vmult(tmpRef, tmpV);
+      tmpRef.cross(tmpV, tmpCross);
+      const y = axisWorld.dot(tmpCross);
+      const x = tmpRef.dot(tmpV);
+      return Math.atan2(y, x);
+    }
+
+    function applyHingeSoftLimit(hingeConstraint, bodyA, axisWorld, min, max, maxForce) {
+      const angle = signedAngleAroundAxis(bodyA, axisWorld);
+      if (angle >= min && angle <= max) return;
+
+      const error = (angle < min) ? (min - angle) : (max - angle);
+
+      const k = 8.0;
+      let speed = k * error;
+      speed = Math.max(Math.min(speed, 12), -12);
+
+      hingeConstraint.enableMotor();
+      hingeConstraint.setMotorSpeed(speed);
+      hingeConstraint.setMotorMaxForce(maxForce);
+
+      bodyA.angularVelocity.scale(0.95, bodyA.angularVelocity);
+    }
+
+    function createLeftFlipper() {
+      const flipper = addDynamicBox({
+        sizeX: 12, sizeY: 2, sizeZ: 2,
+        x: -6, y: 2, z: 0,
+        threeMat: new THREE.MeshPhongMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 }),
+        mass: 0.3
+      });
+
+      const pivotWorld = new CANNON.Vec3(-15, 1, 0);
+
+      const pivotMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(1, 1, 1),
+        new THREE.MeshPhongMaterial({ color: 0x888888 })
+      );
+      pivotMesh.position.set(pivotWorld.x, pivotWorld.y, pivotWorld.z);
+      pivotMesh.castShadow = true;
+      scene.add(pivotMesh);
+
+      const pivotBody = new CANNON.Body({ mass: 0, material: matGround });
+      pivotBody.addShape(new CANNON.Sphere(0.5));
+      pivotBody.position.copy(pivotWorld);
+      world.addBody(pivotBody);
+      link(pivotMesh, pivotBody);
+
+      const c = new CANNON.HingeConstraint(flipper.body, pivotBody, {
+        pivotA: worldPointToLocal(flipper.body, pivotWorld),
+        pivotB: worldPointToLocal(pivotBody,  pivotWorld),
+        axisA: new CANNON.Vec3(0, 1, 0),
+        axisB: new CANNON.Vec3(0, 1, 0)
+      });
+
+      world.addConstraint(c);
+      return { constraint: c, bodyA: flipper.body, axisWorld: new CANNON.Vec3(0, 1, 0) };
+    }
+
+    function createRightFlipper() {
+      const flipper = addDynamicBox({
+        sizeX: 12, sizeY: 2, sizeZ: 2,
+        x: 8, y: 2, z: 0,
+        threeMat: new THREE.MeshPhongMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 }),
+        mass: 0.3
+      });
+
+      const pivotWorld = new CANNON.Vec3(15, 2, 0);
+
+      const pivotMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(1, 1, 1),
+        new THREE.MeshPhongMaterial({ color: 0x888888 })
+      );
+      pivotMesh.position.set(pivotWorld.x, pivotWorld.y, pivotWorld.z);
+      pivotMesh.castShadow = true;
+      scene.add(pivotMesh);
+
+      const pivotBody = new CANNON.Body({ mass: 0, material: matGround });
+      pivotBody.addShape(new CANNON.Sphere(0.5));
+      pivotBody.position.copy(pivotWorld);
+      world.addBody(pivotBody);
+      link(pivotMesh, pivotBody);
+
+      const c = new CANNON.HingeConstraint(flipper.body, pivotBody, {
+        pivotA: worldPointToLocal(flipper.body, pivotWorld),
+        pivotB: worldPointToLocal(pivotBody,  pivotWorld),
+        axisA: new CANNON.Vec3(0, 1, 0),
+        axisB: new CANNON.Vec3(0, 1, 0)
+      });
+
+      world.addConstraint(c);
+      return { constraint: c, bodyA: flipper.body, axisWorld: new CANNON.Vec3(0, 1, 0) };
+    }
+
+    // ============================================================
+    // 9) Slider代替：KINEMATICボディをレール上に動かす
+    // ============================================================
+    // 重要ポイント：
+    // - cannon-es は Prismatic/Slider のような直動ジョイントを標準提供しない
+    // - 代替として sliderBody を KINEMATIC にし、velocity で横移動させる
+    // - KINEMATIC は「自分の速度で動くが、力で押されても動かない」ので、動く床/押し板に向く
+    // - レールから逸れないように、毎ステップで y,z と回転を強制固定する（安定化）
+    function createKinematicSlider({ sizeX, sizeY, sizeZ, x, y, z, limitMin, limitMax, opacity }) {
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(sizeX, sizeY, sizeZ),
+        new THREE.MeshPhongMaterial({ color: 0x44ff44, transparent: true, opacity })
+      );
+      mesh.position.set(x, y, z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+
+      const body = new CANNON.Body({ mass: 0, material: matObject });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(sizeX / 2, sizeY / 2, sizeZ / 2)));
+      body.position.set(x, y, z);
+
+      // KINEMATIC指定（ここが肝）
+      body.type = CANNON.Body.KINEMATIC;
+      body.updateMassProperties();
+
+      // 回転は固定したい（「横にスライドするだけ」にしたい）ので、慣性/角速度を抑える
+      body.angularVelocity.set(0, 0, 0);
+
+      world.addBody(body);
+      link(mesh, body);
+
+      // レール基準（初期位置）を保存して、範囲 clamp を baseX + [min,max] で行う
+      return {
+        body,
+        baseX: x,
+        railY: y,
+        railZ: z,
+        limitMin,
+        limitMax,
+        // スライダーを動かす“命令速度”（UIからセット）
+        targetVx: 0
+      };
+    }
+
+    // 毎ステップ呼び出し：スライダーをレールに拘束しつつ、範囲外なら止める
+    function stepKinematicSlider(sl) {
+      // 速度を入れる（KINEMATICは world.step が position を進める）
+      sl.body.velocity.set(sl.targetVx, 0, 0);
+
+      // レール固定（y,z と回転を“強制的に”戻す）
+      sl.body.position.y = sl.railY;
+      sl.body.position.z = sl.railZ;
+      sl.body.quaternion.set(0, 0, 0, 1);
+      sl.body.angularVelocity.set(0, 0, 0);
+
+      // 範囲 clamp（baseX からの相対で制限）
+      const minX = sl.baseX + sl.limitMin;
+      const maxX = sl.baseX + sl.limitMax;
+
+      if (sl.body.position.x < minX) {
+        sl.body.position.x = minX;
+        sl.targetVx = 0;
+        sl.body.velocity.x = 0;
+      }
+      if (sl.body.position.x > maxX) {
+        sl.body.position.x = maxX;
+        sl.targetVx = 0;
+        sl.body.velocity.x = 0;
+      }
+    }
+
+    // ============================================================
+    // 10) ConeTwist / PointToPoint
+    // ============================================================
+    function createConeTwist() {
+      const baseMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(1, 16, 16),
+        new THREE.MeshPhongMaterial({ color: 0x4444ff, transparent: true, opacity: 0.7 })
+      );
+      baseMesh.position.set(20, 15.5, 0);
+      baseMesh.castShadow = true;
+      scene.add(baseMesh);
+
+      const baseBody = new CANNON.Body({ mass: 0, material: matGround });
+      baseBody.addShape(new CANNON.Sphere(1));
+      baseBody.position.set(20, 15.5, 0);
+      world.addBody(baseBody);
+      link(baseMesh, baseBody);
+
+      const arm = addDynamicBox({
+        sizeX: 2, sizeY: 12, sizeZ: 3,
+        x: 20, y: 7.5, z: 0,
+        threeMat: new THREE.MeshPhongMaterial({ color: 0x4444ff, transparent: true, opacity: 0.7 }),
+        mass: 10
+      });
+
+      const pivotWorld = baseBody.position.clone();
+
+      const c = new CANNON.ConeTwistConstraint(baseBody, arm.body, {
+        pivotA: worldPointToLocal(baseBody, pivotWorld),
+        pivotB: worldPointToLocal(arm.body,  pivotWorld),
+        axisA: new CANNON.Vec3(0, -1, 0),
+        axisB: new CANNON.Vec3(0,  1, 0)
+      });
+
+      if (typeof c.setLimits === "function") c.setLimits(0.5 * Math.PI, 0.5 * Math.PI, 0.5 * Math.PI);
+      if ("motorMaxForce" in c) c.motorMaxForce = 1;
+
+      world.addConstraint(c);
+      return c;
+    }
+
+    function createPointToPoint() {
+      const a = addDynamicSphere({
+        r: 2,
+        x: -10, y: 2, z: -18,
+        threeMat: new THREE.MeshPhongMaterial({ color: 0xff4444, transparent: true, opacity: 0.7 }),
+        mass: 1
+      });
+      const b = addDynamicSphere({
+        r: 2,
+        x: -20, y: 2, z: -5,
+        threeMat: new THREE.MeshPhongMaterial({ color: 0xff4444, transparent: true, opacity: 0.7 }),
+        mass: 1
+      });
+
+      const c = new CANNON.PointToPointConstraint(
+        a.body, new CANNON.Vec3(0, 0, 0),
+        b.body, new CANNON.Vec3(0, 0, 0)
+      );
+      world.addConstraint(c);
+      return c;
+    }
+
+    // ============================================================
+    // 11) 生成（Constraints）
+    // ============================================================
+    const leftHingeInfo  = createLeftFlipper();
+    const rightHingeInfo = createRightFlipper();
+
+    // スライダーは「ジョイント」ではなく「KINEMATIC押し板」として作る
+    const sliderBottomInfo = createKinematicSlider({
+      sizeX: 12, sizeY: 2, sizeZ: 2,
+      x: 6, y: 1.5, z: 20,
+      limitMin: -10,
+      limitMax:  10,
+      opacity: 0.6
+    });
+
+    const sliderTopInfo = createKinematicSlider({
+      sizeX: 7, sizeY: 2, sizeZ: 7,
+      x: -20, y: 1.5, z: -15,
+      limitMin: -20,
+      limitMax:  10,
+      opacity: 0.5
+    });
+
+    const coneTwistConstraint = createConeTwist();
+    createPointToPoint();
+
+    // ============================================================
+    // 12) UI → モーター制御
+    // ============================================================
+    function updateHingeMotor() {
+      syncLabels();
+
+      const enabled = hingeEnable.checked;
+      const speed = Number(hingeSpeed.value);
+      const force = Number(hingeForce.value);
+
+      if (enabled) {
+        leftHingeInfo.constraint.enableMotor();
+        leftHingeInfo.constraint.setMotorSpeed(speed);
+        leftHingeInfo.constraint.setMotorMaxForce(force);
+
+        rightHingeInfo.constraint.enableMotor();
+        rightHingeInfo.constraint.setMotorSpeed(-speed);
+        rightHingeInfo.constraint.setMotorMaxForce(force);
+      } else {
+        leftHingeInfo.constraint.disableMotor();
+        rightHingeInfo.constraint.disableMotor();
+      }
+    }
+
+    // 直動“モーター”代替：targetVx を設定しておき、毎ステップで velocity に反映する
+    function sliderLeft() {
+      syncLabels();
+      const speed = Number(sliderSpeed.value);
+      sliderBottomInfo.targetVx = speed;
+      sliderTopInfo.targetVx = speed;
+    }
+
+    function sliderRight() {
+      syncLabels();
+      const speed = Number(sliderSpeed.value);
+      sliderBottomInfo.targetVx = -speed;
+      sliderTopInfo.targetVx = -speed;
+    }
+
+    function updateConeMotor() {
+      syncLabels();
+
+      const enabled = coneEnable.checked;
+
+      const ex = Number(tx.value);
+      const ey = Number(ty.value);
+      const ez = Number(tz.value);
+
+      const q3 = new THREE.Quaternion().setFromEuler(new THREE.Euler(ex, ey, ez, "XYZ"));
+      const qc = new CANNON.Quaternion(q3.x, q3.y, q3.z, q3.w);
+
+      if (enabled) {
+        try { coneTwistConstraint.enableMotor(); } catch (_) {}
+        try { coneTwistConstraint.setMotorTarget(qc); }
+        catch (_) {
+          try { coneTwistConstraint.motorTarget = qc; } catch (_) {}
+        }
+      } else {
+        try { coneTwistConstraint.disableMotor(); } catch (_) {}
+      }
+    }
+
+    hingeEnable.addEventListener("change", updateHingeMotor);
+    hingeSpeed.addEventListener("input", updateHingeMotor);
+    hingeForce.addEventListener("input", updateHingeMotor);
+
+    sliderSpeed.addEventListener("input", syncLabels);
+    sliderForce.addEventListener("input", syncLabels);
+    btnSliderLeft.addEventListener("click", sliderLeft);
+    btnSliderRight.addEventListener("click", sliderRight);
+
+    coneEnable.addEventListener("change", updateConeMotor);
+    tx.addEventListener("input", updateConeMotor);
+    ty.addEventListener("input", updateConeMotor);
+    tz.addEventListener("input", updateConeMotor);
+
+    btnSpawnSpheres.addEventListener("click", () => {
+      const color = randomPaletteColor();
+      for (let i = 0; i < 5; i++) {
+        addDynamicSphere({
+          r: 2,
+          x: Math.random() * 50 - 25,
+          y: 20 + Math.random() * 5,
+          z: Math.random() * 5,
+          threeMat: new THREE.MeshPhongMaterial({ color, transparent: true, opacity: 0.8 }),
+          mass: 0.1
+        });
+      }
+    });
+
+    btnClearSpawned.addEventListener("click", () => {
+      for (const p of spawned) {
+        scene.remove(p.mesh);
+        if (p.mesh.geometry) p.mesh.geometry.dispose();
+        if (p.mesh.material) p.mesh.material.dispose();
+      }
+      for (const p of spawned) world.removeBody(p.body);
+
+      const spawnedBodies = new Set(spawned.map(s => s.body));
+      for (let i = pairs.length - 1; i >= 0; i--) {
+        if (spawnedBodies.has(pairs[i].body)) pairs.splice(i, 1);
+      }
+      spawned.length = 0;
+    });
+
+    updateHingeMotor();
+    updateConeMotor();
+
+    // ============================================================
+    // 13) アニメーション
+    // ============================================================
+    let paused = false;
+    btnPause.addEventListener("click", () => {
+      paused = !paused;
+      btnPause.textContent = paused ? "resume" : "pause";
+    });
+
+    const fixedDt = 1 / 60;
+    let accumulator = 0;
+    let lastTime = performance.now();
+
+    let fpsAcc = 0;
+    let fpsCount = 0;
+    let fpsLast = performance.now();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+
+      fpsAcc += dt;
+      fpsCount++;
+      if (now - fpsLast >= 500) {
+        fpsEl.textContent = "FPS: " + (fpsCount / fpsAcc).toFixed(1);
+        fpsAcc = 0;
+        fpsCount = 0;
+        fpsLast = now;
+      }
+
+      if (!paused) {
+        accumulator += dt;
+
+        let subSteps = 0;
+        const maxSubSteps = 6;
+
+        while (accumulator >= fixedDt && subSteps < maxSubSteps) {
+          // 先に「KINEMATICスライダー」をレール更新（velocity/固定/クランプ）
+          // これにより world.step の中で正しく移動＆衝突処理される
+          stepKinematicSlider(sliderBottomInfo);
+          stepKinematicSlider(sliderTopInfo);
+
+          world.step(fixedDt);
+
+          // ヒンジ角ソフト制限（setLimits代替）
+          const maxForce = Number(hingeForce.value) || 20;
+
+          applyHingeSoftLimit(
+            leftHingeInfo.constraint,
+            leftHingeInfo.bodyA,
+            leftHingeInfo.axisWorld,
+            hingeLimitMin,
+            hingeLimitMax,
+            maxForce
+          );
+          applyHingeSoftLimit(
+            rightHingeInfo.constraint,
+            rightHingeInfo.bodyA,
+            rightHingeInfo.axisWorld,
+            hingeLimitMin,
+            hingeLimitMax,
+            maxForce
+          );
+
+          accumulator -= fixedDt;
+          subSteps++;
+        }
+      }
+
+      // 物理→描画同期
+      for (const p of pairs) {
+        const b = p.body;
+        p.mesh.position.set(b.position.x, b.position.y, b.position.z);
+        p.mesh.quaternion.set(b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w);
+      }
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ============================================================
+    // 14) リサイズ対応
+    // ============================================================
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    });
+  </script>
+</body>
+</html>
