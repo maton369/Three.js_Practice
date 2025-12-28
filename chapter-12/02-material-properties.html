@@ -1,0 +1,719 @@
+<!--
+============================================================
+GitHub Review（全体アルゴリズム中心 / 修正方針）
+============================================================
+
+## 1. このサンプルの「アルゴリズム（本質）」は何か？
+このコードの本質は「描画（three.js）と物理（Physijs/Ammo）の二重世界を同期して動かす」点にある。
+処理は概ね次のループで構成される。
+
+(1) 初期化（init）
+  - 描画: Renderer / Scene / Camera / Light を構築
+  - 物理: World を構築し、重力・材質（摩擦/反発）を設定
+  - 静的環境: 地面・壁（境界）を作成（当たり判定の器）
+  - 動的物体: キューブ/球体を生成し、世界へ投入
+
+(2) 毎フレーム更新（animate）
+  - 地面を時間で揺らす（回転角を更新）
+  - 物理世界を一定刻みで進める（world.step(fixedDt) を複数回）
+  - 物理ボディの位置・回転を描画メッシュへ転写して同期
+  - renderer.render(scene,camera) で描画
+
+(3) UI操作（add / clear / パラメータ変更）
+  - 摩擦/反発の値を ContactMaterial に反映
+  - 動的物体を追加 or 全削除して再構築
+
+## 2. 旧コード（Physijs版）の問題点と今回の修正
+- 「../libs/* を使わない」要件により、Physijs/Ammo/Stats/dat.gui/chroma を排除する必要がある。
+- Physijs は古く、ESMとの相性やメンテ状況の観点で運用が重い。
+  → 物理エンジンを cannon-es（ES Modules）へ置き換える。
+- dat.gui/stats も libs依存だったので、素のHTML UI + 簡易FPS表示へ置換。
+- 地面＋壁が「地面の子として回転する」挙動を維持するため、
+  → cannon-es では「複合形状（compound body）」として地面ボディに壁形状を統合し、全体をキネマティックで回転させる。
+  これにより「地面が揺れると壁も一緒に傾く」元のシーン構造を忠実に再現できる。
+
+## 3. 実装上の重要ポイント（事故りやすいところ）
+- 物理は “固定刻み” で進めると安定する。
+  dtが大きいフレームで一回だけstepすると貫通/発散しやすい。
+  → accumulator を使って fixedDt で複数回 step する。
+- 地面を回転させる場合、静的ボディ（mass=0）よりキネマティックの方が扱いやすい。
+  → groundBody.type = KINEMATIC にして毎フレーム quaternion を更新。
+- 摩擦/反発は「material同士の接触」(ContactMaterial) で決まる。
+  → UIで変更したら contactMaterial を更新し、既存ボディにも material を設定して整合を保つ。
+
+============================================================
+以下：修正版コード（libsフォルダ不使用 / 詳細コメント付き）
+============================================================
+-->
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Rigid body - Physics（three.js + cannon-es / libs不使用 / 詳細コメント）</title>
+
+  <!--
+    ✅ libsフォルダ（../libs/〜）は一切使わない
+    - three.js: CDN（ES Modules）
+    - OrbitControls: three/examples/jsm を CDN から import
+    - 物理: cannon-es（ES Modules）
+    - stats.js / dat.gui / chroma: 不使用 → 素のHTML UIに置換
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #viewport { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+
+    /* dat.gui の代替：超簡易UI */
+    .hud {
+      position: fixed;
+      left: 10px;
+      top: 10px;
+      z-index: 10;
+      color: #fff;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans JP", sans-serif;
+      background: rgba(0,0,0,0.55);
+      padding: 10px 12px;
+      border-radius: 10px;
+      user-select: none;
+      min-width: 320px;
+    }
+    .hud h1 { margin: 0 0 8px; font-size: 14px; font-weight: 700; }
+    .row {
+      display: grid;
+      grid-template-columns: 110px 1fr 56px;
+      gap: 8px;
+      align-items: center;
+      margin: 6px 0;
+      font-size: 12px;
+    }
+    .row input[type="range"] { width: 100%; }
+    .row .val { text-align: right; font-variant-numeric: tabular-nums; opacity: 0.9; }
+    .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    button {
+      background: #1f6feb;
+      color: #fff;
+      border: 0;
+      padding: 8px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    button.secondary { background: #444; }
+    button:active { transform: translateY(1px); }
+    .fps { margin-top: 8px; font-size: 12px; opacity: 0.9; }
+    .note { margin-top: 6px; font-size: 11px; opacity: 0.75; line-height: 1.4; }
+    .hr { height: 1px; background: rgba(255,255,255,0.15); margin: 8px 0; }
+  </style>
+</head>
+
+<body>
+  <div id="viewport"></div>
+
+  <div class="hud">
+    <h1>Rigid Body Playground（tilting ground）</h1>
+
+    <div class="row">
+      <div>cubeFriction</div>
+      <input id="cubeF" type="range" min="0" max="1" step="0.01" value="0.4">
+      <div class="val" id="cubeFv">0.40</div>
+    </div>
+    <div class="row">
+      <div>cubeRestitution</div>
+      <input id="cubeR" type="range" min="0" max="1" step="0.01" value="0.4">
+      <div class="val" id="cubeRv">0.40</div>
+    </div>
+
+    <div class="row">
+      <div>sphereFriction</div>
+      <input id="sphF" type="range" min="0" max="1" step="0.01" value="0.1">
+      <div class="val" id="sphFv">0.10</div>
+    </div>
+    <div class="row">
+      <div>sphereRestitution</div>
+      <input id="sphR" type="range" min="0" max="1" step="0.01" value="0.9">
+      <div class="val" id="sphRv">0.90</div>
+    </div>
+
+    <div class="hr"></div>
+
+    <div class="row">
+      <div>gravityY</div>
+      <input id="gY" type="range" min="-150" max="0" step="1" value="-90">
+      <div class="val" id="gYv">-90</div>
+    </div>
+
+    <div class="btns">
+      <button id="addCubes">addCubes</button>
+      <button id="addSpheres">addSpheres</button>
+      <button id="clear" class="secondary">clearMeshes</button>
+      <button id="pause" class="secondary">pause</button>
+    </div>
+
+    <div class="fps" id="fps">FPS: --</div>
+    <div class="note">
+      地面は自動で前後に揺れる（±0.4rad）。<br/>
+      物理は固定刻みで進め、メッシュへ同期して描画する。
+    </div>
+  </div>
+
+  <script type="module">
+    /*
+      ============================================================
+      目的：Physijs版の “Rigid body” を libs不使用で再現する
+      ============================================================
+
+      ■ 置換方針
+      - 描画：three.js（ESM）
+      - 物理：cannon-es（ESM）
+      - GUI：dat.gui → 素のHTML
+      - Stats：stats.js → 簡易FPS表示
+      - chroma：ランダム色生成は自作の簡単なパレットで代替
+
+      ■ 全体アルゴリズム（重要）
+      1) 初期化
+         - three: renderer/scene/camera/light/controls
+         - cannon: world/material/contactMaterial
+         - 環境：地面＋壁を「複合形状のキネマティックボディ」として作成
+         - 動的物体：ボタンで追加（キューブ/球）
+
+      2) 毎フレーム
+         - 地面の回転角を更新（揺れる床）
+         - 物理を fixedDt で step（安定のため固定刻み）
+         - 全ボディ→全メッシュへ位置/回転を同期
+         - renderer.render
+
+      ============================================================
+    */
+
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import * as CANNON from "https://esm.sh/cannon-es@0.20.0";
+
+    // -----------------------------
+    // DOM
+    // -----------------------------
+    const viewport = document.getElementById("viewport");
+
+    const cubeF  = document.getElementById("cubeF");
+    const cubeR  = document.getElementById("cubeR");
+    const sphF   = document.getElementById("sphF");
+    const sphR   = document.getElementById("sphR");
+    const gY     = document.getElementById("gY");
+
+    const cubeFv = document.getElementById("cubeFv");
+    const cubeRv = document.getElementById("cubeRv");
+    const sphFv  = document.getElementById("sphFv");
+    const sphRv  = document.getElementById("sphRv");
+    const gYv    = document.getElementById("gYv");
+
+    const btnAddCubes  = document.getElementById("addCubes");
+    const btnAddSpheres= document.getElementById("addSpheres");
+    const btnClear     = document.getElementById("clear");
+    const btnPause     = document.getElementById("pause");
+    const fpsEl        = document.getElementById("fps");
+
+    function fmt2(x) { return Number(x).toFixed(2); }
+    function syncLabels() {
+      cubeFv.textContent = fmt2(cubeF.value);
+      cubeRv.textContent = fmt2(cubeR.value);
+      sphFv.textContent  = fmt2(sphF.value);
+      sphRv.textContent  = fmt2(sphR.value);
+      gYv.textContent    = String(gY.value);
+    }
+    syncLabels();
+
+    // -----------------------------
+    // three.js: Renderer / Scene / Camera
+    // -----------------------------
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setClearColor(0x000000, 1.0);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = true;
+
+    // 色空間（r152+）
+    if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    else if ("outputEncoding" in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+
+    viewport.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 1, 1000);
+    camera.position.set(80, 60, 80);
+    camera.lookAt(0, 0, 0);
+
+    // 操作（Physijs版にはなかったが、確認しやすいので追加）
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    // ライト
+    const ambient = new THREE.AmbientLight(0xffffff, 0.15);
+    scene.add(ambient);
+
+    const spot = new THREE.SpotLight(0xffffff, 1.0);
+    spot.position.set(20, 100, 50);
+    spot.castShadow = true;
+    spot.decay = 0;     // ✅ ユーザー方針：SpotLight の decay は 0
+    spot.distance = 0;  // 減衰無限
+    spot.angle = Math.PI * 0.25;
+    spot.penumbra = 0.25;
+    spot.shadow.mapSize.set(2048, 2048);
+    spot.shadow.camera.near = 1;
+    spot.shadow.camera.far  = 300;
+    spot.target.position.set(0, 0, 0);
+    scene.add(spot);
+    scene.add(spot.target);
+
+    // -----------------------------
+    // cannon-es: World（物理世界）
+    // -----------------------------
+    const world = new CANNON.World({
+      gravity: new CANNON.Vec3(0, Number(gY.value), 0)
+    });
+
+    // 衝突検出の高速化（ドミノのような整列物体に有効なことが多い）
+    world.broadphase = new CANNON.SAPBroadphase(world);
+    world.allowSleep = true;
+
+    // -----------------------------
+    // Material / ContactMaterial
+    // -----------------------------
+    const matGround = new CANNON.Material("ground");
+    const matCube   = new CANNON.Material("cube");
+    const matSphere = new CANNON.Material("sphere");
+
+    // ContactMaterial は「材質A×材質B」の組み合わせで摩擦/反発を定義する。
+    // UIで値が変わるので、参照を保持しておき、更新する。
+    const contactGroundCube = new CANNON.ContactMaterial(matGround, matCube, {
+      friction: Number(cubeF.value),
+      restitution: Number(cubeR.value)
+    });
+
+    const contactGroundSphere = new CANNON.ContactMaterial(matGround, matSphere, {
+      friction: Number(sphF.value),
+      restitution: Number(sphR.value)
+    });
+
+    // 動的物体同士も少し定義（デフォルトだけだと “妙に滑る/跳ねる” を感じる場合がある）
+    const contactCubeCube = new CANNON.ContactMaterial(matCube, matCube, {
+      friction: Number(cubeF.value),
+      restitution: Number(cubeR.value)
+    });
+
+    const contactSphereSphere = new CANNON.ContactMaterial(matSphere, matSphere, {
+      friction: Number(sphF.value),
+      restitution: Number(sphR.value)
+    });
+
+    const contactCubeSphere = new CANNON.ContactMaterial(matCube, matSphere, {
+      friction: (Number(cubeF.value) + Number(sphF.value)) * 0.5,
+      restitution: (Number(cubeR.value) + Number(sphR.value)) * 0.5
+    });
+
+    world.addContactMaterial(contactGroundCube);
+    world.addContactMaterial(contactGroundSphere);
+    world.addContactMaterial(contactCubeCube);
+    world.addContactMaterial(contactSphereSphere);
+    world.addContactMaterial(contactCubeSphere);
+
+    // -----------------------------
+    // 同期ペア管理（mesh <-> body）
+    // -----------------------------
+    const pairs = [];      // { mesh: THREE.Object3D, body: CANNON.Body }
+    const dynamics = [];   // 動的物体だけ（clearMeshesで消す対象）
+
+    // -----------------------------
+    // 色（chroma代替：簡単なパレット）
+    // -----------------------------
+    const palette = [
+      0xffffff, 0x66ccff, 0xff6666, 0xffdd55,
+      0x88ff88, 0xcc88ff, 0x66ffdd, 0xff88cc
+    ];
+    function randomPaletteColor() {
+      return palette[(Math.random() * palette.length) | 0];
+    }
+
+    // -----------------------------
+    // 地面＋壁：three側（見た目）と cannon側（当たり判定）を “一体化” する
+    // -----------------------------
+    // 旧Physijs版は「ground に border を add」して、地面回転に壁が追従していた。
+    // cannon-esでも同じ効果を出すために：
+    //  - three: Group を作り、その中に床meshと壁meshを入れる（まとめて回転）
+    //  - cannon: groundBody に BoxShape を複数 addShape して compound body を作る（まとめて回転）
+    const groundGroup = new THREE.Group();
+    scene.add(groundGroup);
+
+    // テクスチャ（存在しなくても動くように単色でも成立させる）
+    const texLoader = new THREE.TextureLoader();
+    const floorMat = new THREE.MeshPhongMaterial({ color: 0x888888 });
+    texLoader.load(
+      "../assets/textures/general/floor-wood.jpg",
+      (tex) => {
+        if ("colorSpace" in tex) tex.colorSpace = THREE.SRGBColorSpace;
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.repeat.set(4, 8);
+        floorMat.map = tex;
+        floorMat.needsUpdate = true;
+      },
+      undefined,
+      () => { /* 読めなくてもOK（単色床で継続） */ }
+    );
+
+    // groundの寸法（Physijs版に合わせる）
+    // - Physijs: BoxGeometry(60, 1, 130)
+    const G_W = 60;
+    const G_H = 1;
+    const G_D = 130;
+
+    // 壁の寸法（Physijs版に合わせる）
+    // - 左右: BoxGeometry(2,6,130), x=±31, y=2
+    // - 奥手前: BoxGeometry(64,6,2), z=±65, y=2
+    const WALL_H = 6;
+
+    // three: 床mesh
+    const floorMesh = new THREE.Mesh(new THREE.BoxGeometry(G_W, G_H, G_D), floorMat);
+    floorMesh.receiveShadow = true;
+    groundGroup.add(floorMesh);
+
+    // three: 壁mesh群
+    function makeWallMesh(w, h, d, x, y, z) {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), floorMat);
+      m.position.set(x, y, z);
+      m.receiveShadow = true;
+      groundGroup.add(m);
+    }
+    makeWallMesh(2, WALL_H, 130, -31, 2, 0);
+    makeWallMesh(2, WALL_H, 130,  31, 2, 0);
+    makeWallMesh(64, WALL_H, 2,   0, 2,  65);
+    makeWallMesh(64, WALL_H, 2,   0, 2, -65);
+
+    // cannon: 地面ボディ（複合形状）
+    // キネマティックにすることで「自分で動かす床」になる（物理的に押されても動かない）。
+    const groundBody = new CANNON.Body({
+      mass: 0,
+      material: matGround
+    });
+    groundBody.type = CANNON.Body.KINEMATIC;
+    groundBody.updateMassProperties();
+
+    // cannonのBoxは halfExtents（半サイズ）指定
+    // 床 shape（中心に配置）
+    groundBody.addShape(
+      new CANNON.Box(new CANNON.Vec3(G_W/2, G_H/2, G_D/2)),
+      new CANNON.Vec3(0, 0, 0)
+    );
+
+    // 壁 shape（床ボディに相対オフセットで追加）
+    groundBody.addShape(
+      new CANNON.Box(new CANNON.Vec3(1, WALL_H/2, 130/2)),
+      new CANNON.Vec3(-31, 2, 0)
+    );
+    groundBody.addShape(
+      new CANNON.Box(new CANNON.Vec3(1, WALL_H/2, 130/2)),
+      new CANNON.Vec3( 31, 2, 0)
+    );
+    groundBody.addShape(
+      new CANNON.Box(new CANNON.Vec3(64/2, WALL_H/2, 1)),
+      new CANNON.Vec3(0, 2,  65)
+    );
+    groundBody.addShape(
+      new CANNON.Box(new CANNON.Vec3(64/2, WALL_H/2, 1)),
+      new CANNON.Vec3(0, 2, -65)
+    );
+
+    world.addBody(groundBody);
+
+    // three/cannon同期（地面は “自分で動かす” ので、同期は groundGroup と groundBody を揃える形で行う）
+    pairs.push({ mesh: groundGroup, body: groundBody });
+
+    // -----------------------------
+    // 動的物体生成ヘルパ（Box / Sphere）
+    // -----------------------------
+    function addDynamicBox(size, position, rotationEuler) {
+      // three
+      const mat = new THREE.MeshPhongMaterial({
+        color: randomPaletteColor(),
+        transparent: true,
+        opacity: 0.8
+      });
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(size, size, size), mat);
+      mesh.position.copy(position);
+      mesh.rotation.set(rotationEuler.x, rotationEuler.y, rotationEuler.z);
+      mesh.castShadow = true;
+      scene.add(mesh);
+
+      // cannon
+      const body = new CANNON.Body({
+        mass: 1,
+        material: matCube
+      });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(size/2, size/2, size/2)));
+      body.position.set(position.x, position.y, position.z);
+      const q = new THREE.Quaternion().setFromEuler(rotationEuler);
+      body.quaternion.set(q.x, q.y, q.z, q.w);
+
+      body.allowSleep = true;
+      body.sleepTimeLimit = 0.5;
+      body.sleepSpeedLimit = 0.2;
+
+      world.addBody(body);
+
+      pairs.push({ mesh, body });
+      dynamics.push({ mesh, body });
+
+      return { mesh, body };
+    }
+
+    function addDynamicSphere(radius, position) {
+      // three
+      const mat = new THREE.MeshPhongMaterial({
+        color: randomPaletteColor(),
+        transparent: true,
+        opacity: 0.8
+      });
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 24, 16), mat);
+      mesh.position.copy(position);
+      mesh.castShadow = true;
+      scene.add(mesh);
+
+      // cannon
+      const body = new CANNON.Body({
+        mass: 1,
+        material: matSphere
+      });
+      body.addShape(new CANNON.Sphere(radius));
+      body.position.set(position.x, position.y, position.z);
+
+      body.allowSleep = true;
+      body.sleepTimeLimit = 0.5;
+      body.sleepSpeedLimit = 0.2;
+
+      world.addBody(body);
+
+      pairs.push({ mesh, body });
+      dynamics.push({ mesh, body });
+
+      return { mesh, body };
+    }
+
+    // -----------------------------
+    // UI: 追加/削除
+    // -----------------------------
+    function addCubes() {
+      const colorBatch = randomPaletteColor(); // 旧コードは同色5個だったので “雰囲気” として残す
+      for (let i = 0; i < 5; i++) {
+        const pos = new THREE.Vector3(
+          Math.random() * 50 - 25,
+          20 + Math.random() * 5,
+          Math.random() * 50 - 25
+        );
+        const rot = new THREE.Euler(
+          Math.random() * Math.PI * 2,
+          Math.random() * Math.PI * 2,
+          Math.random() * Math.PI * 2,
+          "XYZ"
+        );
+        const obj = addDynamicBox(4, pos, rot);
+        obj.mesh.material.color.setHex(colorBatch);
+      }
+    }
+
+    function addSpheres() {
+      const colorBatch = randomPaletteColor();
+      for (let i = 0; i < 5; i++) {
+        const pos = new THREE.Vector3(
+          Math.random() * 50 - 25,
+          20 + Math.random() * 5,
+          Math.random() * 50 - 25
+        );
+        const obj = addDynamicSphere(2, pos);
+        obj.mesh.material.color.setHex(colorBatch);
+      }
+    }
+
+    function clearMeshes() {
+      // three: シーンから削除し、GPUリソース解放
+      for (const d of dynamics) {
+        scene.remove(d.mesh);
+        if (d.mesh.geometry) d.mesh.geometry.dispose();
+        if (d.mesh.material) d.mesh.material.dispose();
+      }
+
+      // cannon: ワールドからボディ削除
+      for (const d of dynamics) {
+        world.removeBody(d.body);
+      }
+
+      // pairs からも除去（地面は残す）
+      const dynBodies = new Set(dynamics.map(d => d.body));
+      for (let i = pairs.length - 1; i >= 0; i--) {
+        if (dynBodies.has(pairs[i].body)) pairs.splice(i, 1);
+      }
+
+      dynamics.length = 0;
+    }
+
+    btnAddCubes.addEventListener("click", addCubes);
+    btnAddSpheres.addEventListener("click", addSpheres);
+    btnClear.addEventListener("click", clearMeshes);
+
+    // -----------------------------
+    // UI: 摩擦/反発/重力の更新
+    // -----------------------------
+    function applyPhysicsParamsFromUI() {
+      syncLabels();
+
+      // 重力（Yのみスライダー）
+      world.gravity.set(0, Number(gY.value), 0);
+
+      // ContactMaterial の更新（UIの値に追従させる）
+      contactGroundCube.friction = Number(cubeF.value);
+      contactGroundCube.restitution = Number(cubeR.value);
+
+      contactCubeCube.friction = Number(cubeF.value);
+      contactCubeCube.restitution = Number(cubeR.value);
+
+      contactGroundSphere.friction = Number(sphF.value);
+      contactGroundSphere.restitution = Number(sphR.value);
+
+      contactSphereSphere.friction = Number(sphF.value);
+      contactSphereSphere.restitution = Number(sphR.value);
+
+      contactCubeSphere.friction = (Number(cubeF.value) + Number(sphF.value)) * 0.5;
+      contactCubeSphere.restitution = (Number(cubeR.value) + Number(sphR.value)) * 0.5;
+    }
+
+    cubeF.addEventListener("input", applyPhysicsParamsFromUI);
+    cubeR.addEventListener("input", applyPhysicsParamsFromUI);
+    sphF.addEventListener("input", applyPhysicsParamsFromUI);
+    sphR.addEventListener("input", applyPhysicsParamsFromUI);
+    gY.addEventListener("input", applyPhysicsParamsFromUI);
+
+    // 初期反映
+    applyPhysicsParamsFromUI();
+
+    // -----------------------------
+    // アニメーション：揺れる床（Physijs版の ground.rotation.x を再現）
+    // -----------------------------
+    let direction = 1;
+    let groundAngle = 0;
+
+    // 揺れの範囲（Physijs版と同じ ±0.4 rad）
+    const ANGLE_MIN = -0.4;
+    const ANGLE_MAX =  0.4;
+
+    // -----------------------------
+    // 物理ステップ：固定刻み（安定性重視）
+    // -----------------------------
+    let paused = false;
+    btnPause.addEventListener("click", () => {
+      paused = !paused;
+      btnPause.textContent = paused ? "resume" : "pause";
+    });
+
+    const fixedDt = 1 / 60;
+    let accumulator = 0;
+    let lastTime = performance.now();
+
+    // FPS（簡易）
+    let fpsAcc = 0;
+    let fpsCount = 0;
+    let fpsLast = performance.now();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05); // 最大50ms扱いで暴れ防止
+      lastTime = now;
+
+      // FPS表示更新（0.5秒ごと）
+      fpsAcc += dt;
+      fpsCount++;
+      if (now - fpsLast >= 500) {
+        const fps = fpsCount / fpsAcc;
+        fpsEl.textContent = "FPS: " + fps.toFixed(1);
+        fpsAcc = 0;
+        fpsCount = 0;
+        fpsLast = now;
+      }
+
+      // controls（カメラ操作の慣性）
+      controls.update();
+
+      // 地面の揺れ（ここは “物理の外” で決める：いわば外力・演出）
+      // Physijs版: ground.rotation.x += 0.002 * direction; clampで反転
+      // dt依存にしてフレームレート変動に強くする
+      groundAngle += (0.002 / (1/60)) * dt * direction; // 60fps基準で0.002相当
+      if (groundAngle < ANGLE_MIN) { groundAngle = ANGLE_MIN; direction = 1; }
+      if (groundAngle > ANGLE_MAX) { groundAngle = ANGLE_MAX; direction = -1; }
+
+      // 地面の姿勢を three & cannon の両方へ反映
+      // - three: group を回す
+      // - cannon: groundBody を回す（キネマティック）
+      groundGroup.rotation.x = groundAngle;
+
+      // cannonのquaternionへコピー（軸X回転）
+      const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(groundAngle, 0, 0, "XYZ"));
+      groundBody.quaternion.set(q.x, q.y, q.z, q.w);
+
+      // AABB更新を促す（回転させたキネマティックには明示が安全）
+      groundBody.aabbNeedsUpdate = true;
+
+      // 物理ステップ（固定刻み）
+      if (!paused) {
+        accumulator += dt;
+
+        let subSteps = 0;
+        const maxSubSteps = 5; // 無限ループ防止
+        while (accumulator >= fixedDt && subSteps < maxSubSteps) {
+          world.step(fixedDt);
+          accumulator -= fixedDt;
+          subSteps++;
+        }
+      }
+
+      // 同期（物理 → 描画）
+      // 地面は “自分で動かした” が、ここでも揃える（安全側）
+      for (const p of pairs) {
+        const b = p.body;
+        p.mesh.position.set(b.position.x, b.position.y, b.position.z);
+        p.mesh.quaternion.set(b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w);
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    // 初期：少し物体を入れておく（何もないと寂しい）
+    addCubes();
+    addSpheres();
+
+    animate();
+
+    // -----------------------------
+    // リサイズ
+    // -----------------------------
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    });
+  </script>
+</body>
+</html>
