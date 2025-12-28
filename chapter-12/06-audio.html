@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <title>three.js misc - sound（修正版：PositionalAudio / Autoplay対策 / 詳細コメント）</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+
+  <style>
+    body {
+      background-color: #000000;
+      margin: 0;
+      overflow: hidden;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      text-align: center;
+      font-weight: 700;
+    }
+    a { color: #0078ff; }
+
+    /* 情報表示（上部固定） */
+    #info {
+      color: #fff;
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      padding: 10px 8px;
+      z-index: 100;
+      pointer-events: none; /* クリックは下のボタンのみ受けたいので基本は透過 */
+      box-sizing: border-box;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.6);
+    }
+
+    /* Autoplay制限を解除するための「開始ボタン」 */
+    #startBtn {
+      pointer-events: auto; /* ボタンだけクリック可能にする */
+      display: inline-block;
+      margin-top: 8px;
+      background: #1f6feb;
+      color: #fff;
+      border: 0;
+      padding: 10px 14px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: 700;
+    }
+    #startBtn:active { transform: translateY(1px); }
+
+    #container { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+  </style>
+</head>
+
+<body>
+  <div id="container"></div>
+
+  <div id="info">
+    <div>WASD + マウスで移動（FirstPersonControls） / 近い音ほど大きく聞こえる（PositionalAudio）</div>
+    <div style="opacity:0.85; margin-top:6px;">
+      ※ ブラウザの自動再生制限のため、音を鳴らすには「START AUDIO」を押してください。
+      （ローカルファイル直開きだと音/テクスチャが読めない場合があるので、簡易HTTPサーバ推奨）
+    </div>
+    <button id="startBtn">START AUDIO</button>
+    <div id="status" style="margin-top:6px; opacity:0.9;">status: waiting user gesture</div>
+  </div>
+
+  <!-- 旧来の three.js（グローバルTHREE）＋ FirstPersonControls を使う前提のまま修正 -->
+  <script src="../libs/three.js"></script>
+  <script src="../libs/controls/FirstPersonControls.js"></script>
+
+  <script>
+    "use strict";
+
+    // ============================================================
+    // このサンプルのアルゴリズム（重要ポイント）
+    // ============================================================
+    // 1) three.js の Scene / Camera / Renderer を用意して描画ループを回す
+    // 2) Camera に AudioListener を 1つだけ attach する
+    //    - 「耳（Listener）」は通常 1つでよい（複数付けると音量や距離計算が想定外になりやすい）
+    // 3) 音源は Mesh に PositionalAudio を attach する（音源が3D空間に存在する）
+    // 4) ただしブラウザは “ユーザー操作なし” の音再生を禁止する（Autoplay policy）
+    //    - そのため「START AUDIO」クリック時に AudioContext を resume してから play する
+    // 5) PositionalAudio は古い .load() ではなく
+    //    AudioLoader で buffer を読み込み、setBuffer(buffer) → play() が正道
+    // ============================================================
+
+    // DOM
+    const container = document.getElementById("container");
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+
+    // three basics
+    let camera, controls, scene, renderer;
+    const clock = new THREE.Clock();
+
+    // 音関連
+    let listener;                 // AudioListener（耳）
+    const audioLoader = new THREE.AudioLoader(); // 音声ファイルを buffer として読むローダ
+    const sounds = [];            // PositionalAudio を集めておく（開始時に一斉play/停止などしやすい）
+
+    // 立方体（音源オブジェクト）
+    let meshCow, meshDog, meshCat;
+
+    // 画面サイズ
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      // FirstPersonControls は実装バージョンによって handleResize が無いことがあるためガード
+      if (controls && typeof controls.handleResize === "function") {
+        controls.handleResize();
+      }
+    }
+
+    // ------------------------------------------------------------
+    // 便利関数：Promise化した audio 読み込み
+    // ------------------------------------------------------------
+    function loadAudioBuffer(url) {
+      return new Promise((resolve, reject) => {
+        audioLoader.load(
+          url,
+          (buffer) => resolve(buffer),
+          undefined,
+          (err) => reject(err || new Error("AudioLoader failed: " + url))
+        );
+      });
+    }
+
+    // ------------------------------------------------------------
+    // 便利関数：テクスチャ読み込み（失敗しても落ちないようにする）
+    // ------------------------------------------------------------
+    function loadTexture(url) {
+      const loader = new THREE.TextureLoader();
+      return new Promise((resolve) => {
+        loader.load(
+          url,
+          (tex) => resolve(tex),
+          undefined,
+          () => resolve(null) // 失敗時は null（単色マテリアルにフォールバック）
+        );
+      });
+    }
+
+    // ============================================================
+    // init
+    // ============================================================
+    async function init() {
+      // --- Camera ---
+      camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 1, 10000);
+      camera.position.set(-200, 25, 0);
+
+      // --- AudioListener（重要）---
+      // 「耳」は通常1つで十分。
+      // 以前のコードは listener1/2/3 を camera に追加していたが、
+      // PositionalAudio は同じ listener を共有して問題ない（むしろこちらが標準）。
+      listener = new THREE.AudioListener();
+      camera.add(listener);
+
+      // --- Controls ---
+      controls = new THREE.FirstPersonControls(camera);
+      controls.movementSpeed = 70;
+      controls.lookSpeed = 0.15;
+      controls.noFly = true;
+      controls.lookVertical = false;
+
+      // --- Scene ---
+      scene = new THREE.Scene();
+      scene.fog = new THREE.FogExp2(0x000000, 0.0035);
+      scene.add(camera);
+
+      // --- Light ---
+      const light = new THREE.DirectionalLight(0xffffff, 1.0);
+      light.position.set(0, 0.5, 1);
+      // 古いthreeでも動くが、normalize() は Vector3 に対して行う
+      light.position.normalize();
+      scene.add(light);
+
+      // --- Geometry / Textures ---
+      const cube = new THREE.BoxGeometry(40, 40, 40);
+
+      // テクスチャは「読めない環境（file://直開き等）」でも動くようにフォールバックする
+      const texCow = await loadTexture("../assets/textures/animals/cow.png");
+      const texDog = await loadTexture("../assets/textures/animals/dog.jpg");
+      const texCat = await loadTexture("../assets/textures/animals/cat.jpg");
+
+      const matCow = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        map: texCow || null
+      });
+      const matDog = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        map: texDog || null
+      });
+      const matCat = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        map: texCat || null
+      });
+
+      // --- Sound source meshes（音源となる立方体）---
+      meshCow = new THREE.Mesh(cube, matCow);
+      meshCow.position.set(0, 20, 100);
+      scene.add(meshCow);
+
+      meshDog = new THREE.Mesh(cube, matDog);
+      meshDog.position.set(0, 20, 0);
+      scene.add(meshDog);
+
+      meshCat = new THREE.Mesh(cube, matCat);
+      meshCat.position.set(0, 20, -100);
+      scene.add(meshCat);
+
+      // --- Ground grid ---
+      const helper = new THREE.GridHelper(500, 10, 0x444444, 0x444444);
+      helper.position.y = 0.1;
+      scene.add(helper);
+
+      // --- Renderer ---
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      container.innerHTML = "";
+      container.appendChild(renderer.domElement);
+
+      // events
+      window.addEventListener("resize", onWindowResize, false);
+
+      // ステータス更新
+      statusEl.textContent = "status: initialized (press START AUDIO)";
+    }
+
+    // ============================================================
+    // Audio setup（ユーザー操作後に呼ぶ）
+    // ============================================================
+    async function startAudio() {
+      // --- 重要：Autoplay policy 対策 ---
+      // 近年のブラウザは「ユーザー操作なし」で AudioContext が suspended のまま。
+      // クリックなどのジェスチャをきっかけに context.resume() する必要がある。
+      try {
+        await listener.context.resume();
+      } catch (e) {
+        // resume が失敗しても次へ（環境によっては不要/例外になることがある）
+      }
+
+      statusEl.textContent = "status: loading audio...";
+
+      // 3つの音を読み込む（並列）
+      // ※ サーバ配信推奨（file:// だと CORS/読込で失敗することがある）
+      let bufCow, bufDog, bufCat;
+      try {
+        [bufCow, bufDog, bufCat] = await Promise.all([
+          loadAudioBuffer("../assets/audio/cow.ogg"),
+          loadAudioBuffer("../assets/audio/dog.ogg"),
+          loadAudioBuffer("../assets/audio/cat.ogg")
+        ]);
+      } catch (e) {
+        statusEl.textContent = "status: audio load failed (check path / run via http server)";
+        console.error(e);
+        return;
+      }
+
+      // 位置音源（PositionalAudio）を作って Mesh に attach
+      // - setRefDistance: この距離での基準音量（小さいほど近距離で大きく、遠距離で小さくなりやすい）
+      // - setRolloffFactor: 距離減衰の強さ（大きいほど急激に小さくなる）
+      // - distanceModel: 'inverse'（デフォルト）が一般的、他に 'linear', 'exponential'
+      function attachPositionalSound(mesh, buffer) {
+        const sound = new THREE.PositionalAudio(listener);
+
+        sound.setBuffer(buffer);
+        sound.setLoop(true);
+        sound.setVolume(1.0);
+
+        sound.setRefDistance(20);
+        sound.setRolloffFactor(2);
+        sound.setDistanceModel("inverse");
+
+        mesh.add(sound);
+        sounds.push(sound);
+        return sound;
+      }
+
+      attachPositionalSound(meshCow, bufCow);
+      attachPositionalSound(meshDog, bufDog);
+      attachPositionalSound(meshCat, bufCat);
+
+      // 読み込みが完了したら再生
+      // - autoplay プロパティは環境差があるので「明示的に play()」するのが安全
+      for (const s of sounds) {
+        try { s.play(); } catch (_) {}
+      }
+
+      statusEl.textContent = "status: audio playing ✅";
+      startBtn.disabled = true;
+      startBtn.textContent = "AUDIO STARTED";
+      startBtn.style.opacity = "0.7";
+      startBtn.style.cursor = "default";
+    }
+
+    // ============================================================
+    // animate / render loop
+    // ============================================================
+    function animate() {
+      requestAnimationFrame(animate);
+      render();
+    }
+
+    function render() {
+      // delta = フレーム間の経過時間（秒）
+      // FirstPersonControls は dt を渡して更新する
+      const delta = clock.getDelta();
+      controls.update(delta);
+
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // 起動
+    // ============================================================
+    (async () => {
+      await init();
+      animate();
+
+      // ユーザー操作が入った瞬間に audio を開始する
+      startBtn.addEventListener("click", startAudio);
+    })();
+  </script>
+</body>
+</html>
